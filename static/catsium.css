@@ -1,0 +1,661 @@
+/* =====================================================
+   CATSIUM — shared design system
+   pastel pink #f6a8c8 / charcoal plum #17151b / JetBrains Mono
+   ===================================================== */
+:root{
+  --bg:#17151b;
+  --surface:#211e26;
+  --surface-2:#2a2530;
+  --border:#3b3340;
+  --text:#fff8fb;
+  --muted:#b9adb7;
+  --pink:#f6a8c8;
+  --pink-soft:#ffd7e8;
+  --pink-bg:rgba(246,168,200,0.12);
+  --green:#7ee49b;
+  --green-zone:rgba(126,228,155,0.20);
+  --red:#ff8aa0;
+  --red-zone:rgba(255,138,160,0.20);
+  --yellow:#ffe08a;
+  --purple:#d8c7ff;
+  --orange:#ffc18b;
+  --blue:#b6e3ff;
+  --radius:18px;
+  --shadow:0 10px 34px rgba(12,9,18,.38);
+  --t-fast:.18s cubic-bezier(.4,0,.2,1);
+  --t-med:.35s cubic-bezier(.4,0,.2,1);
+}
+*{box-sizing:border-box}
+html,body{margin:0;padding:0;background:var(--bg);color:var(--text);font-family:'JetBrains Mono',ui-monospace,monospace;-webkit-font-smoothing:antialiased}
+/* Round-7: body transparent so the fixed video bg (z-index:-2) shows through;
+   html keeps the dark base as the letterbox color behind the video. */
+body{min-height:100vh;overflow-x:hidden;background:transparent}
+a{color:var(--pink);text-decoration:none}
+a:hover{color:var(--pink-soft)}
+button{font-family:inherit}
+input,select,textarea{font-family:inherit}
+
+/* ============== background (Round-7: looping video/gif) ============== */
+/* Fixed full-screen media behind everything. mp4 preferred, gif fallback,
+   else the dark html bg shows. Mounted by catsium-shell.js as .bgvid. */
+.bgvid{
+  position:fixed;inset:0;width:100%;height:100%;
+  object-fit:cover;z-index:-3;pointer-events:none;
+}
+/* Dim overlay so white text/cards stay readable over a bright video. */
+body::before{
+  content:"";position:fixed;inset:0;z-index:-1;
+  background:
+    linear-gradient(180deg,rgba(23,21,27,.72),rgba(23,21,27,.58)),
+    rgba(23,21,27,.36);
+  pointer-events:none;
+}
+
+/* ============== top nav ============== */
+.nav{
+  position:sticky;top:0;z-index:50;
+  background:rgba(28,24,34,.78);backdrop-filter:blur(14px);
+  border-bottom:1px solid rgba(246,168,200,.20);
+  padding:12px 22px;display:flex;align-items:center;gap:22px;flex-wrap:wrap;
+}
+.nav .brand{
+  display:flex;align-items:center;gap:10px;
+  color:var(--pink);font-weight:700;letter-spacing:.5px;font-size:.95rem;
+}
+.nav .brand .logo{
+  width:30px;height:30px;border-radius:8px;
+  display:inline-flex;align-items:center;justify-content:center;
+  box-shadow:0 4px 14px rgba(246,168,200,.30);
+  object-fit:cover;
+}
+.nav .brand img.logo{background:transparent}
+.nav .brand .logo-fallback{
+  background:linear-gradient(135deg,var(--pink),var(--purple));
+  color:#241820;font-weight:800;font-size:.8rem;
+}
+.nav .links{display:flex;gap:6px;flex-wrap:wrap}
+.nav .links a{
+  color:var(--muted);font-size:.82rem;font-weight:500;
+  padding:6px 11px;border-radius:8px;letter-spacing:.3px;
+  transition:all var(--t-fast);
+}
+.nav .links a:hover{color:#fff;background:rgba(255,255,255,.04)}
+.nav .links a.active{color:var(--pink);background:var(--pink-bg)}
+.nav .right{margin-left:auto;display:flex;align-items:center;gap:10px}
+
+/* ============== layout ============== */
+.scene{position:relative;min-height:100vh;padding:30px 16px 80px}
+.container{max-width:1100px;margin:0 auto}
+.banner{
+  text-align:center;color:var(--pink);font-size:.92rem;line-height:1.6;
+  margin:8px auto 28px;max-width:760px;animation:fadeDown .7s .15s both;
+}
+.banner p{margin:.4rem 0}
+.banner a{text-decoration:underline;text-underline-offset:3px}
+@keyframes fadeDown{from{opacity:0;transform:translateY(-8px)}to{opacity:1;transform:translateY(0)}}
+
+/* ============== market pill ============== */
+.market-pill{
+  display:inline-flex;align-items:center;gap:8px;
+  padding:6px 14px;border-radius:14px;
+  background:var(--pink-bg);border:1px solid var(--pink);
+  color:var(--pink);font-weight:600;font-size:.78rem;letter-spacing:.6px;
+}
+.market-pill .dot{width:8px;height:8px;border-radius:50%;background:var(--pink);animation:pulse 1.8s ease-out infinite}
+.market-pill.open{background:rgba(91,217,122,.12);border-color:var(--green);color:var(--green)}
+.market-pill.open .dot{background:var(--green);animation:pulseG 1.8s ease-out infinite}
+@keyframes pulse{
+  0%{box-shadow:0 0 0 0 rgba(246,168,200,.48)}
+  70%{box-shadow:0 0 0 10px rgba(246,168,200,0)}
+  100%{box-shadow:0 0 0 0 rgba(246,168,200,0)}
+}
+@keyframes pulseG{
+  0%{box-shadow:0 0 0 0 rgba(91,217,122,.55)}
+  70%{box-shadow:0 0 0 10px rgba(91,217,122,0)}
+  100%{box-shadow:0 0 0 0 rgba(91,217,122,0)}
+}
+
+/* ============== cards ============== */
+.card{
+  background:linear-gradient(180deg,rgba(37,32,43,.96),rgba(28,25,34,.96));
+  border:2px solid rgba(246,168,200,.58);border-radius:var(--radius);
+  padding:24px 28px;margin:0 auto 22px;
+  box-shadow:var(--shadow), inset 0 1px 0 rgba(255,255,255,.02);
+  backdrop-filter:blur(6px);
+  opacity:0;transform:translateY(14px);
+  animation:cardIn .55s cubic-bezier(.4,0,.2,1) forwards;
+}
+.card.s1{animation-delay:.05s}
+.card.s2{animation-delay:.20s}
+.card.s3{animation-delay:.35s}
+.card.s4{animation-delay:.50s}
+.card.s5{animation-delay:.65s}
+@keyframes cardIn{to{opacity:1;transform:translateY(0)}}
+
+.card-head{display:flex;align-items:center;gap:14px;margin-bottom:18px}
+.icon-tile{
+  width:38px;height:38px;border-radius:11px;background:linear-gradient(135deg,var(--pink),var(--purple));color:#241820;
+  display:inline-flex;align-items:center;justify-content:center;
+  box-shadow:0 4px 14px rgba(246,168,200,.28);flex:0 0 auto;
+}
+.icon-tile svg{width:22px;height:22px}
+.card-head h2{margin:0;font-size:1.3rem;font-weight:700;letter-spacing:.3px}
+.card-head .head-meta{margin-left:auto;display:flex;gap:10px;align-items:center}
+.card-sub{color:var(--muted);font-size:.84rem;line-height:1.55;margin:-8px 0 14px}
+.card-sub a{text-decoration:underline;text-underline-offset:2px}
+
+/* ============== buttons / chips ============== */
+.btn{
+  background:transparent;border:1.5px solid var(--pink);color:var(--pink);
+  border-radius:10px;padding:8px 16px;font-family:inherit;font-size:.82rem;
+  font-weight:600;cursor:pointer;letter-spacing:.4px;
+  display:inline-flex;align-items:center;gap:8px;
+  transition:all var(--t-fast);text-decoration:none;
+}
+.btn:hover{background:var(--pink);color:#1a1a1a;transform:translateY(-1px)}
+.btn.live{border-color:var(--green);color:var(--green)}
+.btn.live:hover{background:var(--green);color:#1a1a1a}
+.btn.danger{border-color:#ff7b8a;color:#ff7b8a}
+.btn.danger:hover{background:#ff7b8a;color:#1a1a1a}
+.btn .live-dot{width:8px;height:8px;border-radius:50%;background:var(--green);animation:pulseG 1.6s ease-out infinite}
+.ghost-btn{
+  background:transparent;border:1px solid var(--border);color:var(--muted);
+  padding:7px 12px;border-radius:9px;font-size:.78rem;cursor:pointer;
+  display:inline-flex;align-items:center;gap:6px;transition:all var(--t-fast);
+  text-decoration:none;
+}
+.ghost-btn:hover{border-color:var(--pink);color:var(--pink)}
+
+/* segmented range */
+.range-row{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;margin-bottom:16px}
+.range-group{
+  position:relative;display:inline-flex;gap:0;
+  background:var(--surface-2);border:1px solid var(--border);border-radius:11px;padding:4px;
+}
+.range-group .slider{
+  position:absolute;top:4px;bottom:4px;background:var(--pink);border-radius:8px;
+  transition:transform var(--t-med), width var(--t-med);z-index:0;
+  box-shadow:0 4px 12px rgba(246,168,200,.28);
+}
+.range-btn{
+  position:relative;z-index:1;background:transparent;border:0;color:var(--muted);
+  padding:7px 14px;font-size:.78rem;font-weight:600;border-radius:8px;cursor:pointer;
+  letter-spacing:.4px;transition:color var(--t-fast);
+}
+.range-btn:hover{color:#fff}
+.range-btn.active{color:#1a1a1a}
+
+/* ticker chip */
+.tchip{
+  display:inline-flex;align-items:center;gap:8px;
+  background:rgba(34,34,34,.85);border:1px solid var(--border);
+  padding:5px 9px 5px 13px;border-radius:14px;font-size:.85rem;
+  transition:all var(--t-fast);
+}
+.tchip:hover{border-color:var(--pink);background:rgba(246,168,200,.06)}
+.tchip a{font-weight:700;color:#fff}
+.tchip .x{
+  background:transparent;border:0;color:var(--red);
+  font-size:.9rem;cursor:pointer;padding:0 4px;line-height:1;
+  opacity:.7;transition:opacity var(--t-fast);
+}
+.tchip .x:hover{opacity:1}
+
+/* ============== signal badges ============== */
+.sig{
+  display:inline-block;padding:3px 11px;border-radius:14px;
+  font-weight:700;font-size:.72rem;letter-spacing:.6px;
+  border:1px solid;
+}
+.sig.strong-buy{background:rgba(91,217,122,.14);color:var(--green);border-color:var(--green)}
+.sig.buy{background:rgba(91,217,122,.1);color:var(--green);border-color:rgba(91,217,122,.6)}
+.sig.hold{background:rgba(255,200,87,.1);color:var(--yellow);border-color:rgba(255,200,87,.6)}
+.sig.sell{background:rgba(255,93,122,.1);color:var(--red);border-color:rgba(255,93,122,.6)}
+.sig.strong-sell{background:rgba(255,93,122,.14);color:var(--red);border-color:var(--red)}
+.sig.hero{padding:12px 28px;font-size:1.25rem;border-radius:12px;letter-spacing:1px}
+
+/* ============== inputs ============== */
+.field{
+  background:var(--surface-2);border:1px solid var(--border);color:#fff;
+  border-radius:9px;padding:7px 12px;font-size:.85rem;outline:none;
+  transition:border-color var(--t-fast),box-shadow var(--t-fast);
+}
+.field:focus{border-color:var(--pink);box-shadow:0 0 0 3px rgba(246,168,200,.16)}
+.field::placeholder{color:#666}
+
+/* ============== tables ============== */
+.scroll{max-height:340px;overflow-y:auto;padding-right:4px}
+.scroll::-webkit-scrollbar{width:6px}
+.scroll::-webkit-scrollbar-thumb{background:var(--pink);border-radius:3px}
+.scroll::-webkit-scrollbar-track{background:transparent}
+
+table.t{width:100%;border-collapse:separate;border-spacing:0;font-size:.92rem}
+table.t thead th{
+  position:sticky;top:0;background:rgba(28,28,28,.96);backdrop-filter:blur(6px);
+  text-align:left;font-weight:600;color:var(--muted);
+  font-size:.72rem;letter-spacing:.8px;text-transform:uppercase;
+  padding:10px 14px;border-bottom:1px solid var(--border);z-index:2;
+}
+table.t tbody td{padding:13px 14px;border-bottom:1px solid rgba(255,255,255,.045);vertical-align:middle}
+table.t tbody tr{transition:background var(--t-fast)}
+table.t tbody tr:hover{background:rgba(246,168,200,.06)}
+table.t tbody tr.clickable{cursor:pointer}
+table.t tbody tr:last-child td{border-bottom:0}
+
+.sym{font-weight:700;color:#fff;letter-spacing:.3px}
+.sym a{color:#fff}
+.sym a:hover{color:var(--pink)}
+.pos{color:var(--green);font-weight:600}
+.neg{color:var(--red);font-weight:600}
+.buy-c{color:var(--red);font-weight:700;letter-spacing:.5px}
+.sell-c{color:var(--green);font-weight:700;letter-spacing:.5px}
+.hold-c{color:var(--yellow);font-weight:700;letter-spacing:.5px}
+
+/* Round-2 fix #2: explicit opacity:0 base so rows stay hidden through their
+   inline animation-delay window. `forwards` (not `both`) avoids fighting the
+   parent .card's own animation-fill state. */
+.anim-row{opacity:0;animation:rowIn .45s cubic-bezier(.4,0,.2,1) forwards}
+@keyframes rowIn{from{opacity:0;transform:translateX(-8px)}to{opacity:1;transform:translateX(0)}}
+
+/* ============== confidence bar ============== */
+.confbar{
+  display:flex;align-items:center;gap:10px;
+}
+.confbar .track{
+  flex:1;height:5px;background:var(--surface-2);border-radius:3px;overflow:hidden;
+  min-width:60px;max-width:100px;
+}
+.confbar .fill{
+  height:100%;border-radius:3px;background:var(--pink);
+  transition:width .8s cubic-bezier(.4,0,.2,1);
+}
+.confbar .fill.up{background:var(--green)}
+.confbar .fill.down{background:var(--red)}
+.confbar .fill.mid{background:var(--yellow)}
+.confbar small{color:var(--muted);font-size:.78rem;min-width:28px;text-align:right}
+
+/* ============== stats ============== */
+.stats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin-top:4px}
+@media (max-width:640px){.stats{grid-template-columns:repeat(2,1fr)}}
+.stat{
+  background:var(--surface-2);border-radius:10px;padding:12px 14px;
+  border:1px solid transparent;transition:border-color var(--t-fast);
+}
+.stat:hover{border-color:rgba(246,168,200,.34)}
+.stat .label{color:var(--muted);font-size:.68rem;letter-spacing:.8px;text-transform:uppercase}
+.stat .val{font-size:1.15rem;font-weight:700;margin-top:4px}
+.stat .sub{color:var(--muted);font-size:.7rem;margin-top:2px}
+
+/* ============== sector chips ============== */
+.chip{
+  background:var(--surface-2);border:1px solid var(--border);
+  border-radius:8px;padding:5px 10px;font-size:.74rem;transition:border-color var(--t-fast);
+}
+.chip:hover{border-color:var(--pink)}
+.chip .pct{color:var(--pink);font-weight:600;margin:0 4px}
+.chip .v{color:var(--muted)}
+
+/* ============== grid helpers ============== */
+.grid-2{display:grid;grid-template-columns:repeat(2,1fr);gap:20px}
+.grid-3{display:grid;grid-template-columns:repeat(3,1fr);gap:18px}
+.grid-4{display:grid;grid-template-columns:repeat(4,1fr);gap:16px}
+.grid-stock{display:grid;grid-template-columns:2fr 1fr;gap:22px}
+@media (max-width:900px){
+  .grid-2,.grid-3,.grid-4,.grid-stock{grid-template-columns:1fr}
+}
+
+/* ============== news items ============== */
+.news{
+  border-left:3px solid var(--border);padding:11px 14px;margin-bottom:8px;
+  background:rgba(255,255,255,.025);border-radius:0 8px 8px 0;
+  transition:background var(--t-fast);
+}
+.news:hover{background:rgba(255,255,255,.05)}
+.news.bull{border-left-color:var(--green)}
+.news.bear{border-left-color:var(--red)}
+.news.neut{border-left-color:var(--muted)}
+.news .title{color:#fff;font-size:.9rem;font-weight:500;display:block;line-height:1.4}
+.news .title a{color:#fff}
+.news .title a:hover{color:var(--pink)}
+.news .meta{margin-top:6px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;font-size:.72rem;color:var(--muted)}
+.badge-source{
+  background:var(--surface-2);border:1px solid var(--border);
+  color:var(--muted);font-size:.66rem;padding:2px 8px;border-radius:10px;
+}
+
+/* ============== stock-card (dashboard grid) ============== */
+.stock-card{
+  background:linear-gradient(180deg,rgba(38,38,38,.95),rgba(28,28,28,.95));
+  border:1px solid var(--border);border-radius:14px;padding:18px;
+  transition:all var(--t-med);cursor:pointer;display:block;
+  text-decoration:none;color:inherit;
+}
+.stock-card:hover{
+  border-color:var(--pink);transform:translateY(-3px);
+  box-shadow:0 14px 32px rgba(0,0,0,.35), 0 0 0 1px rgba(246,168,200,.28);
+}
+.stock-card .top{display:flex;justify-content:space-between;align-items:start;margin-bottom:14px}
+.stock-card .tk{font-size:1.15rem;font-weight:800;letter-spacing:.5px;color:#fff}
+.stock-card .hint{color:var(--muted);font-size:.65rem;margin-top:2px}
+.stock-card .price{font-size:1.65rem;font-weight:700;color:#fff;margin-bottom:2px}
+.stock-card .day{font-weight:600;font-size:.85rem;margin-bottom:14px}
+.stock-card .hlp{
+  display:grid;grid-template-columns:repeat(3,1fr);gap:0;
+  border-top:1px solid var(--border);padding-top:10px;text-align:center;
+  font-size:.7rem;color:var(--muted);
+}
+.stock-card .hlp > div{padding:0 4px;border-right:1px solid var(--border)}
+.stock-card .hlp > div:last-child{border-right:0}
+.stock-card .hlp .v{color:#fff;font-weight:600;font-size:.82rem;display:block;margin-bottom:2px}
+
+/* misc utility */
+.row-flex{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.gap-2{gap:8px}.gap-3{gap:12px}.gap-4{gap:16px}
+.mt-2{margin-top:8px}.mt-3{margin-top:12px}.mt-4{margin-top:18px}
+.mb-2{margin-bottom:8px}.mb-3{margin-bottom:12px}.mb-4{margin-bottom:18px}
+.text-muted{color:var(--muted)}
+.text-pink{color:var(--pink)}
+.text-center{text-align:center}
+.up{color:var(--green)}.down{color:var(--red)}
+
+
+/* =====================================================
+   CATSIUM — Onimai Decoration Layer (Round-8)
+   Sakura particles, cursor trail, shimmer text,
+   signal glows — inspired by お兄ちゃんはおしまい！
+   ===================================================== */
+
+/* ---- Glow shortcuts ---- */
+:root {
+  --glow-pink:   0 0 18px rgba(246,168,200,.30), 0 0 36px rgba(246,168,200,.10);
+  --glow-purple: 0 0 18px rgba(216,199,255,.32), 0 0 36px rgba(216,199,255,.10);
+}
+
+/* ============================================================
+   SIGNATURE ELEMENT: sakura-sparkle canvas
+   Position: fixed, behind UI, pointer-events:none
+   ============================================================ */
+#onimai-canvas {
+  position: fixed;
+  inset: 0;
+  width: 100% !important;
+  height: 100% !important;
+  pointer-events: none;
+  z-index: -2;
+  opacity: .72;
+  mix-blend-mode: screen;
+}
+
+/* ============================================================
+   Cursor sparkle trail (DOM divs injected by JS)
+   ============================================================ */
+.cat-sparkle {
+  position: fixed;
+  pointer-events: none;
+  z-index: 9999;
+  border-radius: 70% 30% 65% 35%;
+  will-change: transform, opacity;
+  animation: catSparkle .65s ease-out forwards;
+}
+@keyframes catSparkle {
+  0%   { transform: translate(0,0) rotate(var(--rot,0deg)) scale(1); opacity: .72; }
+  100% { transform: translate(var(--tx),var(--ty)) rotate(calc(var(--rot,0deg) + 68deg)) scale(0); opacity: 0; }
+}
+
+/* ============================================================
+   Ambient emoji disabled
+   ============================================================ */
+.onimai-float {
+  display: none !important;
+}
+
+/* ============================================================
+   Shimmer gradient text — headings
+   ============================================================ */
+@keyframes shimmerGrad {
+  0%   { background-position: -200% center; }
+  100% { background-position:  200% center; }
+}
+
+.card-head h2 {
+  background: linear-gradient(90deg,
+    #fff 0%, #fff 18%,
+    var(--pink) 38%,
+    var(--purple) 55%,
+    #fff 72%, #fff 100%
+  );
+  background-size: 200% auto;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  -webkit-text-fill-color: transparent;
+  animation: shimmerGrad 6s linear infinite;
+}
+
+.header h1 {
+  background: linear-gradient(135deg,
+    #fff 0%, var(--pink) 38%,
+    var(--purple) 65%, #fff 100%
+  );
+  background-size: 200% auto;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  -webkit-text-fill-color: transparent;
+  animation: shimmerGrad 5s linear infinite;
+}
+
+/* ============================================================
+   Signal badge glow pulses
+   ============================================================ */
+@keyframes glowGreen {
+  0%,100% { box-shadow: 0 0 4px rgba(91,217,122,.3); }
+  50%      { box-shadow: 0 0 14px rgba(91,217,122,.75), 0 0 28px rgba(91,217,122,.28); }
+}
+@keyframes glowRed {
+  0%,100% { box-shadow: 0 0 4px rgba(255,93,122,.3); }
+  50%      { box-shadow: 0 0 14px rgba(255,93,122,.75), 0 0 28px rgba(255,93,122,.28); }
+}
+.sig.strong-buy  { animation: glowGreen 2.2s ease-in-out infinite; }
+.sig.strong-sell { animation: glowRed   2.2s ease-in-out infinite; }
+
+/* ============================================================
+   Logo pulse
+   ============================================================ */
+@keyframes logoPulse {
+  0%,100% { box-shadow: 0 4px 14px rgba(246,168,200,.30); }
+  50%      { box-shadow: 0 4px 24px rgba(246,168,200,.48),
+                         0 0  30px rgba(216,199,255,.30); }
+}
+.nav .brand .logo,
+.nav .brand .logo-fallback { animation: logoPulse 3s ease-in-out infinite; }
+
+/* ============================================================
+   Market pill — open state extra glow
+   ============================================================ */
+@keyframes marketOpenGlow {
+  0%,100% { box-shadow: none; }
+  50%      { box-shadow: 0 0 0 4px rgba(91,217,122,.12), 0 0 20px rgba(91,217,122,.2); }
+}
+.market-pill.open { animation: marketOpenGlow 2s ease-in-out infinite; }
+
+/* ============================================================
+   Nav active link text-glow + bottom shimmer border
+   ============================================================ */
+.nav .links a.active {
+  box-shadow: 0 0 12px rgba(246,168,200,.18);
+  text-shadow: 0 0 8px rgba(246,168,200,.42);
+}
+@keyframes navBorderShimmer {
+  0%,100% { border-bottom-color: rgba(246,168,200,.18); }
+  50%      { border-bottom-color: rgba(246,168,200,.42); }
+}
+.nav { animation: navBorderShimmer 3s ease-in-out infinite; }
+
+/* ============================================================
+   Card hover glow
+   ============================================================ */
+.card {
+  position: relative;
+  transition: box-shadow .3s ease, transform .3s ease, border-color .3s ease;
+}
+.card:hover {
+  box-shadow: var(--shadow), var(--glow-pink),
+              inset 0 1px 0 rgba(255,255,255,.04);
+  border-color: rgba(246,168,200,.66);
+  transform: translateY(-2px);
+}
+
+/* ============================================================
+   Stock card hover — stronger glow
+   ============================================================ */
+.stock-card:hover {
+  box-shadow:
+    0 14px 32px rgba(0,0,0,.35),
+    0 0 0 1px rgba(246,168,200,.26),
+    0 0 22px rgba(246,168,200,.14) !important;
+}
+.stock-card .tk,
+.sym a {
+  transition: color var(--t-fast), text-shadow var(--t-fast);
+}
+.stock-card:hover .tk,
+.sym a:hover {
+  text-shadow: 0 0 12px rgba(246,168,200,.28);
+}
+
+/* ============================================================
+   Confbar gradient fills with glow
+   ============================================================ */
+.confbar .fill {
+  background: linear-gradient(90deg, var(--pink), var(--pink-soft));
+  background-size: 200% 100%;
+  box-shadow: 0 0 6px rgba(246,168,200,.34);
+  animation: progressShimmer 3.1s linear infinite;
+}
+.confbar .fill.up {
+  background: linear-gradient(90deg, var(--green), #a2ffca);
+  background-size: 200% 100%;
+  box-shadow: 0 0 6px rgba(91,217,122,.45);
+}
+.confbar .fill.down {
+  background: linear-gradient(90deg, var(--red), #ffa0ae);
+  background-size: 200% 100%;
+  box-shadow: 0 0 6px rgba(255,93,122,.45);
+}
+.confbar .fill.mid {
+  background: linear-gradient(90deg, var(--yellow), #ffe59a);
+  background-size: 200% 100%;
+  box-shadow: 0 0 4px rgba(255,200,87,.30);
+}
+@keyframes progressShimmer {
+  0% { background-position: 0% 50%; }
+  100% { background-position: 200% 50%; }
+}
+
+/* ============================================================
+   Stat card — purple hover tint
+   ============================================================ */
+.stat { transition: all var(--t-fast); }
+.stat:hover {
+  border-color: rgba(200,162,255,.42) !important;
+  box-shadow: 0 0 16px rgba(200,162,255,.18);
+  background: linear-gradient(135deg, var(--surface-2), rgba(200,162,255,.05)) !important;
+}
+
+/* ============================================================
+   Ticker chip — purple hover
+   ============================================================ */
+.tchip:hover {
+  border-color: var(--purple) !important;
+  box-shadow: 0 0 10px rgba(200,162,255,.2);
+}
+
+/* ============================================================
+   Ghost button — subtle glow lift
+   ============================================================ */
+.ghost-btn { transition: all var(--t-fast) !important; }
+.ghost-btn:hover {
+  box-shadow: 0 0 10px rgba(246,168,200,.18);
+  transform: translateY(-1px);
+}
+.btn,
+.ghost-btn,
+.add-btn,
+.range-btn {
+  will-change: transform;
+}
+.btn:active,
+.ghost-btn:active,
+.add-btn:active,
+.range-btn:active {
+  transform: translateY(1px) scale(.98);
+}
+
+/* ============================================================
+   Table row — warm pink flush on hover
+   ============================================================ */
+table.t tbody tr:hover { background: rgba(246,168,200,.06) !important; }
+.news,
+.ind,
+.sum-card,
+.trade-form {
+  transition: transform var(--t-fast), border-color var(--t-fast), box-shadow var(--t-fast), background var(--t-fast);
+}
+.news:hover,
+.ind:hover,
+.sum-card:hover,
+.trade-form:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 8px 24px rgba(12,9,18,.18);
+}
+
+/* ============================================================
+   Anim rows — add blur for a softer entrance
+   ============================================================ */
+@keyframes rowInOnimai {
+  from { opacity: 0; transform: translateX(-10px); filter: blur(2px); }
+  to   { opacity: 1; transform: translateX(0);     filter: blur(0); }
+}
+.anim-row {
+  animation: rowInOnimai .45s cubic-bezier(.4,0,.2,1) forwards !important;
+}
+
+/* ============================================================
+   Bot page — equity total glow
+   ============================================================ */
+.total-amount          { text-shadow: 0 0 20px rgba(246,168,200,.30); }
+.total-delta.pos       { text-shadow: 0 0 16px rgba(91,217,122,.50); }
+.total-delta.neg       { text-shadow: 0 0 16px rgba(255,93,122,.50); }
+
+/* ============================================================
+   Pink-to-purple gradient scrollbar (all elements)
+   ============================================================ */
+* { scrollbar-width: thin; scrollbar-color: var(--pink) transparent; }
+::-webkit-scrollbar       { width: 5px; height: 5px; }
+::-webkit-scrollbar-thumb {
+  background: linear-gradient(180deg, var(--pink), var(--purple));
+  border-radius: 3px;
+}
+::-webkit-scrollbar-track { background: transparent; }
+
+/* ============================================================
+   Extra pastel motion accents
+   ============================================================ */
+@keyframes iconBob {
+  0%,100% { transform: translateY(0) rotate(0deg); }
+  45% { transform: translateY(-2px) rotate(-2deg); }
+  70% { transform: translateY(1px) rotate(1deg); }
+}
+.icon-tile {
+  animation: iconBob 4.6s ease-in-out infinite;
+}
+.card:hover .icon-tile,
+.stock-card:hover .sig {
+  animation-duration: 2.6s;
+}
+
+/* Personal dashboard preference: keep motion active even if the OS reports reduced motion. */
+@media (prefers-reduced-motion: reduce) {
+  #onimai-canvas { opacity: .56; }
+}
