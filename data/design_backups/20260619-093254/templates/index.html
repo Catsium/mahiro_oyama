@@ -1,0 +1,278 @@
+{% extends 'base.html' %}
+{% set active = 'dashboard' %}
+{% block title %}//catsium · market dashboard{% endblock %}
+
+{% block head_extra %}
+<style>
+  .header{display:flex;justify-content:space-between;align-items:end;flex-wrap:wrap;gap:14px;margin-bottom:22px;animation:fadeDown .7s .1s both}
+  .header h1{margin:0;font-size:1.65rem;font-weight:700;letter-spacing:.4px}
+  .header .meta{color:var(--muted);font-size:.82rem;margin-top:4px;display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+  .stock-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:22px}
+  @media(max-width:900px){.stock-grid{grid-template-columns:repeat(2,1fr)}}
+  @media(max-width:560px){.stock-grid{grid-template-columns:1fr}}
+  .regime{
+    display:inline-flex;align-items:center;gap:6px;padding:4px 11px;
+    border-radius:11px;font-size:.74rem;font-weight:600;letter-spacing:.4px;
+    border:1px solid;
+  }
+  .regime.bull{background:rgba(91,217,122,.1);color:var(--green);border-color:var(--green)}
+  .regime.bear{background:rgba(255,93,122,.1);color:var(--red);border-color:var(--red)}
+  .regime.neutral{background:var(--surface-2);color:var(--muted);border-color:var(--border)}
+  .add-form{display:inline-flex;gap:6px;margin-top:10px}
+  .add-form .field{width:200px;text-transform:uppercase}
+  .add-btn{
+    background:var(--pink);color:#1a1a1a;border:0;
+    padding:7px 14px;border-radius:9px;font-weight:700;font-size:.78rem;
+    cursor:pointer;letter-spacing:.4px;transition:transform var(--t-fast);
+  }
+  .add-btn:hover{transform:translateY(-1px)}
+  .tchip form{display:inline-flex;margin:0}
+  .tchip form button.x{background:transparent;border:0;color:var(--red);font-size:.9rem;cursor:pointer;padding:0 4px;line-height:1;opacity:.7;transition:opacity var(--t-fast)}
+  .tchip form button.x:hover{opacity:1}
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="scene">
+<div class="container">
+
+  <div class="header">
+    <div>
+      <h1>//market dashboard</h1>
+      <div class="meta">
+        Updated {{ now.strftime('%b %d, %Y %H:%M') }}
+        {% if regime %}
+          {% set rcls = 'bull' if regime.regime == 'bull' else ('bear' if regime.regime == 'bear' else 'neutral') %}
+          <span class="regime {{ rcls }}">
+            {% if regime.regime == 'bull' %}▲ BULL REGIME
+            {% elif regime.regime == 'bear' %}▼ BEAR REGIME
+            {% else %}— NEUTRAL REGIME{% endif %}
+          </span>
+          <span class="text-muted">SPY {{ '%+.1f'|format(regime.spy_mom_30d) }}% / 30d</span>
+        {% endif %}
+      </div>
+    </div>
+    <div class="row-flex gap-2">
+      <a href="{{ url_for('top_picks') }}" class="ghost-btn">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2l2 6h6l-5 4 2 7-7-5-7 5 2-7-5-4h6z"/></svg>
+        top picks
+      </a>
+      <a href="{{ url_for('bot_view') }}" class="ghost-btn" style="border-color:var(--pink);color:var(--pink)">
+        //view bot portfolio →
+      </a>
+      <a href="{{ url_for('simulator') }}" class="ghost-btn">paper trading</a>
+    </div>
+  </div>
+
+  <!-- ============== watchlist ============== -->
+  <section class="card s1">
+    <div class="card-head">
+      <span class="icon-tile">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"/>
+        </svg>
+      </span>
+      <h2>//watchlist</h2>
+      <div class="head-meta"><small class="text-muted">add any US ticker · bot will trade from this list</small></div>
+    </div>
+    <div class="row-flex gap-2" id="watchChips">
+      {% for t in tickers %}
+      <span class="tchip">
+        <a href="{{ url_for('stock_detail', ticker=t) }}">{{ t }}</a>
+        {% if tickers|length > 1 %}
+        <form method="POST" action="{{ url_for('remove_ticker') }}" onsubmit="return confirm('Remove {{ t }}?')">
+          <input type="hidden" name="ticker" value="{{ t }}">
+          <button type="submit" class="x" title="Remove">×</button>
+        </form>
+        {% endif %}
+      </span>
+      {% endfor %}
+    </div>
+    <form method="POST" action="{{ url_for('add_ticker') }}" class="add-form">
+      <input class="field" name="ticker" placeholder="add ticker (e.g. TSLA, AMD)" maxlength="8" required>
+      <button type="submit" class="add-btn">+ Add</button>
+    </form>
+  </section>
+
+  <!-- ============== stock cards ============== -->
+  <div class="stock-grid">
+    {% for c in cards %}
+    {% set q = c.quote %}
+    {% set rec = c.rec %}
+    <a href="{{ url_for('stock_detail', ticker=c.ticker) }}" class="stock-card" style="animation:cardIn .55s {{ 0.2 + loop.index0 * 0.05 }}s both">
+      <div class="top">
+        <div>
+          <div class="tk">{{ c.ticker }}</div>
+          <div class="hint">click for chart &amp; analysis</div>
+        </div>
+        <span class="sig {{ rec.cls }}">{{ rec.signal }}</span>
+      </div>
+      <div class="price">${{ '%.2f'|format(q.price) }}</div>
+      <div class="day {{ 'up' if q.pct >= 0 else 'down' }}">
+        {{ '▲' if q.pct >= 0 else '▼' }} {{ '%+.2f'|format(q.pct) }}% ({{ '%+.2f'|format(q.change) }})
+      </div>
+      <div class="confbar mb-3">
+        <small style="min-width:auto">conf.</small>
+        <div class="track"><div class="fill {% if rec.cls in ['strong-buy','buy'] %}up{% elif rec.cls in ['strong-sell','sell'] %}down{% else %}mid{% endif %}" style="width:{{ rec.confidence }}%"></div></div>
+        <small>{{ rec.confidence }}%</small>
+      </div>
+      <div class="hlp">
+        <div><span class="v">${{ '%.2f'|format(q.high) }}</span>High</div>
+        <div><span class="v">${{ '%.2f'|format(q.low) }}</span>Low</div>
+        <div><span class="v">${{ '%.2f'|format(q.prev) }}</span>Prev</div>
+      </div>
+    </a>
+    {% endfor %}
+  </div>
+
+  <!-- ============== top confidence + top gainers ============== -->
+  <div class="grid-2">
+    <section class="card s2">
+      <div class="card-head">
+        <span class="icon-tile">
+          <svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 2c-2 4-1 6 1 8s2 4 0 6-4 2-4 2 6-1 9-4 4-7 1-12c-2 0-4 0-7 0z"/></svg>
+        </span>
+        <h2>//top confidence</h2>
+        <div class="head-meta">
+          <form method="POST" action="{{ url_for('top_refresh') }}" style="display:inline">
+            <button class="ghost-btn" type="submit" title="Force a fresh scan (takes ~1-2 min)">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 3-6.7"/><path d="M3 4v5h5"/></svg>
+              rescan
+            </button>
+          </form>
+        </div>
+      </div>
+      <div class="card-sub">
+        Scanning {{ scan_total }} popular stocks ·
+        {% if scan_age_min is none %}warming up{% elif scan_age_min == 0 %}fresh{% else %}{{ scan_age_min }} min ago{% endif %}
+        · auto-refresh ~90s
+      </div>
+      {% if not top_confidence %}
+      <div class="text-muted" style="font-size:.85rem">Scanner is warming up — refresh in a minute or click rescan.</div>
+      {% else %}
+      <div class="scroll" style="max-height:380px">
+        <table class="t">
+          <thead><tr><th>#</th><th>Ticker</th><th>Price</th><th>Day</th><th>Signal</th><th>Conf.</th><th></th></tr></thead>
+          <tbody>
+            {% for r in top_confidence %}
+            <tr class="anim-row">
+              <td class="text-muted">{{ loop.index }}</td>
+              <td class="sym"><a href="{{ url_for('stock_detail', ticker=r.ticker) }}">{{ r.ticker }}</a></td>
+              <td>${{ '%.2f'|format(r.price) }}</td>
+              <td class="{{ 'pos' if r.pct >= 0 else 'neg' }}">{{ '%+.2f'|format(r.pct) }}%</td>
+              <td><span class="sig {{ r.cls }}">{{ r.signal }}</span></td>
+              <td><strong>{{ r.confidence }}%</strong></td>
+              <td>
+                {% if r.ticker in tickers %}
+                <span title="already in watchlist" style="font-size:.85rem;color:var(--yellow);text-shadow:0 0 6px rgba(255,200,87,.55)">★</span>
+                {% else %}
+                <form method="POST" action="{{ url_for('add_ticker') }}" style="display:inline">
+                  <input type="hidden" name="ticker" value="{{ r.ticker }}">
+                  <button type="submit" class="add-btn" style="font-size:.65rem;padding:3px 9px">+</button>
+                </form>
+                {% endif %}
+              </td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% endif %}
+    </section>
+
+    <section class="card s3">
+      <div class="card-head">
+        <span class="icon-tile" style="background:var(--green);color:#1a1a1a">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M3 17l5-5 4 4 8-9"/><path d="M14 7h6v6"/>
+          </svg>
+        </span>
+        <h2>//top % gainers today</h2>
+      </div>
+      <div class="card-sub">Best day change across the scan universe</div>
+      {% if not top_gainers %}
+      <div class="text-muted" style="font-size:.85rem">Scanner is warming up.</div>
+      {% else %}
+      <div class="scroll" style="max-height:380px">
+        <table class="t">
+          <thead><tr><th>#</th><th>Ticker</th><th>Price</th><th>Day Change</th><th>Signal</th><th></th></tr></thead>
+          <tbody>
+            {% for r in top_gainers %}
+            <tr class="anim-row">
+              <td class="text-muted">{{ loop.index }}</td>
+              <td class="sym"><a href="{{ url_for('stock_detail', ticker=r.ticker) }}">{{ r.ticker }}</a></td>
+              <td>${{ '%.2f'|format(r.price) }}</td>
+              <td class="{{ 'pos' if r.pct >= 0 else 'neg' }}" style="font-weight:700">
+                {{ '▲' if r.pct >= 0 else '▼' }} {{ '%+.2f'|format(r.pct) }}%
+              </td>
+              <td><span class="sig {{ r.cls }}">{{ r.signal }}</span></td>
+              <td>
+                {% if r.ticker in tickers %}
+                <span title="already in watchlist" style="font-size:.85rem;color:var(--yellow);text-shadow:0 0 6px rgba(255,200,87,.55)">★</span>
+                {% else %}
+                <form method="POST" action="{{ url_for('add_ticker') }}" style="display:inline">
+                  <input type="hidden" name="ticker" value="{{ r.ticker }}">
+                  <button type="submit" class="add-btn" style="font-size:.65rem;padding:3px 9px">+</button>
+                </form>
+                {% endif %}
+              </td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% endif %}
+    </section>
+  </div>
+
+  <!-- ============== quick comparison ============== -->
+  <section class="card s4">
+    <div class="card-head">
+      <span class="icon-tile">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
+          <line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/>
+        </svg>
+      </span>
+      <h2>//quick comparison (your watchlist)</h2>
+    </div>
+    <table class="t">
+      <thead><tr><th>Ticker</th><th>Price</th><th>Day Change</th><th>Signal</th><th>Confidence</th><th>News</th><th></th></tr></thead>
+      <tbody>
+        {% for c in cards %}
+        {% set q = c.quote %}
+        {% set rec = c.rec %}
+        <tr class="anim-row">
+          <td class="sym"><a href="{{ url_for('stock_detail', ticker=c.ticker) }}">{{ c.ticker }}</a></td>
+          <td><strong>${{ '%.2f'|format(q.price) }}</strong></td>
+          <td class="{{ 'pos' if q.pct >= 0 else 'neg' }}">
+            {{ '▲' if q.pct >= 0 else '▼' }} {{ '%+.2f'|format(q.pct) }}%
+          </td>
+          <td><span class="sig {{ rec.cls }}">{{ rec.signal }}</span></td>
+          <td>
+            <div class="confbar">
+              <div class="track"><div class="fill {% if rec.cls in ['strong-buy','buy'] %}up{% elif rec.cls in ['strong-sell','sell'] %}down{% else %}mid{% endif %}" style="width:{{ rec.confidence }}%"></div></div>
+              <small>{{ rec.confidence }}%</small>
+            </div>
+          </td>
+          <td class="{{ 'pos' if c.sentiment > 0.1 else ('neg' if c.sentiment < -0.1 else 'text-muted') }}" style="font-weight:600">
+            {{ '%+.2f'|format(c.sentiment) }}
+          </td>
+          <td><a href="{{ url_for('stock_detail', ticker=c.ticker) }}" class="ghost-btn" style="font-size:.7rem;padding:5px 10px">View →</a></td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </section>
+
+</div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+  // Auto-refresh every 60s during market hours so signal confidence,
+  // top confidence, and top gainers update at ~1-minute cadence.
+  var MKT_OPEN_DASH = {{ 'true' if market_open else 'false' }};
+  if (MKT_OPEN_DASH) setTimeout(function(){ location.reload(); }, 60 * 1000);
+</script>
+{% endblock %}

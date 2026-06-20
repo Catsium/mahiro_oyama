@@ -1,0 +1,414 @@
+{% extends 'base.html' %}
+{% set active = 'dashboard' %}
+{% block title %}//catsium · {{ ticker }}{% endblock %}
+
+{% block head_extra %}
+<style>
+  .stock-header{
+    display:flex;align-items:center;gap:18px;flex-wrap:wrap;
+    margin-bottom:22px;animation:fadeDown .7s .1s both;
+  }
+  .stock-header .tk{font-size:2.4rem;font-weight:800;color:var(--pink);letter-spacing:1px}
+  .stock-header .px{font-size:2rem;font-weight:700;color:#fff}
+  .stock-header .ch{font-size:1.1rem;font-weight:700}
+  .stock-header .meta{color:var(--muted);font-size:.78rem;flex-basis:100%;margin-top:4px}
+  .legend{display:flex;gap:14px;font-size:.74rem;color:var(--muted);margin-bottom:14px;flex-wrap:wrap}
+  .legend .sw{display:inline-block;width:18px;height:3px;vertical-align:middle;margin-right:4px;border-radius:2px}
+  .legend .sw.price{background:var(--pink)}
+  .legend .sw.short{background:repeating-linear-gradient(90deg,var(--orange) 0 4px,transparent 4px 8px)}
+  .legend .sw.long{background:repeating-linear-gradient(90deg,var(--green) 0 4px,transparent 4px 8px)}
+
+  .chart-wrap{position:relative;height:340px;border-radius:12px;overflow:hidden;background:rgba(0,0,0,.15);padding:6px}
+  .chart-status{position:absolute;left:0;right:0;top:50%;transform:translateY(-50%);text-align:center;font-size:.85rem;color:var(--muted)}
+
+  .ind-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}
+  @media(max-width:700px){.ind-grid{grid-template-columns:repeat(2,1fr)}}
+  .ind{
+    background:var(--surface-2);border-radius:11px;padding:14px 16px;
+    border:1px solid transparent;transition:border-color var(--t-fast);
+  }
+  .ind:hover{border-color:rgba(246,168,200,.34)}
+  .ind .lbl{color:var(--muted);font-size:.66rem;letter-spacing:.7px;text-transform:uppercase}
+  .ind .v{font-size:1.45rem;font-weight:700;margin-top:5px}
+  .ind .sub{color:var(--muted);font-size:.7rem;margin-top:2px}
+
+  .signal-card{text-align:center}
+  .reasons{list-style:none;padding:0;margin:0}
+  .reasons li{
+    display:flex;gap:9px;align-items:start;margin-bottom:8px;font-size:.86rem;
+    color:#fff;line-height:1.5;
+  }
+  .reasons li::before{
+    content:"▸";color:var(--pink);font-size:.7rem;margin-top:4px;flex-shrink:0;
+  }
+  .suggestion{
+    background:var(--surface-2);border-radius:10px;padding:12px 14px;
+    text-align:left;margin-bottom:14px;font-size:.86rem;
+    border-left:3px solid var(--green);
+  }
+  .suggestion.bear{border-left-color:var(--red)}
+  .suggestion.hold{border-left-color:var(--yellow)}
+  .support-card{border-color:var(--green)}
+  .support-card.bear{border-color:var(--red)}
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="scene">
+<div class="container">
+
+  <a href="{{ url_for('index') }}" class="ghost-btn" style="margin-bottom:18px">← back to dashboard</a>
+
+  <div class="stock-header">
+    <span class="tk">{{ ticker }}</span>
+    <span class="px">${{ '%.2f'|format(quote.price) }}</span>
+    <span class="ch {{ 'pos' if quote.pct >= 0 else 'neg' }}">
+      {{ '▲' if quote.pct >= 0 else '▼' }} {{ '%+.2f'|format(quote.change) }} ({{ '%+.2f'|format(quote.pct) }}%)
+    </span>
+    <small class="text-muted" style="font-size:.75rem">Updated {{ now.strftime('%b %d, %H:%M') }} · auto-refresh 60s</small>
+    <div class="meta">Last close ${{ '%.2f'|format(quote.prev) }}</div>
+  </div>
+
+  <div class="grid-stock">
+    <!-- LEFT column -->
+    <div>
+      <!-- Chart -->
+      <section class="card s1">
+        <div class="card-head">
+          <span class="icon-tile">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M3 17l5-5 4 4 8-9"/><path d="M14 7h6v6"/>
+            </svg>
+          </span>
+          <h2>//price chart</h2>
+          <div class="head-meta">
+            <div class="range-group" id="rangeGroup">
+              <span class="slider" id="rangeSlider"></span>
+              <button class="range-btn" data-range="1d">1D</button>
+              <button class="range-btn" data-range="1w">1W</button>
+              <button class="range-btn" data-range="1m">1M</button>
+              <button class="range-btn active" data-range="3m">3M</button>
+            </div>
+          </div>
+        </div>
+        <div class="legend">
+          <span><span class="sw price"></span>Price</span>
+          <span><span class="sw short"></span>Short MA</span>
+          <span><span class="sw long"></span>Long MA</span>
+        </div>
+        <div class="chart-wrap">
+          <canvas id="priceChart"></canvas>
+          <div id="chartStatus" class="chart-status" style="display:none"></div>
+        </div>
+      </section>
+
+      <!-- Indicators -->
+      {% if ctx %}
+      <section class="card s2">
+        <div class="card-head">
+          <span class="icon-tile">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M3 12h4l3-9 4 18 3-9h4"/>
+            </svg>
+          </span>
+          <h2>//technical indicators</h2>
+        </div>
+        <div class="ind-grid">
+          <div class="ind">
+            <div class="lbl">RSI (14)</div>
+            <div class="v" style="color:{% if ctx.rsi >= 70 %}var(--red){% elif ctx.rsi <= 30 %}var(--green){% else %}var(--yellow){% endif %}">{{ '%.0f'|format(ctx.rsi) }}</div>
+            <div class="sub">{% if ctx.rsi >= 70 %}Overbought{% elif ctx.rsi <= 30 %}Oversold{% else %}Neutral{% endif %}</div>
+          </div>
+          <div class="ind">
+            <div class="lbl">7-Day MA</div>
+            <div class="v">${{ '%.2f'|format(ctx.ma7) }}</div>
+            <div class="sub {{ 'up' if ctx.current > ctx.ma7 else 'down' }}">{{ 'Price above MA' if ctx.current > ctx.ma7 else 'Price below MA' }}</div>
+          </div>
+          <div class="ind">
+            <div class="lbl">30-Day MA</div>
+            <div class="v">${{ '%.2f'|format(ctx.ma30) }}</div>
+            <div class="sub {{ 'up' if ctx.above_ma30 else 'down' }}">{{ 'Bullish' if ctx.above_ma30 else 'Bearish' }}</div>
+          </div>
+          <div class="ind">
+            <div class="lbl">Week %</div>
+            <div class="v {{ 'up' if ctx.week_chg_pct >= 0 else 'down' }}">{{ '%+.1f'|format(ctx.week_chg_pct) }}%</div>
+            <div class="sub">5-day momentum</div>
+          </div>
+        </div>
+      </section>
+      {% endif %}
+
+      <!-- News -->
+      <section class="card s3">
+        <div class="card-head">
+          <span class="icon-tile">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="3" y="4" width="18" height="16" rx="2"/>
+              <line x1="7" y1="9" x2="17" y2="9"/><line x1="7" y1="13" x2="17" y2="13"/><line x1="7" y1="17" x2="13" y2="17"/>
+            </svg>
+          </span>
+          <h2>//recent news</h2>
+          <div class="head-meta">
+            <small class="text-muted">
+              {{ articles|selectattr('score','gt',0)|list|length }} bull /
+              {{ articles|selectattr('score','lt',0)|list|length }} bear /
+              {{ articles|selectattr('score','eq',0)|list|length }} neutral
+            </small>
+          </div>
+        </div>
+        {% if not articles %}
+        <p class="text-muted">No news available.</p>
+        {% endif %}
+        <div id="newsList">
+        {% for a in articles %}
+          {% set cls = 'bull' if a.score > 0 else ('bear' if a.score < 0 else 'neut') %}
+          {% set sigCls = 'buy' if a.score > 0 else ('sell' if a.score < 0 else 'hold') %}
+          {% set label = 'Bullish' if a.score > 0 else ('Bearish' if a.score < 0 else 'Neutral') %}
+          <div class="news {{ cls }} anim-row" style="animation-delay:{{ 0.4 + loop.index0 * 0.05 }}s">
+            <span class="title">
+              {% if a.link %}<a href="{{ a.link }}" target="_blank" rel="noopener">{{ a.title }}</a>
+              {% else %}{{ a.title }}{% endif %}
+            </span>
+            <div class="meta">
+              {% if a.source %}<span class="badge-source">{{ a.source }}</span>{% endif %}
+              {% if a.pub %}<span>{{ a.pub }}</span>{% endif %}
+              <span class="sig {{ sigCls }}" style="font-size:.62rem;padding:1px 7px">{{ label }}</span>
+            </div>
+          </div>
+        {% endfor %}
+        </div>
+      </section>
+    </div>
+
+    <!-- RIGHT column -->
+    <div>
+      <!-- AI signal -->
+      <section class="card s1 signal-card">
+        <div class="card-head" style="justify-content:center">
+          <span class="icon-tile">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 3"/>
+            </svg>
+          </span>
+          <h2>//ai signal</h2>
+        </div>
+        <div class="sig hero {{ rec.cls }}" style="margin-bottom:14px">
+          {% if rec.cls == 'strong-buy' %}▲▲
+          {% elif rec.cls == 'buy' %}▲
+          {% elif rec.cls == 'strong-sell' %}▼▼
+          {% elif rec.cls == 'sell' %}▼
+          {% else %}—{% endif %}
+          {{ rec.signal }}
+        </div>
+        <div class="confbar mb-3" style="justify-content:center">
+          <small style="min-width:auto">Confidence</small>
+          <div class="track" style="max-width:160px"><div class="fill {% if rec.cls in ['strong-buy','buy'] %}up{% elif rec.cls in ['strong-sell','sell'] %}down{% else %}mid{% endif %}" id="confFill" style="width:0%"></div></div>
+          <small><strong style="color:#fff">{{ rec.confidence }}%</strong></small>
+        </div>
+        {% if rec.cls in ['strong-buy','buy'] %}
+        <div class="suggestion">
+          <strong style="color:var(--green)">▲ Suggestion:</strong>
+          consider <strong style="color:var(--green)">buying</strong>. test in simulator first.
+        </div>
+        <a href="{{ url_for('simulator') }}" class="btn" style="width:100%;justify-content:center;background:var(--green);color:#1a1a1a;border-color:var(--green)">
+          try in simulator
+        </a>
+        {% elif rec.cls in ['strong-sell','sell'] %}
+        <div class="suggestion bear">
+          <strong style="color:var(--red)">▼ Suggestion:</strong>
+          consider <strong style="color:var(--red)">selling or avoiding</strong>. multiple bearish signals.
+        </div>
+        <a href="{{ url_for('simulator') }}" class="btn danger" style="width:100%;justify-content:center">try in simulator</a>
+        {% else %}
+        <div class="suggestion hold">
+          <strong style="color:var(--yellow)">— Suggestion:</strong>
+          <strong style="color:var(--yellow)">hold</strong> or wait. mixed signals.
+        </div>
+        <a href="{{ url_for('simulator') }}" class="btn" style="width:100%;justify-content:center">try in simulator</a>
+        {% endif %}
+      </section>
+
+      <!-- Why -->
+      <section class="card s2">
+        <div class="card-head">
+          <span class="icon-tile">
+            <svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 2a7 7 0 0 0-4 12.7V17a2 2 0 0 0 2 2h4a2 2 0 0 0 2-2v-2.3A7 7 0 0 0 12 2zM9 21h6"/></svg>
+          </span>
+          <h2>//why this signal?</h2>
+        </div>
+        <ul class="reasons">
+          {% for reason in rec.reasons %}
+          <li>{{ reason }}</li>
+          {% endfor %}
+        </ul>
+      </section>
+
+      {% if support %}
+      <section class="card s3 support-card {{ 'bear' if rec.score < 0 else '' }}">
+        <div class="card-head">
+          <span class="icon-tile" style="background:{% if rec.score >= 0 %}var(--green){% else %}var(--red){% endif %};color:#1a1a1a">
+            <svg viewBox="0 0 24 24" fill="currentColor"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6" fill="#1a1a1a"/></svg>
+          </span>
+          <h2 style="font-size:1.05rem">//key supporting article</h2>
+        </div>
+        <div style="font-size:.94rem;font-weight:500;line-height:1.5;margin-bottom:10px">
+          {% if support.link %}<a href="{{ support.link }}" target="_blank" rel="noopener">{{ support.title }}</a>
+          {% else %}{{ support.title }}{% endif %}
+        </div>
+        <div class="row-flex gap-2">
+          {% if support.source %}<span class="badge-source">{{ support.source }}</span>{% endif %}
+          {% if support.pub %}<span class="text-muted" style="font-size:.7rem">{{ support.pub }}</span>{% endif %}
+        </div>
+        <div class="mt-3 text-muted" style="font-size:.78rem">
+          Supports the <strong style="color:{% if rec.score >= 0 %}var(--green){% else %}var(--red){% endif %}">{{ 'bullish' if rec.score >= 0 else 'bearish' }}</strong> case.
+        </div>
+      </section>
+      {% endif %}
+    </div>
+  </div>
+
+</div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+const TICKER = "{{ ticker }}";
+const MARKET_OPEN = {{ 'true' if market_open else 'false' }};
+let chart = null;
+
+const baseDataset = (label, data, color, dashed, fill) => ({
+  label, data, borderColor: color,
+  backgroundColor: fill ? 'rgba(246,168,200,0.08)' : 'transparent',
+  borderWidth: dashed ? 1.5 : 2.2,
+  borderDash: dashed ? [5,4] : [],
+  fill: !!fill, tension: 0.3, pointRadius: 0, pointHoverRadius: 4, spanGaps: true,
+});
+
+async function loadChart(rng) {
+  const status = document.getElementById('chartStatus');
+  status.style.display = 'block';
+  status.style.color = 'var(--muted)';
+  status.textContent = 'Loading…';
+  try {
+    if (!window.Chart) {
+      status.style.color = 'var(--yellow)';
+      status.textContent = 'Chart library unavailable.';
+      return;
+    }
+    const r = await fetch(`/api/chart/${TICKER}/${rng}`);
+    const d = await r.json();
+    if (d.error) {
+      status.style.color = 'var(--yellow)';
+      status.innerHTML = `⚠ Chart unavailable: <span style="color:#fff">${d.error}</span>`;
+      if (chart) { chart.destroy(); chart = null; }
+      return;
+    }
+    if (!d.dates || !d.dates.length) {
+      status.style.color = 'var(--yellow)';
+      status.textContent = 'No chart data returned for this range.';
+      if (chart) { chart.destroy(); chart = null; }
+      return;
+    }
+    status.style.display = 'none';
+    const cfg = {
+      type: 'line',
+      data: {
+        labels: d.dates,
+        datasets: [
+          { ...baseDataset('Price', d.prices, '#f6a8c8', false, true) },
+          { ...baseDataset(d.ma_short_label || 'Short MA', d.ma7_series,  '#ff9a3d', true, false) },
+          { ...baseDataset(d.ma_long_label  || 'Long MA',  d.ma30_series, '#5bd97a', true, false) },
+        ]
+      },
+      options: {
+        responsive: true, maintainAspectRatio: false,
+        interaction: { mode: 'index', intersect: false },
+        // Round-4 Bug #2 fix: animation goes under `options.animation` (singular),
+        // not `options.animations` (plural), and `animation: false` short-circuits
+        // the whole system. The canonical progressive-line pattern below.
+        animation: (function(){
+          const N = (d.prices || []).length || 1;
+          const TOTAL = 1500;
+          const delay = TOTAL / N;
+          return {
+            duration: TOTAL,
+            x: {
+              type: 'number', easing: 'linear', duration: delay, from: NaN,
+              delay(ctx) {
+                if (ctx.type !== 'data' || ctx.xStarted) return 0;
+                ctx.xStarted = true;
+                return ctx.index * delay;
+              }
+            },
+            y: {
+              type: 'number', easing: 'linear', duration: delay,
+              from(ctx) {
+                if (ctx.index === 0) {
+                  return ctx.chart.scales.y.getPixelForValue(ctx.chart.scales.y.min);
+                }
+                const prev = ctx.chart.getDatasetMeta(ctx.datasetIndex).data[ctx.index - 1];
+                return prev ? prev.getProps(['y'], true).y : 0;
+              },
+              delay(ctx) {
+                if (ctx.type !== 'data' || ctx.yStarted) return 0;
+                ctx.yStarted = true;
+                return ctx.index * delay;
+              }
+            }
+          };
+        })(),
+        plugins: {
+          legend: { labels: { color: '#e6edf3', boxWidth: 18, font: { size: 11 } } },
+          tooltip: {
+            backgroundColor: 'rgba(15,15,15,.96)', borderColor: '#f6a8c8', borderWidth: 1,
+            titleColor: '#f6a8c8', bodyColor: '#fff',
+            callbacks: { label: c => ' ' + c.dataset.label + ': $' + (c.parsed.y != null ? c.parsed.y.toFixed(2) : 'N/A') }
+          }
+        },
+        scales: {
+          x: { ticks: { color: '#a8a8a8', maxTicksLimit: 10, font: { size: 11 } }, grid: { color: 'rgba(255,255,255,.04)' } },
+          y: { ticks: { color: '#a8a8a8', font: { size: 11 }, callback: v => '$' + v.toFixed(0) }, grid: { color: 'rgba(255,255,255,.04)' } }
+        }
+      }
+    };
+    if (chart) chart.destroy();
+    chart = new Chart(document.getElementById('priceChart').getContext('2d'), cfg);
+  } catch (e) {
+    status.textContent = 'Error loading chart: ' + e.message;
+    status.style.color = 'var(--red)';
+  }
+}
+
+// Range button slider + handler
+const group = document.getElementById('rangeGroup');
+const slider = document.getElementById('rangeSlider');
+function positionSlider(btn){
+  const r = btn.getBoundingClientRect();
+  const g = group.getBoundingClientRect();
+  slider.style.width = r.width + 'px';
+  slider.style.transform = `translateX(${r.left - g.left - 4}px)`;
+}
+group.querySelectorAll('.range-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    group.querySelectorAll('.range-btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    positionSlider(btn);
+    loadChart(btn.dataset.range);
+  });
+});
+window.addEventListener('resize', () => positionSlider(group.querySelector('.range-btn.active')));
+
+// Boot
+requestAnimationFrame(() => positionSlider(group.querySelector('.range-btn.active')));
+loadChart('3m');
+
+// Animate confidence bar
+setTimeout(() => {
+  const f = document.getElementById('confFill');
+  if (f) f.style.width = '{{ rec.confidence }}%';
+}, 400);
+
+if (MARKET_OPEN) setTimeout(() => location.reload(), 60 * 1000);
+</script>
+{% endblock %}
