@@ -1,0 +1,284 @@
+"""Portfolio & bot routes:
+# Ticker management
+- Bot dashboard (/bot, /botcontrol, /bot/run, /bot/stop, /bot/start, /bot/reset)
+- /health (lightweight keepalive ping)
+"""
+import re
+import time
+from datetime import datetime
+from flask import render_template, request, redirect, url_for, flash, session
+
+from app import app
+from market.quotes import get_quote, is_valid_ticker
+from market.snapshots import signal_snapshot
+from trading.bot import (
+    bot_state, _render_bot_page, STARTING_CASH,
+)
+from trading.risk import get_market_regime
+from trading.suggestion_store import record_suggestion_feedback
+from utils.auth import require_admin_token
+from utils.config import BOT_ENABLED
+from utils.deploy_config import PYTHONANYWHERE_MODE
+from utils.storage import (
+    acquire_bot_file_lock, load_tickers, save_tickers, save_bot, load_bot,
+    SUGGESTION_DB_FILE,
+)
+from utils.threading_utils import start_scheduler_once, trigger_bot_if_due, _bot_run_lock
+from utils.time_utils import is_market_open
+
+
+# User session portfolio (paper trading simulator)
+def init_pf():
+    if "pf" not in session:
+        session["pf"] = {"cash": STARTING_CASH, "holdings": {}, "history": []}
+
+
+def pf_state():
+    init_pf()
+    pf = session["pf"]
+    total = pf["cash"]
+    rows = []
+    for t, h in pf["holdings"].items():
+        p = get_quote(t)["price"]
+        val = h["shares"] * p
+        cost = h["shares"] * h["avg_cost"]
+        pnl = val - cost
+        total += val
+        rows.append({"ticker": t, "shares": h["shares"], "avg_cost": h["avg_cost"],
+                     "price": p, "value": val, "pnl": pnl,
+                     "pnl_pct": (pnl / cost * 100) if cost else 0})
+    pnl_t = total - STARTING_CASH
+    return pf, rows, total, pnl_t, (pnl_t / STARTING_CASH * 100)
+
+
+# Ticker management
+@app.route("/ticker/add", methods=["POST"])
+def add_ticker():
+    require_admin_token()
+    t = (request.form.get("ticker") or "").upper().strip()
+    if not re.match(r"^[A-Z][A-Z0-9.\-]{0,7}$", t):
+        flash("Invalid ticker symbol.", "warning")
+        return redirect(request.referrer or url_for("index"))
+    tickers = load_tickers()
+    if t in tickers:
+        flash(f"{t} is already in your watchlist.", "info")
+    elif not is_valid_ticker(t):
+        flash(f"Could not find data for '{t}'. Check the symbol and try again.", "warning")
+    else:
+        tickers.append(t)
+        save_tickers(tickers)
+        flash(f"Added {t} to watchlist.", "success")
+    return redirect(request.referrer or url_for("index"))
+
+
+@app.route("/ticker/remove", methods=["POST"])
+def remove_ticker():
+    require_admin_token()
+    t = (request.form.get("ticker") or "").upper().strip()
+    tickers = load_tickers()
+    if t in tickers and len(tickers) > 1:
+        tickers.remove(t)
+        save_tickers(tickers)
+        flash(f"Removed {t} from watchlist.", "success")
+    elif len(tickers) <= 1:
+        flash("Can't remove the last ticker.", "warning")
+    return redirect(request.referrer or url_for("index"))
+
+
+# Simulator
+@app.route("/simulator")
+def simulator():
+    pf, holdings, total, pnl, pnl_pct = pf_state()
+    bot, b_hold, b_total, b_pnl, b_pnl_pct = bot_state()
+    tickers = load_tickers()
+    recs = {}
+    regime = get_market_regime()
+    for t in tickers:
+        owned = pf["holdings"].get(t, {}).get("shares", 0)
+        snap = signal_snapshot(t, regime=regime, live=not PYTHONANYWHERE_MODE,
+                               owned=owned)
+        recs[t] = {**snap["rec"], "price": snap["price"], "owned": owned}
+    return render_template("simulator.html",
+        pf=pf, holdings=holdings, total=total, pnl=pnl, pnl_pct=pnl_pct,
+        bot=bot, bot_holdings=b_hold, bot_total=b_total, bot_pnl=b_pnl, bot_pnl_pct=b_pnl_pct,
+        recs=recs, tickers=tickers, starting=STARTING_CASH,
+        market_open=is_market_open(), now=datetime.now())
+
+
+@app.route("/simulator/buy", methods=["POST"])
+def sim_buy():
+    init_pf()
+    t = (request.form.get("ticker") or "").upper()
+    try: sh = float(request.form.get("shares", 0))
+    except Exception: sh = 0
+    if t not in load_tickers() or sh <= 0:
+        return redirect(url_for("simulator"))
+    pf = session["pf"]; q = get_quote(t); p = q.get("price", 0)
+    if p <= 0 or q.get("stale"):
+        flash(f"No live price for {t}. Try again later.", "warning")
+        return redirect(url_for("simulator"))
+    cost = p * sh
+    if pf["cash"] >= cost:
+        pf["cash"] -= cost
+        h = pf["holdings"].get(t, {"shares": 0, "avg_cost": 0})
+        ns = h["shares"] + sh; na = (h["shares"] * h["avg_cost"] + cost) / ns
+        pf["holdings"][t] = {"shares": round(ns, 4), "avg_cost": round(na, 4)}
+        pf["history"] = [{"action": "BUY", "ticker": t, "shares": sh, "price": p, "total": cost,
+                          "time": datetime.now().strftime("%m/%d %H:%M")}] + pf["history"][:19]
+        session["pf"] = pf; session.modified = True
+    else:
+        flash(f"Not enough cash for {sh} shares of {t}.", "warning")
+    return redirect(url_for("simulator"))
+
+
+@app.route("/simulator/sell", methods=["POST"])
+def sim_sell():
+    init_pf()
+    t = (request.form.get("ticker") or "").upper()
+    try: sh = float(request.form.get("shares", 0))
+    except Exception: sh = 0
+    if t not in load_tickers() or sh <= 0:
+        return redirect(url_for("simulator"))
+    pf = session["pf"]; h = pf["holdings"].get(t)
+    if not h or h["shares"] < sh:
+        flash(f"You don't own enough {t} shares.", "warning")
+        return redirect(url_for("simulator"))
+    q = get_quote(t); p = q.get("price", 0)
+    if p <= 0 or q.get("stale"):
+        flash(f"No live price for {t}. Try again later.", "warning")
+        return redirect(url_for("simulator"))
+    pf["cash"] += p * sh
+    h["shares"] = round(h["shares"] - sh, 4)
+    if h["shares"] <= 0:
+        del pf["holdings"][t]
+    else:
+        pf["holdings"][t] = h
+    pf["history"] = [{"action": "SELL", "ticker": t, "shares": sh, "price": p, "total": p * sh,
+                      "time": datetime.now().strftime("%m/%d %H:%M")}] + pf["history"][:19]
+    session["pf"] = pf; session.modified = True
+    return redirect(url_for("simulator"))
+
+
+@app.route("/simulator/reset", methods=["POST"])
+def sim_reset():
+    session["pf"] = {"cash": STARTING_CASH, "holdings": {}, "history": []}
+    session.modified = True
+    flash("Your portfolio has been reset.", "success")
+    return redirect(url_for("simulator"))
+
+
+# Bot dashboard & controls
+@app.route("/botcontrol")
+def bot_dashboard():
+    """Admin page with run/stop/start/reset controls."""
+    auth = require_admin_token()
+    if auth is not True:
+        return auth
+    return _render_bot_page(read_only=False)
+
+
+@app.route("/bot")
+def bot_view():
+    """Public view-only; safe to share."""
+    return _render_bot_page(read_only=True)
+
+
+@app.route("/bot/view")
+def bot_view_legacy():
+    """Backwards-compat redirect; old /bot/view links keep working."""
+    return redirect(url_for("bot_view"))
+
+
+@app.route("/bot/reset", methods=["POST"])
+def bot_reset():
+    require_admin_token()
+    try: starting = float(request.form.get("starting", 10000))
+    except Exception: starting = 10000
+    starting = max(100, min(starting, 1_000_000))
+    with _bot_run_lock, acquire_bot_file_lock(timeout=10):
+        b = load_bot()
+        if b.get("_load_error"):
+            flash("Bot state is corrupt; reset refused to avoid overwriting bot_state.json.", "danger")
+            return redirect(url_for("bot_dashboard"))
+        save_bot({"cash": starting, "starting": starting, "holdings": {}, "history": [],
+                  "last_trade": time.time(), "recent_sells": {}, "stopped": False})
+    flash(f"Bot reset with ${starting:.0f} starting balance.", "success")
+# Simulator
+
+
+@app.route("/bot/stop", methods=["POST"])
+def bot_stop():
+    require_admin_token()
+    # Bug #2: hold _bot_run_lock for the read-modify-write so a user toggle can't
+    # race (and clobber) an in-flight trading pass.
+    with _bot_run_lock, acquire_bot_file_lock(timeout=10):
+        b = load_bot()
+        b["stopped"] = True
+        b["pending_run"] = False
+        save_bot(b)
+    flash("Bot stopped. Existing positions are kept; click 'start bot' to resume.", "warning")
+    return redirect(url_for("bot_dashboard"))
+
+
+@app.route("/bot/start", methods=["POST"])
+def bot_start():
+    require_admin_token()
+    with _bot_run_lock, acquire_bot_file_lock(timeout=10):
+        b = load_bot()
+        b["stopped"] = False
+        save_bot(b)
+    flash("Bot resumed; will run on the next health ping or manual run.", "success")
+    return redirect(url_for("bot_dashboard"))
+
+
+@app.route("/bot/run", methods=["POST"])
+def bot_run():
+    require_admin_token()
+    if not is_market_open():
+        flash("Market is closed; bot is already auto-queued for the next open.", "info")
+        return redirect(url_for("bot_dashboard"))
+    # A3: a human clicked "run now"; user_forced relaxes the TOD gate + buy-1 fallback.
+    started = trigger_bot_if_due(force=True, user_forced=True)
+    if started:
+        flash("Bot run triggered; refresh in a few seconds to see results.", "info")
+    elif not BOT_ENABLED:
+        flash("Bot is disabled by configuration; no run started.", "warning")
+    elif _bot_run_lock.locked():
+        flash("Bot is already running; no duplicate run started.", "info")
+    else:
+        flash("Bot run was not started; check logs if this repeats.", "warning")
+    return redirect(url_for("bot_dashboard"))
+
+
+@app.route("/bot/suggestion-feedback", methods=["POST"])
+def bot_suggestion_feedback():
+    require_admin_token()
+    action = (request.form.get("action") or "").strip().lower()
+    ticker = (request.form.get("ticker") or "").strip().upper()
+    run_id = (request.form.get("run_id") or "").strip()
+    if action not in {"useful", "weak", "hide"} or not ticker:
+        flash("Invalid suggestion feedback.", "warning")
+        return redirect(url_for("bot_dashboard"))
+    try:
+        record_suggestion_feedback(SUGGESTION_DB_FILE, run_id, ticker, action, int(time.time()))
+    except Exception as e:
+        try: print(f"[suggestion_store] feedback failed: {e}")
+        except Exception: pass
+    if action == "hide":
+        with _bot_run_lock, acquire_bot_file_lock(timeout=10):
+            b = load_bot()
+            b["extra_ticker_suggestions"] = [
+                s for s in b.get("extra_ticker_suggestions", [])
+                if s.get("ticker") != ticker or s.get("run_id") != run_id
+            ]
+            save_bot(b)
+    flash(f"Saved {ticker} suggestion feedback.", "success")
+    return redirect(url_for("bot_dashboard"))
+
+
+@app.route("/health")
+def health():
+    """Lightweight keepalive endpoint. Returns 2 bytes. UptimeRobot-friendly."""
+    start_scheduler_once()
+    trigger_bot_if_due(force=False)
+    return "ok", 200, {"Content-Type": "text/plain"}

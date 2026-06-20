@@ -1,0 +1,6 @@
+Flask>=3.0,<4
+finnhub-python>=2.4,<3
+yfinance>=0.2,<1
+pandas>=2.0,<3
+vaderSentiment>=3.3,<4
+scipy>=1.10,<2

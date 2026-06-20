@@ -1,0 +1,22 @@
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+
+.venv/
+venv/
+env/
+
+*.log
+*.tmp
+data/cache/
+
+# Keep production state out of source deployments unless explicitly copied.
+data/bot_state.json
+data/price_history.json
+
+# Historical monolith; useful locally, not needed for deploy package.
+_legacy/
