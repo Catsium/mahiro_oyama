@@ -66,3 +66,4 @@ DECISIONS.md
 .planning/REQUIREMENTS.md
 .planning/PROJECT.md
 .planning/config.json
+tests/test_stabilization.py
