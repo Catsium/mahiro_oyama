@@ -82,6 +82,10 @@ body::before{
 .nav .links a:hover{color:#fff;background:rgba(255,255,255,.04)}
 .nav .links a.active{color:var(--pink);background:var(--pink-bg)}
 .nav .right{margin-left:auto;display:flex;align-items:center;gap:10px}
+.trust-note{
+  max-width:1100px;margin:10px auto 0;padding:0 16px;
+  color:var(--muted);font-size:.72rem;text-align:center;
+}
 
 /* ============== layout ============== */
 .scene{position:relative;min-height:100vh;padding:30px 16px 80px}
@@ -241,6 +245,12 @@ table.t tbody tr{transition:background var(--t-fast)}
 table.t tbody tr:hover{background:rgba(246,168,200,.06)}
 table.t tbody tr.clickable{cursor:pointer}
 table.t tbody tr:last-child td{border-bottom:0}
+
+@media(max-width:700px){
+  .card{overflow-x:auto}
+  .scroll{overflow:auto;-webkit-overflow-scrolling:touch}
+  table.t{min-width:640px}
+}
 
 .sym{font-weight:700;color:#fff;letter-spacing:.3px}
 .sym a{color:#fff}
@@ -655,7 +665,12 @@ table.t tbody tr:hover { background: rgba(246,168,200,.06) !important; }
   animation-duration: 2.6s;
 }
 
-/* Personal dashboard preference: keep motion active even if the OS reports reduced motion. */
 @media (prefers-reduced-motion: reduce) {
-  #onimai-canvas { opacity: .56; }
+  *,*::before,*::after{
+    animation-duration:.001ms !important;
+    animation-iteration-count:1 !important;
+    transition-duration:.001ms !important;
+    scroll-behavior:auto !important;
+  }
+  .bgvid,#onimai-canvas,.cat-sparkle{display:none !important}
 }

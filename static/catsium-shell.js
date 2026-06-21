@@ -9,7 +9,12 @@
 
   var motionStarted = false;
 
+  function prefersReducedMotion() {
+    return window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  }
+
   function mountMedia() {
+    if (prefersReducedMotion()) return;
     if (document.querySelector('.bgvid')) return;
 
     function addGif() {
@@ -238,6 +243,11 @@
 
   function initOnimaiMotion() {
     if (motionStarted) return;
+    if (prefersReducedMotion()) {
+      motionStarted = true;
+      document.documentElement.classList.add('motion-reduced');
+      return;
+    }
     motionStarted = true;
     document.documentElement.classList.add('motion-ready');
     initSakuraCanvas();
@@ -247,6 +257,10 @@
 
   window.CatsiumShell = {
     mount: function () {
+      if (prefersReducedMotion()) {
+        document.documentElement.classList.add('motion-reduced');
+        return;
+      }
       mountMedia();
       initOnimaiMotion();
     },

@@ -46,7 +46,7 @@
     <div class="row-flex gap-2">
       <form method="POST" action="{{ url_for('top_refresh') }}">
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-        <button class="ghost-btn" type="submit">
+        <button class="ghost-btn" type="submit" aria-label="Force a fresh scan">
           <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 3-6.7"/><path d="M3 4v5h5"/></svg>
           force rescan
         </button>
@@ -102,12 +102,12 @@
           </td>
           <td>
             {% if r.ticker in watchlist %}
-            <span class="text-muted" title="In watchlist" style="font-size:.85rem;color:var(--yellow)">★</span>
+            <span class="text-muted" title="In watchlist" role="img" aria-label="Already in watchlist" style="font-size:.85rem;color:var(--yellow)">★</span>
             {% else %}
             <form method="POST" action="{{ url_for('add_ticker') }}">
               <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
               <input type="hidden" name="ticker" value="{{ r.ticker }}">
-              <button type="submit" class="add-btn">+</button>
+              <button type="submit" class="add-btn" aria-label="Add {{ r.ticker }} to watchlist">+</button>
             </form>
             {% endif %}
           </td>

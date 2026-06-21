@@ -77,22 +77,26 @@
       <div class="head-meta"><small class="text-muted">add any US ticker · bot will trade from this list</small></div>
     </div>
     <div class="row-flex gap-2" id="watchChips">
-      {% for t in tickers %}
+      {% set shown_tickers = visible_tickers if visible_tickers is defined else tickers %}
+      {% for t in shown_tickers %}
       <span class="tchip">
         <a href="{{ url_for('stock_detail', ticker=t) }}">{{ t }}</a>
         {% if tickers|length > 1 %}
         <form method="POST" action="{{ url_for('remove_ticker') }}" onsubmit="return confirm('Remove {{ t }}?')">
           <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
           <input type="hidden" name="ticker" value="{{ t }}">
-          <button type="submit" class="x" title="Remove">×</button>
+          <button type="submit" class="x" title="Remove" aria-label="Remove {{ t }}">&times;</button>
         </form>
         {% endif %}
       </span>
       {% endfor %}
+      {% if hidden_ticker_count|default(0) > 0 %}
+      <span class="text-muted ticker-limit-note">showing {{ shown_tickers|length }} of {{ tickers|length }} on this page</span>
+      {% endif %}
     </div>
     <form method="POST" action="{{ url_for('add_ticker') }}" class="add-form">
       <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-      <input class="field" name="ticker" placeholder="add ticker (e.g. TSLA, AMD)" maxlength="8" required>
+      <input class="field" name="ticker" placeholder="add ticker (e.g. TSLA, AMD)" aria-label="Ticker symbol" maxlength="8" required>
       <button type="submit" class="add-btn">+ Add</button>
     </form>
   </section>
@@ -168,12 +172,12 @@
               <td><strong>{{ r.confidence }}%</strong></td>
               <td>
                 {% if r.ticker in tickers %}
-                <span title="already in watchlist" style="font-size:.85rem;color:var(--yellow);text-shadow:0 0 6px rgba(255,200,87,.55)">★</span>
+                <span title="already in watchlist" role="img" aria-label="Already in watchlist" style="font-size:.85rem;color:var(--yellow);text-shadow:0 0 6px rgba(255,200,87,.55)">★</span>
                 {% else %}
                 <form method="POST" action="{{ url_for('add_ticker') }}" style="display:inline">
                   <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
                   <input type="hidden" name="ticker" value="{{ r.ticker }}">
-                  <button type="submit" class="add-btn" style="font-size:.65rem;padding:3px 9px">+</button>
+                  <button type="submit" class="add-btn" style="font-size:.65rem;padding:3px 9px" aria-label="Add {{ r.ticker }} to watchlist">+</button>
                 </form>
                 {% endif %}
               </td>
@@ -213,12 +217,12 @@
               <td><span class="sig {{ r.cls }}">{{ r.signal }}</span></td>
               <td>
                 {% if r.ticker in tickers %}
-                <span title="already in watchlist" style="font-size:.85rem;color:var(--yellow);text-shadow:0 0 6px rgba(255,200,87,.55)">★</span>
+                <span title="already in watchlist" role="img" aria-label="Already in watchlist" style="font-size:.85rem;color:var(--yellow);text-shadow:0 0 6px rgba(255,200,87,.55)">★</span>
                 {% else %}
                 <form method="POST" action="{{ url_for('add_ticker') }}" style="display:inline">
                   <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
                   <input type="hidden" name="ticker" value="{{ r.ticker }}">
-                  <button type="submit" class="add-btn" style="font-size:.65rem;padding:3px 9px">+</button>
+                  <button type="submit" class="add-btn" style="font-size:.65rem;padding:3px 9px" aria-label="Add {{ r.ticker }} to watchlist">+</button>
                 </form>
                 {% endif %}
               </td>
@@ -272,13 +276,4 @@
 
 </div>
 </div>
-{% endblock %}
-
-{% block scripts %}
-<script>
-  // Auto-refresh every 60s during market hours so signal confidence,
-  // top confidence, and top gainers update at ~1-minute cadence.
-  var MKT_OPEN_DASH = {{ 'true' if market_open else 'false' }};
-  if (MKT_OPEN_DASH) setTimeout(function(){ location.reload(); }, 60 * 1000);
-</script>
 {% endblock %}

@@ -3,13 +3,17 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Catsium is a paper-trading stock dashboard with watchlist signals, scans, and bot portfolio tracking.">
+  <meta property="og:title" content="Catsium paper-trading dashboard">
+  <meta property="og:description" content="Watchlist signals, scans, and paper bot portfolio tracking. Not financial advice.">
+  <meta property="og:type" content="website">
+  <meta name="twitter:card" content="summary">
   <title>{% block title %}//catsium{% endblock %}</title>
+  <link rel="icon" href="{{ url_for('static', filename='catsium.png') }}">
+  <link rel="apple-touch-icon" href="{{ url_for('static', filename='catsium.png') }}">
   <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
   <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css" rel="stylesheet">
   <link rel="stylesheet" href="{{ url_for('static', filename='catsium.css') }}">
-  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.2/dist/chart.umd.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/hammerjs@2.0.8/hammer.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-zoom@2.0.1/dist/chartjs-plugin-zoom.min.js"></script>
   <style>
     /* Flash messages */
     .flash-wrap{max-width:1100px;margin:14px auto 0;padding:0 16px}
@@ -49,6 +53,10 @@
     </span>
   </div>
 </nav>
+
+<div class="trust-note" role="note">
+  Paper-trading research dashboard. Not financial advice. Data may be delayed or stale.
+</div>
 
 {% with messages = get_flashed_messages(with_categories=true) %}
   {% if messages %}
