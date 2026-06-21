@@ -15,7 +15,7 @@ from trading.risk import (
 )
 from trading.signals import get_recommendation
 from utils.auth import require_admin_token
-from utils.deploy_config import PYTHONANYWHERE_MODE
+from utils.deploy_config import PA_PAGE_TICKER_LIMIT, PYTHONANYWHERE_MODE
 from utils.storage import load_tickers
 from utils.time_utils import is_market_open
 
@@ -23,9 +23,11 @@ from utils.time_utils import is_market_open
 @app.route("/")
 def index():
     tickers = load_tickers()
+    visible_tickers = tickers[:PA_PAGE_TICKER_LIMIT] if PYTHONANYWHERE_MODE else tickers
+    hidden_ticker_count = max(0, len(tickers) - len(visible_tickers))
     regime = get_market_regime()
     cards = []
-    for t in tickers:
+    for t in visible_tickers:
         snap = signal_snapshot(t, regime=regime, live=not PYTHONANYWHERE_MODE)
         cards.append({"ticker": t, "quote": snap["quote"],
                       "sentiment": snap["sentiment"], "rec": snap["rec"]})
@@ -39,7 +41,10 @@ def index():
         key=lambda r: -r["pct"]
     )[:10]
     scan_age_min = int((time.time() - scan_ts) / 60) if scan_ts else None
-    return render_template("index.html", cards=cards, tickers=tickers, regime=regime,
+    return render_template("index.html", cards=cards, tickers=tickers,
+                           visible_tickers=visible_tickers,
+                           hidden_ticker_count=hidden_ticker_count,
+                           regime=regime,
                            top_confidence=top_confidence, top_gainers=top_gainers,
                            scan_age_min=scan_age_min, scan_total=len(scan_rows),
                            now=datetime.now(), market_open=is_market_open())
