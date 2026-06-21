@@ -1,22 +1,62 @@
+# Python cache
 __pycache__/
+**/__pycache__/
 *.py[cod]
 *.pyo
+*.pyd
+
+# Test / lint / coverage cache
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
 .coverage
+htmlcov/
 
+# Virtual environments
 .venv/
 venv/
 env/
 
+# Logs
 *.log
-*.tmp
-data/cache/
+*.out.log
+*.err.log
 
-# Keep production state out of source deployments unless explicitly copied.
+# Temp / lock files
+*.tmp
+*.lock
+
+# Local environment / secrets
+.env
+*.env
+.env.*
+secrets.json
+credentials.json
+token.json
+*.pem
+*.key
+
+# App runtime data
+data/cache/
+data/backups/
+data/design_backups/
 data/bot_state.json
 data/price_history.json
+data/*.lock
 
-# Historical monolith; useful locally, not needed for deploy package.
+# Keep if tickers.json is your normal watchlist config.
+# If it is generated automatically, uncomment this:
+# data/tickers.json
+
+# Legacy local code
 _legacy/
+
+# OS / editor junk
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+AGENTS.md
+CLAUDE.md
+DECISIONS.md
