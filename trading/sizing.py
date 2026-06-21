@@ -330,6 +330,8 @@ def evaluate_candidate(candidate, total_equity, regime_stop_pct, regime_kind,
         source == "watchlist"
         and edge.get("edge_source") == "confidence_prior"
         and rec.get("cls") in ("buy", "strong-buy")
+        and rec.get("confidence", 0) >= float(signal_cfg.get("min_buy_confidence", 55))
+        and net >= 0
     )
     tradable = risk_sized and (ev_pass or warmup_watchlist)
     if not risk_sized:

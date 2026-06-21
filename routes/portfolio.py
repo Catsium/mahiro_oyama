@@ -12,7 +12,7 @@ from app import app
 from market.quotes import get_quote, is_valid_ticker
 from market.snapshots import signal_snapshot
 from trading.bot import (
-    bot_state, _render_bot_page, STARTING_CASH,
+    bot_state, _render_bot_page, STARTING_CASH, warm_scan_if_due,
 )
 from trading.risk import get_market_regime
 from trading.suggestion_store import record_suggestion_feedback
@@ -203,6 +203,7 @@ def bot_reset():
         save_bot({"cash": starting, "starting": starting, "holdings": {}, "history": [],
                   "last_trade": time.time(), "recent_sells": {}, "stopped": False})
     flash(f"Bot reset with ${starting:.0f} starting balance.", "success")
+    return redirect(url_for("bot_dashboard"))
 # Simulator
 
 
@@ -281,4 +282,5 @@ def health():
     """Lightweight keepalive endpoint. Returns 2 bytes. UptimeRobot-friendly."""
     start_scheduler_once()
     trigger_bot_if_due(force=False)
+    warm_scan_if_due()
     return "ok", 200, {"Content-Type": "text/plain"}

@@ -232,7 +232,7 @@ class TradingV1SizingTests(unittest.TestCase):
                         hi_eval["risk"]["target_notional"])
         self.assertIn("non-dip volume <1.2", lo_eval["risk"]["size_penalties"])
 
-    def test_confidence_prior_watchlist_warmup_can_trade(self):
+    def test_confidence_prior_watchlist_warmup_requires_min_confidence(self):
         cand = self._candidate("WARM", 35, "trend", atr_pct=2.0, score=4.0)
         cand["rec"]["cls"] = "strong-buy"
         cand["rec"]["signal"] = "STRONG BUY"
@@ -248,8 +248,8 @@ class TradingV1SizingTests(unittest.TestCase):
             edge_stats={},
             min_position_usd=400,
         )
-        self.assertTrue(out["tradable"])
-        self.assertEqual(out["rank_reason"], "warm-up confidence prior allowed")
+        self.assertFalse(out["tradable"])
+        self.assertIn("EV gate", out["rank_reason"])
         self.assertGreaterEqual(out["risk"]["target_notional"], 400)
         self.assertEqual(out["sizing_confidence"], 55)
 
@@ -1679,6 +1679,9 @@ class PythonAnywhereHardeningTests(unittest.TestCase):
             second = bot._pa_stage_tickers(["A", "B", "C", "D"], ["H1", "H2"], state)
             self.assertEqual(first, ["H1", "H2", "A"])
             self.assertEqual(second, ["H1", "H2", "B"])
+            state = {}
+            self.assertEqual(bot._pa_stage_tickers(["SPY", "A", "QQQ"], [], state), ["A"])
+            self.assertEqual(bot._pa_stage_tickers(["SPY", "A"], ["SPY"], state), ["SPY", "A"])
         finally:
             bot.PYTHONANYWHERE_MODE = old_pa
             bot.PA_TICKERS_PER_BOT_RUN = old_batch

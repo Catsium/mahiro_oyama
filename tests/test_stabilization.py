@@ -14,6 +14,17 @@ os.environ.setdefault("FINNHUB_KEY", "test-finnhub")
 os.environ.setdefault("FLASK_SECRET_KEY", "test-secret")
 
 
+def _has_real_flask():
+    try:
+        import flask
+        return hasattr(flask.Flask, "test_client")
+    except Exception:
+        return False
+
+
+HAS_REAL_FLASK = _has_real_flask()
+
+
 class ConfigTests(unittest.TestCase):
     def test_test_mode_supplies_placeholder_secrets(self):
         from utils.config import get_finnhub_key, get_flask_secret_key, redacted_config
@@ -184,6 +195,7 @@ class StorageTests(unittest.TestCase):
         self.assertIn("commission_invested", state["holdings"]["AAPL"])
 
 
+@unittest.skipUnless(HAS_REAL_FLASK, "Flask not installed")
 class SimulatorRouteTests(unittest.TestCase):
     def setUp(self):
         from app import app
@@ -222,6 +234,7 @@ class SimulatorRouteTests(unittest.TestCase):
             self.assertEqual(sess["pf"]["holdings"]["AAPL"]["shares"], 2.0)
 
 
+@unittest.skipUnless(HAS_REAL_FLASK, "Flask not installed")
 class AuthRouteTests(unittest.TestCase):
     def setUp(self):
         from app import app
@@ -255,6 +268,7 @@ class AuthRouteTests(unittest.TestCase):
         self.assertEqual(response.status_code, 403)
 
 
+@unittest.skipUnless(HAS_REAL_FLASK, "Flask not installed")
 class DashboardRouteTests(unittest.TestCase):
     def setUp(self):
         from app import app
@@ -291,7 +305,46 @@ class DashboardRouteTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.get_data(as_text=True), "ok")
 
+    def test_pythonanywhere_dashboard_caps_visible_tickers_only(self):
+        tickers = ["AAPL", "MSFT", "NVDA"]
+        snapshot_calls = []
+        rendered = {}
 
+        def fake_snapshot(ticker, **_kwargs):
+            snapshot_calls.append(ticker)
+            return {
+                "quote": {"price": 1, "pct": 0, "change": 0, "high": 1, "low": 1, "prev": 1},
+                "sentiment": 0,
+                "rec": {"signal": "HOLD", "cls": "hold", "confidence": 0, "score": 0},
+            }
+
+        def fake_render(_template, **kwargs):
+            rendered.update(kwargs)
+            return "ok"
+
+        patches = [
+            patch("routes.dashboard.PYTHONANYWHERE_MODE", True),
+            patch("routes.dashboard.PA_PAGE_TICKER_LIMIT", 2),
+            patch("routes.dashboard.load_tickers", return_value=tickers),
+            patch("routes.dashboard.get_market_regime", return_value={"regime": "neutral", "spy_mom_30d": 0}),
+            patch("routes.dashboard.signal_snapshot", side_effect=fake_snapshot),
+            patch("routes.dashboard.get_scan", return_value=([], 0)),
+            patch("routes.dashboard.render_template", side_effect=fake_render),
+        ]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+
+        response = self.client.get("/")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_data(as_text=True), "ok")
+        self.assertEqual(snapshot_calls, ["AAPL", "MSFT"])
+        self.assertEqual(rendered["tickers"], tickers)
+        self.assertEqual(rendered["visible_tickers"], ["AAPL", "MSFT"])
+        self.assertEqual(rendered["hidden_ticker_count"], 1)
+
+
+@unittest.skipUnless(HAS_REAL_FLASK, "Flask not installed")
 class ApiRouteTests(unittest.TestCase):
     def setUp(self):
         from app import app
@@ -324,6 +377,7 @@ class ApiRouteTests(unittest.TestCase):
                 self.assertEqual(response.status_code, 403, path)
 
 
+@unittest.skipUnless(HAS_REAL_FLASK, "Flask not installed")
 class TriggerRouteTests(unittest.TestCase):
     def setUp(self):
         from app import app
@@ -366,12 +420,14 @@ class TriggerRouteTests(unittest.TestCase):
     def test_health_is_the_public_trigger_route(self):
         with patch("routes.portfolio.start_scheduler_once") as scheduler:
             with patch("routes.portfolio.trigger_bot_if_due") as trigger:
-                response = self.client.get("/health")
+                with patch("routes.portfolio.warm_scan_if_due") as scan:
+                    response = self.client.get("/health")
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.get_data(as_text=True), "ok")
         scheduler.assert_called_once_with()
         trigger.assert_called_once_with(force=False)
+        scan.assert_called_once_with()
 
     def test_bot_reset_refuses_corrupt_loaded_state(self):
         patches = [
@@ -500,6 +556,7 @@ class ScanTests(unittest.TestCase):
                                         with patch("trading.bot.get_recommendation", side_effect=recommendation):
                                             rows = bot.run_scan()
         self.assertEqual([r["ticker"] for r in rows], ["AAA"])
+        self.assertIsInstance(rows[0]["ts"], int)
 
 
 if __name__ == "__main__":

@@ -16,6 +16,7 @@ from utils.auth import require_admin_token
 from utils.cache import api_failure_snapshot, cache_get
 from utils.deploy_config import PYTHONANYWHERE_MODE
 from utils.storage import load_bot, load_tickers
+from utils.threading_utils import _BOT_STATUS
 
 
 @app.route("/api/chart/<ticker>/<rng>")
@@ -91,6 +92,9 @@ def api_bot_status():
             "skip_reason_counts": diag.get("skip_reason_counts", {}),
             "buyable_reject_counts": diag.get("buyable_reject_counts", {}),
             "scan_payload_misses": diag.get("scan_payload_misses", 0),
+            "scan_age_sec": diag.get("scan_age_sec"),
+            "scan_rows_count": diag.get("scan_rows_count"),
+            "scan_fresh_rows_count": diag.get("scan_fresh_rows_count"),
             "pa_stage_status": diag.get("pa_stage_status"),
             "spy_data_ok": diag.get("spy_data_ok"),
             "regime_data_status": diag.get("regime_data_status"),
@@ -109,6 +113,8 @@ def api_bot_status():
         },
         "last_state_write_ts": b.get("last_state_write_ts"),
         "last_cache_prune": b.get("last_cache_prune"),
+        "last_bot_error": _BOT_STATUS.get("last_error"),
+        "last_bot_error_ts": _BOT_STATUS.get("last_error_ts"),
     })
 
 

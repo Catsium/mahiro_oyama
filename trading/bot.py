@@ -89,6 +89,7 @@ SUGGESTION_MIN_ADV_USD = 15_000_000
 SUGGESTION_MIN_PRICE = 5.0
 SUGGESTION_RECENT_TICKER_COOLDOWN_SEC = 6 * 3600
 EQUITY_HISTORY_MAX = 400 if PYTHONANYWHERE_MODE else 2000
+BENCHMARK_ONLY_TICKERS = {"SPY", "QQQ", "VOO"}
 KNIFE_CATALYST_TYPES = {
     "earnings_miss",
     "guidance_cut",
@@ -153,6 +154,7 @@ def _new_no_buy_diag(now, b, force=False, user_forced=False):
         "scan_fresh": None,
         "scan_age_sec": None,
         "scan_rows_count": None,
+        "scan_fresh_rows_count": None,
         "scan_payload_misses": 0,
         "main_blocker": None,
     }
@@ -240,7 +242,10 @@ def _pa_stage_tickers(tickers, holdings, b):
     if not PYTHONANYWHERE_MODE:
         return list(set(tickers) | set(holdings))
     holdings_ordered = [t for t in holdings if t]
-    watch = [t for t in tickers if t not in holdings_ordered]
+    watch = [
+        t for t in tickers
+        if t not in holdings_ordered and t not in BENCHMARK_ONLY_TICKERS
+    ]
     if not watch:
         return holdings_ordered
     room = max(0, PA_TICKERS_PER_BOT_RUN - len(holdings_ordered))
@@ -1106,16 +1111,16 @@ def _run_bot_locked(force=False, user_forced=False):
                     f"at {shadow.get('pnl_pct'):+.1f}%."
                 )
             sh = h["shares"]
-            # Round-5 cost model: flat $0.99, no bps markup. proceeds = sh*pr − 0.99.
-            realized = sh * pr - sh * h["avg_cost"] - COMMISSION_PER_TRADE
+            # Round-5 cost model: flat $0.99, no bps markup.
+            entry_commission = float(h.get("commission_invested", 0) or 0)
+            realized = sh * pr - sh * h["avg_cost"] - entry_commission - COMMISSION_PER_TRADE
             b["total_costs_usd"] = round(b.get("total_costs_usd", 0) + COMMISSION_PER_TRADE, 2)
             b["cash"] += sh * pr - COMMISSION_PER_TRADE
             # A4: the learning loop (Kelly, cold-streak, win-rate, calibration) must see
             # NET P&L — the gross price move overstates edge by the full round-trip
             # commission. `pnl_pct` stays gross for the human-readable reason string.
-            cost_basis = sh * h["avg_cost"]
-            net_pnl_pct = (((sh * pr - cost_basis - 2 * COMMISSION_PER_TRADE) / cost_basis * 100)
-                           if cost_basis else 0)
+            cost_basis = sh * h["avg_cost"] + entry_commission
+            net_pnl_pct = (realized / cost_basis * 100) if cost_basis else 0
             _record_trade(b, "SELL", t, sh, pr, s["rec"], s["arts"], sell_reason,
                           pnl_usd=round(realized, 2))
             entry_snap = h.get("entry_snapshot") or {}
@@ -1282,10 +1287,16 @@ def _run_bot_locked(force=False, user_forced=False):
     candidate_pool = []
     scan_data_snapshot, scan_ts_snapshot = _scan_snapshot()
     scan_age = now - (scan_ts_snapshot or 0)
-    scan_fresh = bool(scan_data_snapshot) and scan_age < SCAN_FRESHNESS_SEC
+    scan_rows_all = scan_data_snapshot or []
+    fresh_scan_rows = [
+        r for r in scan_rows_all
+        if now - float(r.get("ts") or scan_ts_snapshot or 0) < SCAN_FRESHNESS_SEC
+    ]
+    scan_fresh = bool(fresh_scan_rows)
     no_buy_diag["scan_fresh"] = bool(scan_fresh)
     no_buy_diag["scan_age_sec"] = int(scan_age) if scan_ts_snapshot else None
-    no_buy_diag["scan_rows_count"] = len(scan_data_snapshot or [])
+    no_buy_diag["scan_rows_count"] = len(scan_rows_all)
+    no_buy_diag["scan_fresh_rows_count"] = len(fresh_scan_rows)
 
     if not buys_paused and regime_allow_buys and tod_ok:
         for t, s in sigs.items():
@@ -1294,8 +1305,7 @@ def _run_bot_locked(force=False, user_forced=False):
                 candidate_pool.append(_candidate(t, s, "watchlist"))
 
         if scan_fresh and b["cash"] - cash_floor > MIN_POSITION_USD:
-            scan_rows = scan_data_snapshot or []
-            bullish = [r for r in scan_rows if r["direction"] > 0 and r["price"] > 0]
+            bullish = [r for r in fresh_scan_rows if r["direction"] > 0 and r["price"] > 0]
             by_conf = sorted(bullish, key=lambda r: (-r["confidence"], -r["score"]))[:10]
             by_gain = sorted(bullish, key=lambda r: -r["pct"])[:10]
             seen = set(); pool = []
@@ -1532,6 +1542,10 @@ def _run_bot_locked(force=False, user_forced=False):
         trend_start = prior.get("trend_start_ts") or int(now)
         b["holdings"][t] = {
             "shares": round(ns, 4), "avg_cost": round(na, 4),
+            "commission_invested": round(
+                float(prior.get("commission_invested", 0) or 0) + COMMISSION_PER_TRADE,
+                4,
+            ),
             "peak": round(max(prior.get("peak", cand["price"]), cand["price"]), 4),
             "trough": round(min(prior.get("trough", cand["price"]), cand["price"]), 4),
             "entry_categories": prior.get("entry_categories") or rec.get("categories", {}),
@@ -1820,6 +1834,11 @@ def _render_bot_page(read_only):
         "skip_reason_counts": no_buy.get("skip_reason_counts", {}),
         "buyable_reject_counts": no_buy.get("buyable_reject_counts", {}),
         "scan_payload_misses": no_buy.get("scan_payload_misses", 0),
+        "scan_age_sec": no_buy.get("scan_age_sec"),
+        "scan_rows_count": no_buy.get("scan_rows_count"),
+        "scan_fresh_rows_count": no_buy.get("scan_fresh_rows_count"),
+        "last_bot_error": _BOT_STATUS.get("last_error"),
+        "last_bot_error_ts": _BOT_STATUS.get("last_error_ts"),
         "pa_stage_status": no_buy.get("pa_stage_status"),
         "spy_data_ok": no_buy.get("spy_data_ok"),
         "regime_data_status": no_buy.get("regime_data_status"),
@@ -1937,6 +1956,7 @@ def run_scan():
                 "confidence": rec["confidence"], "score": rec["score"],
                 "sentiment": sent, "direction": direction,
                 "rsi": ctx.get("rsi", 0) if ctx else 0,
+                "ts": int(time.time()),
             }
         except Exception:
             return None
@@ -1977,6 +1997,18 @@ def _refresh_scan_background():
     finally:
         with _scan_refresh_lock:
             _scan_refresh_in_flight = False
+
+
+def warm_scan_if_due():
+    """Start one background scan refresh if /health is keeping the app awake."""
+    data, ts = _scan_snapshot()
+    if not is_market_open() or (data and time.time() - ts < SCAN_CACHE_TTL * 0.8):
+        return False
+    try:
+        threading.Thread(target=_refresh_scan_background, daemon=True).start()
+        return True
+    except Exception:
+        return False
 
 
 def get_scan():
