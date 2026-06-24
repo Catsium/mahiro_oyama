@@ -64,6 +64,8 @@ def trigger_bot_if_due(force=False, user_forced=False, min_interval=None):
     if not BOT_ENABLED:
         return False
     interval = BOT_TRIGGER_MIN_INTERVAL if min_interval is None else min_interval
+    if not force:
+        interval = max(interval, BOT_INTERVAL)
     now = time.time()
     with _trigger_lock:
         if _bot_run_lock.locked():

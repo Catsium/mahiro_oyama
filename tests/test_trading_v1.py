@@ -1657,9 +1657,13 @@ class PythonAnywhereHardeningTests(unittest.TestCase):
             tu._BOT_STATUS["last_run_ts"] = time.time()
             self.assertFalse(tu.trigger_bot_if_due(min_interval=60))
             self.assertEqual(calls, [])
-            tu._BOT_STATUS["last_run_ts"] = 0
-            self.assertTrue(tu.trigger_bot_if_due(min_interval=1))
+            self.assertFalse(tu.trigger_bot_if_due(min_interval=1))
+            self.assertEqual(calls, [])
+            self.assertTrue(tu.trigger_bot_if_due(force=True, min_interval=999))
             self.assertEqual(len(calls), 1)
+            tu._BOT_STATUS["last_run_ts"] = time.time() - tu.BOT_INTERVAL - 1
+            self.assertTrue(tu.trigger_bot_if_due(min_interval=1))
+            self.assertEqual(len(calls), 2)
         finally:
             tu.BOT_ENABLED = old_enabled
             tu._trigger_bot_async = old_async
