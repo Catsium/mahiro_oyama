@@ -6,13 +6,14 @@
 import re
 import time
 from datetime import datetime
-from flask import render_template, request, redirect, url_for, flash, session
+from flask import render_template, request, redirect, url_for, flash, session, jsonify
 
 from app import app
 from market.quotes import get_quote, is_valid_ticker
 from market.snapshots import signal_snapshot
 from trading.bot import (
-    bot_state, _render_bot_page, STARTING_CASH,
+    bot_state, _render_bot_page, STARTING_CASH, warm_scan_if_due,
+    run_bot, BOT_TICK_MAX_RUNTIME_SEC,
 )
 from trading.risk import get_market_regime
 from trading.suggestion_store import record_suggestion_feedback
@@ -203,6 +204,7 @@ def bot_reset():
         save_bot({"cash": starting, "starting": starting, "holdings": {}, "history": [],
                   "last_trade": time.time(), "recent_sells": {}, "stopped": False})
     flash(f"Bot reset with ${starting:.0f} starting balance.", "success")
+    return redirect(url_for("bot_dashboard"))
 # Simulator
 
 
@@ -250,6 +252,36 @@ def bot_run():
     return redirect(url_for("bot_dashboard"))
 
 
+@app.route("/bot/tick", methods=["POST"])
+def bot_tick():
+    auth = require_admin_token()
+    if auth is not True:
+        return auth
+    if _bot_run_lock.locked():
+        return jsonify({"status": "already_running"}), 409
+    start = time.time()
+    b, traded, last_action = run_bot(force=True, user_forced=True)
+    diag = b.get("last_no_buy_diagnostics") or {}
+    runtime = round(time.time() - start, 3)
+    return jsonify({
+        "status": diag.get("main_blocker") or last_action or "complete",
+        "traded": bool(traded),
+        "last_action": last_action,
+        "runtime_seconds": runtime,
+        "max_runtime_seconds": BOT_TICK_MAX_RUNTIME_SEC,
+        "last_no_buy_diagnostics": {
+            "main_blocker": diag.get("main_blocker"),
+            "data_health_blocks": diag.get("data_health_blocks", []),
+            "raw_buy_count": diag.get("raw_buy_count", 0),
+            "candidate_pool_count": diag.get("candidate_pool_count", 0),
+            "tradable_count": diag.get("tradable_count", 0),
+            "top_buyable_rejects": (diag.get("top_buyable_rejects") or [])[:5],
+            "top_ranked_rejections": (diag.get("top_ranked_rejections") or [])[:5],
+            "tick_runtime_seconds": diag.get("tick_runtime_seconds"),
+        },
+    })
+
+
 @app.route("/bot/suggestion-feedback", methods=["POST"])
 def bot_suggestion_feedback():
     require_admin_token()
@@ -281,4 +313,5 @@ def health():
     """Lightweight keepalive endpoint. Returns 2 bytes. UptimeRobot-friendly."""
     start_scheduler_once()
     trigger_bot_if_due(force=False)
+    warm_scan_if_due()
     return "ok", 200, {"Content-Type": "text/plain"}

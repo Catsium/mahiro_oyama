@@ -121,7 +121,7 @@ def get_news(tk):
                 src  = it.get("source", "")
                 _ingest(title, pub, link, src, pub_ts=pub_ts)
         except Exception as e:
-            record_api_failure(endpoint)
+            record_api_failure(endpoint, e)
             try: print(f"[news] finnhub {tk} failed: {type(e).__name__}: {e}")
             except Exception: pass
 

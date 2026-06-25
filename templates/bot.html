@@ -148,7 +148,7 @@
           </button>
           {% else %}
           <button class="btn live" type="submit" id="runBtn" title="Force immediate decision">
-            <span class="live-dot"></span>in progress · force check
+            <span class="live-dot"></span>force check
           </button>
           {% endif %}
         </form>
@@ -169,6 +169,9 @@
         </button>
       </form>
     </div>
+    {% if not read_only and no_buy.last_bot_error %}
+    <div class="ro-note" style="color:var(--red)">last bot error: {{ no_buy.last_bot_error }}</div>
+    {% endif %}
     {% endif %}
   </section>
 

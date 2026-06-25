@@ -57,7 +57,7 @@ def _finnhub_daily(tk, full=False):
         except Exception:
             pass
         cache_set(cache_key, None)
-        record_api_failure(endpoint)
+        record_api_failure(endpoint, e)
         return None
 
 
@@ -103,7 +103,7 @@ def _raw_daily(tk, full=False):
         except Exception:
             pass
         cache_set(cache_key, None)
-        record_api_failure(endpoint)
+        record_api_failure(endpoint, e)
         return None
 
 
@@ -172,8 +172,8 @@ def _fetch_quote_once(tk):
         if r["price"] > 0:
             record_api_success(endpoint)
         return r
-    except Exception:
-        record_api_failure(endpoint)
+    except Exception as e:
+        record_api_failure(endpoint, e)
         return {"price": 0, "change": 0, "pct": 0, "high": 0, "low": 0,
                 "open": 0, "prev": 0}
 

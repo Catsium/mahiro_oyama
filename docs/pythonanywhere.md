@@ -79,6 +79,9 @@ service. UptimeRobot can also call every minute:
 https://<username>.pythonanywhere.com/health
 ```
 
+The 60-second ping only keeps the web worker warm. Bot work is still throttled
+to the bot interval, so duplicate pings do not start cooldown-only bot passes.
+
 ## Admin Checks
 
 Open:

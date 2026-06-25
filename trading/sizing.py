@@ -273,8 +273,11 @@ def evaluate_candidate(candidate, total_equity, regime_stop_pct, regime_kind,
     risk = risk_target_notional(total_equity, ctx, regime_stop_pct, regime_kind,
                                 vix_mult, streak_mult, kelly_mult,
                                 size_confidence, source, config=cfg)
-    if not bool(ctx.get("is_dip")) and float(ctx.get("vol_ratio", 1.0) or 1.0) < 1.2:
-        apply_size_mult(risk, 0.80, "non-dip volume <1.2")
+    warnings = []
+    vol_ratio = float(ctx.get("vol_ratio", 1.0) or 1.0)
+    if not bool(ctx.get("is_dip")) and 0.70 <= vol_ratio < 1.20:
+        warnings.append("LOW_VOLUME_PENALTY_ONLY")
+        apply_size_mult(risk, 0.75, "LOW_VOLUME_PENALTY_ONLY")
     regime_mult = float(candidate.get("regime_risk_mult", 1.0) or 1.0)
     cluster_mult = float(candidate.get("cluster_regime_mult", 1.0) or 1.0)
     combined_regime_mult = max(0.0, min(1.25, regime_mult * cluster_mult))
@@ -330,6 +333,8 @@ def evaluate_candidate(candidate, total_equity, regime_stop_pct, regime_kind,
         source == "watchlist"
         and edge.get("edge_source") == "confidence_prior"
         and rec.get("cls") in ("buy", "strong-buy")
+        and rec.get("confidence", 0) >= float(signal_cfg.get("min_buy_confidence", 55))
+        and net >= 0
     )
     tradable = risk_sized and (ev_pass or warmup_watchlist)
     if not risk_sized:
@@ -362,6 +367,7 @@ def evaluate_candidate(candidate, total_equity, regime_stop_pct, regime_kind,
         "edge_horizon": edge["edge_horizon"],
         "required_edge_pct": round(required_edge, 4),
         "sizing_confidence": size_confidence,
+        "warnings": warnings,
     })
     return out
 

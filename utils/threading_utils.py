@@ -27,9 +27,25 @@ def _trigger_bot_async(force=False, user_forced=False):
     if _bot_run_lock.locked():
         return False
     from trading.bot import run_bot
+
+    def _target():
+        try:
+            run_bot(force=force, user_forced=user_forced)
+        except Exception as e:
+            _BOT_STATUS.update({
+                "last_error": f"{type(e).__name__}: {str(e)[:200]}",
+                "last_error_ts": int(time.time()),
+                "last_action": "error",
+                "last_traded": False,
+            })
+            try:
+                print(f"[bot-trigger] run_bot error: {type(e).__name__}: {e}")
+            except Exception:
+                pass
+
     try:
         threading.Thread(
-            target=lambda: run_bot(force=force, user_forced=user_forced),
+            target=_target,
             daemon=True,
         ).start()
         return True
@@ -48,6 +64,8 @@ def trigger_bot_if_due(force=False, user_forced=False, min_interval=None):
     if not BOT_ENABLED:
         return False
     interval = BOT_TRIGGER_MIN_INTERVAL if min_interval is None else min_interval
+    if not force:
+        interval = max(interval, BOT_INTERVAL)
     now = time.time()
     with _trigger_lock:
         if _bot_run_lock.locked():

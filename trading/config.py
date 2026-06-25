@@ -18,9 +18,16 @@ RISK_CONFIG = {
         "bear": 0.40,
     },
     "min_trade_size": 400.0,
-    "max_position_pct": 0.35,
-    "max_sector_pct": 0.55,
-    "max_corr_group_pct": 0.45,
+    "max_position_pct": 0.08,
+    "max_sector_pct": 0.25,
+    "max_corr_group_pct": 0.25,
+    "max_gross_exposure_pct": 0.70,
+    "min_cash_reserve_pct": 0.30,
+    "max_positions": 8,
+    "max_new_buys_per_tick": 1,
+    "max_new_buys_per_day": 2,
+    "experimental_trade_size_mult": 0.25,
+    "validated_trade_size_mult": 1.0,
 }
 
 SIGNAL_CONFIG = {
@@ -29,14 +36,18 @@ SIGNAL_CONFIG = {
     "min_expected_edge_pct": 0.40,
     "min_net_edge_pct": 0.20,
     "strong_edge_pct": 2.00,
+    "volume_hard_reject_ratio": 0.70,
+    "volume_soft_penalty_ratio": 1.20,
+    "low_volume_size_mult": 0.75,
+    "neutral_gate_adx_threshold": 20,
 }
 
 KELLY_CONFIG = {
-    "enabled": True,
-    "min_samples": 20,
+    "enabled": False,
+    "min_samples": 100,
     "fraction": 0.50,
-    "min_mult": 0.10,
-    "max_mult": 1.50,
+    "min_mult": 1.0,
+    "max_mult": 1.0,
 }
 
 EXIT_CONFIG = {

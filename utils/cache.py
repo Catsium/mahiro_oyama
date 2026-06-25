@@ -8,6 +8,7 @@ import time
 import os
 import pickle
 import re
+import json
 
 from utils.deploy_config import PERSISTENT_CACHE
 from utils.storage import DATA_DIR
@@ -19,6 +20,33 @@ _cache: dict = {}
 _cache_lock = threading.Lock()
 _api_failures: dict = {}
 _CACHE_DIR = os.path.join(DATA_DIR, "cache")
+_PROVIDER_HEALTH_FILE = os.path.join(DATA_DIR, "provider_health.json")
+
+
+def _load_provider_health():
+    try:
+        with open(_PROVIDER_HEALTH_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_provider_health():
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        with open(_PROVIDER_HEALTH_FILE, "w", encoding="utf-8") as f:
+            json.dump(_api_failures, f, sort_keys=True)
+    except Exception:
+        pass
+
+
+def _looks_rate_limited(error):
+    text = str(error or "").lower()
+    return "429" in text or "rate limit" in text or "too many requests" in text
+
+
+_api_failures.update(_load_provider_health())
 
 
 def _safe_key(k):
@@ -122,25 +150,53 @@ def should_skip_api(endpoint, cooldown_sec=300, failure_threshold=3):
         rec = _api_failures.get(key)
         if not rec:
             return False
-        count = int(rec.get("count", 0) or 0)
-        if count < int(failure_threshold or 1):
+        now = time.time()
+        recent = [
+            float(ts) for ts in (rec.get("failures") or [])
+            if now - float(ts or 0) <= 600
+        ]
+        if not recent and rec.get("ts"):
+            recent = [float(rec.get("ts") or 0)] * int(rec.get("count", 0) or 0)
+        rec["failures"] = recent[-20:]
+        rec["count"] = len(rec["failures"])
+        if len(rec["failures"]) < int(failure_threshold or 1):
             return False
-        return time.time() - rec.get("ts", 0) < float(cooldown_sec or 0)
+        return now - rec.get("ts", 0) < float(cooldown_sec or 0)
 
 
-def record_api_failure(endpoint):
+def record_api_failure(endpoint, error=None):
     key = str(endpoint or "")
     with _cache_lock:
-        rec = _api_failures.setdefault(key, {"count": 0, "ts": 0})
-        rec["count"] = int(rec.get("count", 0)) + 1
-        rec["ts"] = time.time()
+        now = time.time()
+        rec = _api_failures.setdefault(key, {"count": 0, "ts": 0, "failures": []})
+        failures = [
+            float(ts) for ts in (rec.get("failures") or [])
+            if now - float(ts or 0) <= 600
+        ]
+        failures.append(now)
+        rec["failures"] = failures[-20:]
+        rec["count"] = len(rec["failures"])
+        rec["ts"] = now
+        rec["last_error"] = str(error)[:160] if error is not None else rec.get("last_error")
+        rec["rate_limited"] = bool(_looks_rate_limited(error) or rec.get("rate_limited"))
+        rec["status"] = "rate_limited" if rec["rate_limited"] else "degraded"
+        _save_provider_health()
     return rec
 
 
 def record_api_success(endpoint):
     key = str(endpoint or "")
     with _cache_lock:
-        _api_failures.pop(key, None)
+        rec = _api_failures.setdefault(key, {"count": 0, "ts": time.time(), "failures": []})
+        rec.update({
+            "count": 0,
+            "failures": [],
+            "ts": time.time(),
+            "status": "healthy",
+            "rate_limited": False,
+            "last_error": None,
+        })
+        _save_provider_health()
 
 
 def api_failure_snapshot():
@@ -150,6 +206,10 @@ def api_failure_snapshot():
             key: {
                 "count": int(rec.get("count", 0) or 0),
                 "age_sec": int(now - float(rec.get("ts", 0) or 0)),
+                "status": rec.get("status") or "degraded",
+                "rate_limited": bool(rec.get("rate_limited")),
+                "last_error": rec.get("last_error"),
             }
             for key, rec in _api_failures.items()
+            if rec.get("status") != "healthy" or int(rec.get("count", 0) or 0) > 0
         }

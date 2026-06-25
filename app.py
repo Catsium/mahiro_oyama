@@ -9,11 +9,20 @@ Templates keep working with bare `url_for('index')` etc. (no Blueprint
 namespacing required).
 """
 from flask import Flask
-from utils.deploy_config import FLASK_SECRET_KEY, PYTHONANYWHERE_MODE
+from utils.deploy_config import ADMIN_TOKEN, FINNHUB_KEY, FLASK_SECRET_KEY, PYTHONANYWHERE_MODE
 
 app = Flask(__name__)
-if PYTHONANYWHERE_MODE and not FLASK_SECRET_KEY:
-    raise RuntimeError("Set FLASK_SECRET_KEY for PythonAnywhere deployment.")
+if PYTHONANYWHERE_MODE:
+    missing = [
+        name for name, value in (
+            ("FINNHUB_KEY", FINNHUB_KEY),
+            ("ADMIN_TOKEN", ADMIN_TOKEN),
+            ("FLASK_SECRET_KEY", FLASK_SECRET_KEY),
+        )
+        if not value
+    ]
+    if missing:
+        raise RuntimeError(f"Set {', '.join(missing)} for PythonAnywhere deployment.")
 app.secret_key = FLASK_SECRET_KEY or "dev-only-change-me"
 
 
