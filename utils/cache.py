@@ -21,6 +21,7 @@ _cache_lock = threading.Lock()
 _api_failures: dict = {}
 _CACHE_DIR = os.path.join(DATA_DIR, "cache")
 _PROVIDER_HEALTH_FILE = os.path.join(DATA_DIR, "provider_health.json")
+_provider_health_last_error = None
 
 
 def _load_provider_health():
@@ -33,12 +34,18 @@ def _load_provider_health():
 
 
 def _save_provider_health():
+    global _provider_health_last_error
     try:
         os.makedirs(DATA_DIR, exist_ok=True)
-        with open(_PROVIDER_HEALTH_FILE, "w", encoding="utf-8") as f:
+        tmp = _PROVIDER_HEALTH_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(_api_failures, f, sort_keys=True)
+        os.replace(tmp, _PROVIDER_HEALTH_FILE)
+        _provider_health_last_error = None
+        return True
     except Exception:
-        pass
+        _provider_health_last_error = "provider_health_write_failed"
+        return False
 
 
 def _looks_rate_limited(error):
@@ -179,8 +186,8 @@ def record_api_failure(endpoint, error=None):
         rec["ts"] = now
         rec["last_error"] = str(error)[:160] if error is not None else rec.get("last_error")
         rec["rate_limited"] = bool(_looks_rate_limited(error) or rec.get("rate_limited"))
-        rec["status"] = "rate_limited" if rec["rate_limited"] else "degraded"
-        _save_provider_health()
+        rec["status"] = "degraded"
+        rec["persisted"] = _save_provider_health()
     return rec
 
 
@@ -196,20 +203,34 @@ def record_api_success(endpoint):
             "rate_limited": False,
             "last_error": None,
         })
-        _save_provider_health()
+        rec["persisted"] = _save_provider_health()
 
 
 def api_failure_snapshot():
     now = time.time()
     with _cache_lock:
-        return {
+        snapshot = {
             key: {
                 "count": int(rec.get("count", 0) or 0),
                 "age_sec": int(now - float(rec.get("ts", 0) or 0)),
                 "status": rec.get("status") or "degraded",
                 "rate_limited": bool(rec.get("rate_limited")),
                 "last_error": rec.get("last_error"),
+                "persisted": bool(rec.get("persisted", True)),
             }
             for key, rec in _api_failures.items()
             if rec.get("status") != "healthy" or int(rec.get("count", 0) or 0) > 0
         }
+        for rec in snapshot.values():
+            rec["rate_limit_recent"] = bool(rec.get("rate_limited") and rec.get("age_sec", 0) <= 600)
+        if _provider_health_last_error:
+            snapshot["_provider_health_persistence"] = {
+                "count": 1,
+                "age_sec": 0,
+                "status": "degraded",
+                "rate_limited": False,
+                "rate_limit_recent": False,
+                "last_error": _provider_health_last_error,
+                "persisted": False,
+            }
+        return snapshot
