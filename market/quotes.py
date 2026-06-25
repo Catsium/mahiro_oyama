@@ -1,6 +1,7 @@
 """Quote fetching, ticker validation, and daily-bar helpers."""
 import time
 from datetime import datetime, timedelta
+from io import StringIO
 
 import pandas as pd
 
@@ -15,6 +16,54 @@ from utils.storage import load_price_hist, append_price_snapshot
 
 def record_price(tk, price):
     append_price_snapshot(tk, price, min_interval=60, limit=6000)
+
+
+def _direct_stooq_daily(tk, full=False, cache_prefix="stooq"):
+    """Direct Stooq CSV fetch. Do not route through data_manager."""
+    endpoint = f"{cache_prefix}_daily:{tk}:{int(bool(full))}"
+    if should_skip_api(endpoint):
+        return None
+    cache_key = f"{cache_prefix}_full_{tk}" if full else f"{cache_prefix}_{tk}"
+    c = cache_get(cache_key, max_age=300, default=CACHE_MISS)
+    if c is not CACHE_MISS:
+        return c if isinstance(c, pd.DataFrame) and not c.empty else None
+    try:
+        import urllib.request
+
+        s = tk.lower().lstrip("^") + ".us"
+        url = f"https://stooq.com/q/d/l/?s={s}&i=d"
+        req = urllib.request.Request(url, headers={"User-Agent": "stock-tracker/1.0"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            raw = resp.read().decode("utf-8", errors="ignore")
+        if not raw or raw.startswith("No data") or "," not in raw:
+            cache_set(cache_key, None)
+            return None
+        df = pd.read_csv(StringIO(raw))
+        if df.empty or "Close" not in df.columns or "Date" not in df.columns:
+            cache_set(cache_key, None)
+            return None
+        df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+        df = df.dropna(subset=["Date"])
+        for col in ("Open", "High", "Low", "Close", "Volume"):
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+        df = df.dropna(subset=["Close"]).set_index("Date").sort_index()
+        if df.empty:
+            cache_set(cache_key, None)
+            return None
+        if not full:
+            df = df.tail(400)
+        cache_set(cache_key, df)
+        record_api_success(endpoint)
+        return df
+    except Exception as e:
+        try:
+            print(f"[stooq] {tk} fetch failed: {type(e).__name__}: {e}")
+        except Exception:
+            pass
+        cache_set(cache_key, None)
+        record_api_failure(endpoint, e)
+        return None
 
 
 def _finnhub_daily(tk, full=False):
@@ -66,45 +115,15 @@ def _raw_daily(tk, full=False):
     if PYTHONANYWHERE_MODE:
         return _finnhub_daily(tk, full=full)
 
-    endpoint = f"stooq_daily:{tk}:{int(bool(full))}"
-    if should_skip_api(endpoint):
-        return None
-    cache_key = f"stooq_full_{tk}" if full else f"stooq_{tk}"
-    c = cache_get(cache_key, max_age=300, default=CACHE_MISS)
-    if c is not CACHE_MISS:
-        return c if isinstance(c, pd.DataFrame) and not c.empty else None
-    try:
-        import urllib.request
+    return _direct_stooq_daily(tk, full=full)
 
-        s = tk.lower().lstrip("^") + ".us"
-        url = f"https://stooq.com/q/d/l/?s={s}&i=d"
-        req = urllib.request.Request(url, headers={"User-Agent": "stock-tracker/1.0"})
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            raw = resp.read().decode("utf-8", errors="ignore")
-        if not raw or raw.startswith("No data") or "," not in raw:
-            cache_set(cache_key, None)
-            return None
-        from io import StringIO
 
-        df = pd.read_csv(StringIO(raw))
-        if df.empty or "Close" not in df.columns:
-            cache_set(cache_key, None)
-            return None
-        df["Date"] = pd.to_datetime(df["Date"])
-        df = df.set_index("Date").sort_index()
-        if not full:
-            df = df.tail(400)
-        cache_set(cache_key, df)
-        record_api_success(endpoint)
+def get_regime_daily(tk, full=False):
+    """Regime symbols use Stooq first, then Finnhub."""
+    df = _direct_stooq_daily(tk, full=full, cache_prefix="stooq_regime")
+    if df is not None and not df.empty:
         return df
-    except Exception as e:
-        try:
-            print(f"[stooq] {tk} fetch failed: {type(e).__name__}: {e}")
-        except Exception:
-            pass
-        cache_set(cache_key, None)
-        record_api_failure(endpoint, e)
-        return None
+    return _finnhub_daily(tk, full=full)
 
 
 def _stooq_daily(tk, full=False):

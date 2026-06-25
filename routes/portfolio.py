@@ -12,19 +12,18 @@ from app import app
 from market.quotes import get_quote, is_valid_ticker
 from market.snapshots import signal_snapshot
 from trading.bot import (
-    bot_state, _render_bot_page, STARTING_CASH, warm_scan_if_due,
-    run_bot, BOT_TICK_MAX_RUNTIME_SEC,
+    bot_state, _render_bot_page, STARTING_CASH, run_bot, BOT_TICK_MAX_RUNTIME_SEC,
 )
 from trading.risk import get_market_regime
 from trading.suggestion_store import record_suggestion_feedback
-from utils.auth import require_admin_token
+from utils.auth import require_admin_token, require_machine_token
 from utils.config import BOT_ENABLED
 from utils.deploy_config import PYTHONANYWHERE_MODE
 from utils.storage import (
     acquire_bot_file_lock, load_tickers, save_tickers, save_bot, load_bot,
     SUGGESTION_DB_FILE,
 )
-from utils.threading_utils import start_scheduler_once, trigger_bot_if_due, _bot_run_lock
+from utils.threading_utils import trigger_bot_if_due, _bot_run_lock
 from utils.time_utils import is_market_open
 
 
@@ -252,15 +251,19 @@ def bot_run():
     return redirect(url_for("bot_dashboard"))
 
 
-@app.route("/bot/tick", methods=["POST"])
+@app.route("/bot/tick", methods=["GET", "POST"])
 def bot_tick():
-    auth = require_admin_token()
+    auth = require_machine_token()
     if auth is not True:
         return auth
     if _bot_run_lock.locked():
         return jsonify({"status": "already_running"}), 409
     start = time.time()
-    b, traded, last_action = run_bot(force=True, user_forced=True)
+    b, traded, last_action = run_bot(
+        force=True,
+        user_forced=True,
+        max_runtime_sec=BOT_TICK_MAX_RUNTIME_SEC,
+    )
     diag = b.get("last_no_buy_diagnostics") or {}
     runtime = round(time.time() - start, 3)
     return jsonify({
@@ -310,8 +313,5 @@ def bot_suggestion_feedback():
 
 @app.route("/health")
 def health():
-    """Lightweight keepalive endpoint. Returns 2 bytes. UptimeRobot-friendly."""
-    start_scheduler_once()
-    trigger_bot_if_due(force=False)
-    warm_scan_if_due()
+    """Passive keepalive endpoint. Trading is triggered by authenticated /bot/tick."""
     return "ok", 200, {"Content-Type": "text/plain"}

@@ -71,3 +71,5 @@ DECISIONS.md
 .planning/config.json
 tests/test_stabilization.py
 .codex/environments/environment.toml
+docs/superpowers/plans/2026-06-25-paper-trading-hardening-freeze.md
+README.md

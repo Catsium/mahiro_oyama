@@ -209,6 +209,56 @@ class TradingV1SizingTests(unittest.TestCase):
         self.assertFalse(cand["tradable"])
         self.assertIn("EV gate", cand["rank_reason"])
 
+    def test_market_data_mode_multiplier_applies_after_base_sizing(self):
+        base = evaluate_candidate(
+            self._candidate("BASE", 80, "trend", score=8),
+            total_equity=10_000,
+            regime_stop_pct=-6,
+            regime_kind="neutral",
+            vix_mult=1,
+            streak_mult=1,
+            kelly_mult=1,
+            edge_stats={},
+            min_position_usd=100,
+        )
+        proxy = evaluate_candidate(
+            self._candidate("PROXY", 80, "trend", score=8),
+            total_equity=10_000,
+            regime_stop_pct=-6,
+            regime_kind="neutral",
+            vix_mult=1,
+            streak_mult=1,
+            kelly_mult=1,
+            edge_stats={},
+            min_position_usd=100,
+            mode_size_mult=0.85,
+            mode_size_reason="PROXY_MODE",
+        )
+        self.assertEqual(proxy["risk"]["pre_mode_target_notional"],
+                         base["risk"]["target_notional"])
+        self.assertAlmostEqual(proxy["risk"]["target_notional"],
+                               round(base["risk"]["target_notional"] * 0.85, 2))
+        self.assertIn("PROXY_MODE", proxy["risk"]["size_penalties"])
+
+    def test_risk_and_kelly_defaults_match_paper_contract(self):
+        risk = DEFAULT_CONFIG["risk"]
+        kelly = DEFAULT_CONFIG["kelly"]
+        modes = DEFAULT_CONFIG["market_data_modes"]
+        self.assertEqual(risk["max_new_buys_per_tick"], 1)
+        self.assertEqual(risk["max_new_buys_per_day"], 2)
+        self.assertEqual(risk["max_positions"], 8)
+        self.assertEqual(risk["max_position_pct"], 0.08)
+        self.assertEqual(risk["max_gross_exposure_pct"], 0.70)
+        self.assertEqual(risk["min_cash_reserve_pct"], 0.30)
+        self.assertEqual(risk["daily_loss_limit_pct"], -0.02)
+        self.assertEqual(risk["hard_drawdown_lockout_pct"], -0.10)
+        self.assertFalse(kelly["enabled"])
+        self.assertEqual(kelly["min_samples"], 100)
+        self.assertEqual(kelly["max_mult"], 1.0)
+        self.assertEqual(modes["proxy_size_mult"], 0.85)
+        self.assertEqual(modes["degraded_size_mult"], 0.70)
+        self.assertEqual(modes["degraded_min_confidence"], 65)
+
     def test_scan_source_gets_smaller_risk_budget(self):
         base = self._candidate("BASE", 75, "trend")
         scan = dict(base)
@@ -407,14 +457,14 @@ class TradingV3ConfigRegimeCatalystTests(unittest.TestCase):
         import pandas as pd
         import trading.risk as risk
 
-        old_daily = risk._daily_bars
+        old_daily = risk._regime_daily_bars
         old_append = risk._append_live_bar
         old_credit = risk.credit_signal
         old_vix = risk.get_vix
         old_open = risk.is_market_open
         try:
             idx = pd.date_range("2025-01-01", periods=70, freq="B")
-            risk._daily_bars = lambda _tk: pd.DataFrame({
+            risk._regime_daily_bars = lambda _tk: pd.DataFrame({
                 "Close": list(range(100, 170)),
             }, index=idx)
             risk._append_live_bar = lambda df, _tk: df
@@ -423,7 +473,7 @@ class TradingV3ConfigRegimeCatalystTests(unittest.TestCase):
             risk.is_market_open = lambda: False
             regime = risk.get_market_regime_pa_light()
         finally:
-            risk._daily_bars = old_daily
+            risk._regime_daily_bars = old_daily
             risk._append_live_bar = old_append
             risk.credit_signal = old_credit
             risk.get_vix = old_vix
@@ -436,18 +486,18 @@ class TradingV3ConfigRegimeCatalystTests(unittest.TestCase):
     def test_pa_light_missing_spy_history_is_explicit_fallback(self):
         import trading.risk as risk
 
-        old_daily = risk._daily_bars
+        old_daily = risk._regime_daily_bars
         old_credit = risk.credit_signal
         old_vix = risk.get_vix
         old_open = risk.is_market_open
         try:
-            risk._daily_bars = lambda _tk: None
+            risk._regime_daily_bars = lambda _tk: None
             risk.credit_signal = lambda: {"credit_label": "neutral", "credit_pct": 50.0}
             risk.get_vix = lambda: {"vix": 12.0, "regime": "NORMAL", "mult": 1.0}
             risk.is_market_open = lambda: False
             regime = risk.get_market_regime_pa_light()
         finally:
-            risk._daily_bars = old_daily
+            risk._regime_daily_bars = old_daily
             risk.credit_signal = old_credit
             risk.get_vix = old_vix
             risk.is_market_open = old_open
@@ -463,7 +513,7 @@ class TradingV3ConfigRegimeCatalystTests(unittest.TestCase):
         import trading.risk as risk
 
         old_pa = risk.PYTHONANYWHERE_MODE
-        old_daily = risk._daily_bars
+        old_daily = risk._regime_daily_bars
         old_credit = risk.credit_signal
         old_open = risk.is_market_open
         old_cache_get = risk.cache_get
@@ -476,7 +526,7 @@ class TradingV3ConfigRegimeCatalystTests(unittest.TestCase):
                     history=lambda *_a, **_k: types.SimpleNamespace(empty=True)
                 )
             )
-            risk._daily_bars = lambda _tk: None
+            risk._regime_daily_bars = lambda _tk: None
             risk.credit_signal = lambda: {"credit_label": "neutral", "credit_pct": 50.0}
             risk.is_market_open = lambda: False
             risk.cache_get = lambda *_args, **_kwargs: None
@@ -486,7 +536,7 @@ class TradingV3ConfigRegimeCatalystTests(unittest.TestCase):
                 regime = risk.get_market_regime()
         finally:
             risk.PYTHONANYWHERE_MODE = old_pa
-            risk._daily_bars = old_daily
+            risk._regime_daily_bars = old_daily
             risk.credit_signal = old_credit
             risk.is_market_open = old_open
             risk.cache_get = old_cache_get
@@ -500,16 +550,16 @@ class TradingV3ConfigRegimeCatalystTests(unittest.TestCase):
     def test_vix_missing_spy_history_is_explicit_unknown(self):
         import trading.risk as risk
 
-        old_daily = risk._daily_bars
+        old_daily = risk._regime_daily_bars
         old_cache_get = risk.cache_get
         old_cache_set = risk.cache_set
         try:
-            risk._daily_bars = lambda _tk: None
+            risk._regime_daily_bars = lambda _tk: None
             risk.cache_get = lambda *_args, **_kwargs: None
             risk.cache_set = lambda *_args, **_kwargs: None
             out = risk.get_vix()
         finally:
-            risk._daily_bars = old_daily
+            risk._regime_daily_bars = old_daily
             risk.cache_get = old_cache_get
             risk.cache_set = old_cache_set
         self.assertIsNone(out["vix"])
@@ -1275,26 +1325,139 @@ class PythonAnywhereHardeningTests(unittest.TestCase):
         bot._set_main_blocker(diag)
         self.assertEqual(diag["main_blocker"], "raw_buys_rejected_pre_candidate")
 
+        diag = bot._new_no_buy_diag(int(time.time()), {"cash": 1000}, False, False)
+        diag["market_open"] = True
+        diag["tod_ok"] = True
+        diag["degraded_mode_active"] = True
+        diag["data_health_blocks"] = ["STALE_HELD_QUOTE"]
+        bot._set_main_blocker(diag)
+        self.assertEqual(diag["main_blocker"], "data_health_block")
+
+        diag = bot._new_no_buy_diag(int(time.time()), {"cash": 1000}, False, False)
+        diag["market_open"] = True
+        diag["tod_ok"] = True
+        diag["paper_trading_locked"] = True
+        diag["paper_lock_reason"] = "DAILY_LOSS_LIMIT"
+        bot._set_main_blocker(diag)
+        self.assertEqual(diag["main_blocker"], "DAILY_LOSS_LIMIT")
+
+    def test_tick_log_entry_contains_required_contract_fields(self):
+        import trading.bot as bot
+
+        event = bot._tick_log_entry({
+            "ts": 123,
+            "top_buyable_rejects": [{"rejection_reason": "CONFIDENCE_BELOW_MIN_BUY"}],
+            "top_ranked_rejections": [{"rank_reason": "EDGE_TOO_LOW"}],
+        })
+        for field in bot.REQUIRED_TICK_LOG_FIELDS:
+            self.assertIn(field, event)
+        self.assertEqual(event["timestamp"], 123)
+        self.assertEqual(event["top_rejection_reasons"],
+                         ["CONFIDENCE_BELOW_MIN_BUY", "EDGE_TOO_LOW"])
+
+    def test_paper_loss_lockout_sets_daily_loss_reason(self):
+        import trading.bot as bot
+
+        state = {"today_open_equity": 10_000.0}
+        diag = bot._new_no_buy_diag(int(time.time()), {"cash": 1000}, False, False)
+        events = []
+        old_log = bot._log_bot_event
+        try:
+            bot._log_bot_event = lambda event, **payload: events.append((event, payload))
+            locked = bot._apply_paper_loss_lockouts(
+                state,
+                diag,
+                {"daily_loss_limit_pct": -0.02, "hard_drawdown_lockout_pct": -0.10},
+                9_700.0,
+                10_000.0,
+                time.time(),
+            )
+        finally:
+            bot._log_bot_event = old_log
+        self.assertTrue(locked)
+        self.assertTrue(diag["paper_trading_locked"])
+        self.assertEqual(diag["paper_lock_reason"], "DAILY_LOSS_LIMIT")
+        self.assertEqual(events[0][0], "DAILY_LOSS_LIMIT")
+
+    def test_provider_failure_snapshot_marks_rate_limit_recent(self):
+        import utils.cache as cache
+
+        old_failures = dict(cache._api_failures)
+        old_save = cache._save_provider_health
+        try:
+            cache._api_failures.clear()
+            cache._save_provider_health = lambda: True
+            cache.record_api_failure("finnhub", "HTTP 429 Too Many Requests")
+            snap = cache.api_failure_snapshot()
+        finally:
+            cache._api_failures.clear()
+            cache._api_failures.update(old_failures)
+            cache._save_provider_health = old_save
+        self.assertEqual(snap["finnhub"]["status"], "degraded")
+        self.assertTrue(snap["finnhub"]["rate_limited"])
+        self.assertTrue(snap["finnhub"]["rate_limit_recent"])
+
+    def test_health_route_is_passive(self):
+        import routes.portfolio as portfolio
+
+        old_trigger = portfolio.trigger_bot_if_due
+        try:
+            portfolio.trigger_bot_if_due = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("health must not trigger bot work")
+            )
+            response = portfolio.health()
+        finally:
+            portfolio.trigger_bot_if_due = old_trigger
+        self.assertEqual(response[0], "ok")
+        self.assertEqual(response[1], 200)
+
+    def test_bot_tick_uses_machine_auth_and_runtime_cap(self):
+        import routes.portfolio as portfolio
+
+        calls = {}
+        old = {
+            "require_machine_token": portfolio.require_machine_token,
+            "run_bot": portfolio.run_bot,
+            "jsonify": portfolio.jsonify,
+        }
+        try:
+            portfolio.require_machine_token = lambda: calls.setdefault("auth", True)
+            portfolio.jsonify = lambda obj=None, **kwargs: obj if obj is not None else kwargs
+
+            def fake_run_bot(**kwargs):
+                calls["run_kwargs"] = kwargs
+                return {"last_no_buy_diagnostics": {"main_blocker": "partial_timeout"}}, False, "partial_timeout"
+
+            portfolio.run_bot = fake_run_bot
+            payload = portfolio.bot_tick()
+        finally:
+            for name, value in old.items():
+                setattr(portfolio, name, value)
+        self.assertTrue(calls["auth"])
+        self.assertEqual(calls["run_kwargs"]["max_runtime_sec"],
+                         portfolio.BOT_TICK_MAX_RUNTIME_SEC)
+        self.assertEqual(payload["status"], "partial_timeout")
+
     def test_get_vix_reports_spy_proxy_source(self):
         import pandas as pd
         import trading.risk as risk
 
-        idx = pd.date_range("2026-01-01", periods=40, freq="B")
-        df = pd.DataFrame({"Close": [100 + i * 0.4 for i in range(40)]}, index=idx)
+        idx = pd.date_range("2026-01-01", periods=80, freq="B")
+        df = pd.DataFrame({"Close": [100 + i * 0.4 for i in range(80)]}, index=idx)
         old_cache_get = risk.cache_get
         old_cache_set = risk.cache_set
-        old_daily = risk._daily_bars
+        old_daily = risk._regime_daily_bars
         old_append = risk._append_live_bar
         try:
             risk.cache_get = lambda *_args, **_kwargs: None
             risk.cache_set = lambda *_args, **_kwargs: None
-            risk._daily_bars = lambda _tk: df
+            risk._regime_daily_bars = lambda _tk: df
             risk._append_live_bar = lambda d, _tk: d
             out = risk.get_vix()
         finally:
             risk.cache_get = old_cache_get
             risk.cache_set = old_cache_set
-            risk._daily_bars = old_daily
+            risk._regime_daily_bars = old_daily
             risk._append_live_bar = old_append
         self.assertTrue(out["data_ok"])
         self.assertEqual(out["source"], "spy_realized_vol_proxy")
@@ -1410,7 +1573,7 @@ class PythonAnywhereHardeningTests(unittest.TestCase):
         self.assertEqual(saved[-1]["last_no_buy_diagnostics"]["main_blocker"],
                          "no_buy_candidates")
 
-    def test_missing_spy_regime_data_blocks_new_buys(self):
+    def test_missing_spy_regime_data_enters_degraded_mode(self):
         import trading.bot as bot
 
         state = {
@@ -1505,6 +1668,8 @@ class PythonAnywhereHardeningTests(unittest.TestCase):
 
             def fake_rank(_cands, _pt, _stop, _regime, vix_mult, *_args, **_kwargs):
                 captured["vix_mult"] = vix_mult
+                captured["mode_size_mult"] = _kwargs.get("mode_size_mult")
+                captured["mode_size_reason"] = _kwargs.get("mode_size_reason")
                 return []
 
             bot.rank_candidates = fake_rank
@@ -1512,13 +1677,16 @@ class PythonAnywhereHardeningTests(unittest.TestCase):
         finally:
             for name, value in old.items():
                 setattr(bot, name, value)
-        self.assertNotIn("vix_mult", captured)
+        self.assertEqual(captured["vix_mult"], 1.0)
+        self.assertEqual(captured["mode_size_mult"], 0.70)
+        self.assertEqual(captured["mode_size_reason"], "DEGRADED_MODE")
         diag = out_state["last_no_buy_diagnostics"]
-        self.assertFalse(diag["regime_allow_buys"])
-        self.assertEqual(diag["main_blocker"], "data_health_block")
+        self.assertTrue(diag["regime_allow_buys"])
+        self.assertEqual(diag["trading_mode"], "DEGRADED_MODE")
+        self.assertTrue(diag["degraded_mode_active"])
         self.assertIn("SPY_DATA_MISSING", diag["data_health_blocks"])
         self.assertTrue(diag["regime_data_fallback"])
-        self.assertEqual(diag["regime_data_size_mult"], 1.0)
+        self.assertEqual(diag["regime_data_size_mult"], 0.70)
 
     def test_scan_payload_cache_prevents_buy_pass_refetch(self):
         import trading.bot as bot
@@ -1671,6 +1839,14 @@ class PythonAnywhereHardeningTests(unittest.TestCase):
                     "raw_buy_count": 1,
                     "display_buy_candidate_count": 0,
                     "data_health_blocks": ["SPY_DATA_MISSING"],
+                    "trading_mode": "DEGRADED_MODE",
+                    "degraded_mode_active": True,
+                    "degraded_mode_reason": "SPY_DATA_MISSING",
+                    "degraded_size_mult": 0.70,
+                    "degraded_min_confidence": 65,
+                    "degraded_reject_counts": {"DEGRADED_LOW_VOLUME_BLOCKED": 1},
+                    "volatility_value": 14.2,
+                    "regime_source": "degraded_fallback",
                     "top_buyable_rejects": [
                         {"ticker": "AAA", "rejection_reason": "VERY_LOW_VOLUME_CONFIRMATION"}
                     ],
@@ -1689,6 +1865,12 @@ class PythonAnywhereHardeningTests(unittest.TestCase):
         self.assertEqual(out["last_no_buy_diagnostics"]["raw_buy_count"], 1)
         self.assertEqual(out["last_no_buy_diagnostics"]["data_health_blocks"],
                          ["SPY_DATA_MISSING"])
+        self.assertEqual(out["last_no_buy_diagnostics"]["trading_mode"],
+                         "DEGRADED_MODE")
+        self.assertTrue(out["last_no_buy_diagnostics"]["degraded_mode_active"])
+        self.assertEqual(out["last_no_buy_diagnostics"]["volatility_value"], 14.2)
+        self.assertEqual(out["last_no_buy_diagnostics"]["regime_source"],
+                         "degraded_fallback")
         self.assertEqual(out["last_no_buy_diagnostics"]["tick_runtime_seconds"], 0.25)
         self.assertNotIn("bot_file_path", str(out))
         self.assertNotIn("storage_base_dir", str(out))
@@ -1840,9 +2022,9 @@ class PythonAnywhereHardeningTests(unittest.TestCase):
         start = source.index('def bot_tick():')
         end = source.index('@app.route("/bot/suggestion-feedback"')
         body = source[start:end]
-        self.assertIn('@app.route("/bot/tick", methods=["POST"])', source)
-        self.assertIn("require_admin_token()", body)
-        self.assertIn("run_bot(force=True, user_forced=True)", body)
+        self.assertIn('@app.route("/bot/tick", methods=["GET", "POST"])', source)
+        self.assertIn("require_machine_token()", body)
+        self.assertIn("max_runtime_sec=BOT_TICK_MAX_RUNTIME_SEC", body)
         self.assertIn("max_runtime_seconds", body)
 
     def test_price_history_atomic_updates_preserve_tickers(self):
@@ -1899,7 +2081,8 @@ class PythonAnywhereHardeningTests(unittest.TestCase):
                 snap = cache.api_failure_snapshot()
                 self.assertIn("endpoint:test", snap)
                 self.assertTrue(snap["endpoint:test"]["rate_limited"])
-                self.assertEqual(snap["endpoint:test"]["status"], "rate_limited")
+                self.assertTrue(snap["endpoint:test"]["rate_limit_recent"])
+                self.assertEqual(snap["endpoint:test"]["status"], "degraded")
                 cache.record_api_success("endpoint:test")
                 self.assertFalse(cache.should_skip_api("endpoint:test", cooldown_sec=300))
 
@@ -1987,6 +2170,24 @@ class PythonAnywhereHardeningTests(unittest.TestCase):
 
 
 class TradingV1BacktestSmokeTests(unittest.TestCase):
+    def test_backtest_execution_price_helpers(self):
+        import pandas as pd
+        import trading.backtest as bt
+
+        dates = pd.date_range("2025-01-01", periods=2, freq="B")
+        df = pd.DataFrame({
+            "Open": [100.0, 105.0],
+            "High": [102.0, 108.0],
+            "Low": [99.0, 101.0],
+            "Close": [101.0, 106.0],
+            "Volume": [1_000_000, 1_000_000],
+        }, index=dates)
+        self.assertEqual(bt._entry_price_for_next_bar(df, list(dates), 0), 105.0)
+        self.assertIsNone(bt._entry_price_for_next_bar(df, list(dates), 1))
+        self.assertEqual(bt._exit_price_for_bar(bt._bar_at(df, dates[1]), stop_price=102.0), 102.0)
+        self.assertEqual(bt._exit_price_for_bar(bt._bar_at(df, dates[1]), take_profit_price=107.0), 107.0)
+        self.assertEqual(bt._exit_price_for_bar(bt._bar_at(df, dates[1])), 106.0)
+
     def test_synthetic_backtest_smoke_no_network(self):
         import pandas as pd
         from trading.backtest import _simulate
@@ -2291,7 +2492,8 @@ class TradingV1TemplateTests(unittest.TestCase):
             portfolio_source.index("def health():"):
         ]
         self.assertNotIn("trigger_bot_if_due", simulator_body)
-        self.assertIn("trigger_bot_if_due(force=False)", health_body)
+        self.assertNotIn("trigger_bot_if_due", health_body)
+        self.assertIn('return "ok"', health_body)
 
 
 if __name__ == "__main__":

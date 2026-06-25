@@ -103,6 +103,31 @@ KNIFE_CATALYST_TYPES = {
 MIN_POSITION_USD   = 400
 BOT_TICK_MAX_RUNTIME_SEC = 25
 USE_CONFIDENCE_WEIGHTING = True
+REQUIRED_TICK_LOG_FIELDS = (
+    "timestamp",
+    "trading_mode",
+    "degraded_mode_active",
+    "degraded_mode_reason",
+    "market_open",
+    "buy_window_open",
+    "spy_data_ok",
+    "spy_data_source",
+    "spy_data_error",
+    "volatility_data_ok",
+    "volatility_source",
+    "volatility_error",
+    "data_health_blocks",
+    "raw_buy_count",
+    "display_buy_candidate_count",
+    "candidate_pool_count",
+    "ranked_count",
+    "tradable_count",
+    "top_rejection_reasons",
+    "degraded_reject_counts",
+    "buys_executed",
+    "sells_executed",
+    "runtime_seconds",
+)
 
 # Scheduler cooperation
 _bot_running = False
@@ -120,7 +145,11 @@ def _append_jsonl(filename, event):
         with open(path, "a", encoding="utf-8") as f:
             f.write(json.dumps(event, sort_keys=True, default=str) + "\n")
     except Exception:
-        pass
+        try:
+            _BOT_STATUS["last_log_error"] = f"{filename}:write_failed"
+            _BOT_STATUS["last_log_error_ts"] = int(time.time())
+        except Exception:
+            pass
 
 
 def _log_bot_event(event_type, **payload):
@@ -129,9 +158,30 @@ def _log_bot_event(event_type, **payload):
     _append_jsonl("bot_events.jsonl", event)
 
 
+def _tick_log_entry(diag):
+    top_rejections = []
+    for key in ("top_buyable_rejects", "top_ranked_rejections"):
+        for row in diag.get(key) or []:
+            reason = row.get("rejection_reason") or row.get("rank_reason")
+            if reason:
+                top_rejections.append(reason)
+    event = dict(diag)
+    event.update({
+        "timestamp": diag.get("timestamp") or diag.get("ts") or int(time.time()),
+        "volatility_error": diag.get("volatility_error") or diag.get("volatility_data_error"),
+        "top_rejection_reasons": top_rejections[:10],
+        "buys_executed": int(diag.get("buys_executed", 0) or 0),
+        "sells_executed": int(diag.get("sells_executed", 0) or 0),
+        "runtime_seconds": diag.get("tick_runtime_seconds"),
+    })
+    for key in REQUIRED_TICK_LOG_FIELDS:
+        event.setdefault(key, [] if key in {"data_health_blocks", "top_rejection_reasons"} else None)
+    return event
+
+
 def _log_tick(diag):
     if isinstance(diag, dict):
-        _append_jsonl("tick_log.jsonl", diag)
+        _append_jsonl("tick_log.jsonl", _tick_log_entry(diag))
 
 
 def _annotate_signal(rec):
@@ -156,7 +206,20 @@ def _new_no_buy_diag(now, b, force=False, user_forced=False):
         "buy_window_open": None,
         "regime_allow_buys": None,
         "regime_kind": None,
+        "regime_source": None,
         "regime_v3": None,
+        "trading_mode": None,
+        "normal_mode_active": False,
+        "proxy_mode_active": False,
+        "degraded_mode_active": False,
+        "degraded_mode_reason": None,
+        "degraded_size_mult": None,
+        "degraded_min_confidence": None,
+        "degraded_reject_counts": {},
+        "degraded_buys_today": 0,
+        "degraded_max_buys_today": None,
+        "degraded_gross_exposure_pct": None,
+        "degraded_max_gross_exposure_pct": None,
         "spy_data_ok": None,
         "regime_data_status": None,
         "regime_data_fallback": None,
@@ -175,6 +238,7 @@ def _new_no_buy_diag(now, b, force=False, user_forced=False):
         "vix_display": None,
         "volatility_data_ok": None,
         "volatility_source": None,
+        "volatility_value": None,
         "volatility_data_error": None,
         "data_health_ok": None,
         "data_health_blocks": [],
@@ -194,6 +258,10 @@ def _new_no_buy_diag(now, b, force=False, user_forced=False):
         "stale_positions": [],
         "risk_unmanaged_positions": [],
         "api_circuit_breakers": {},
+        "provider_health_status": "healthy",
+        "rate_limit_recent": False,
+        "buys_executed": 0,
+        "sells_executed": 0,
         "signal_counts": {},
         "display_signal_counts": {},
         "raw_buy_count": 0,
@@ -224,8 +292,12 @@ def _set_main_blocker(diag):
         blocker = "market_closed"
     elif diag.get("tod_ok") is False:
         blocker = "outside_new_buy_window"
-    elif diag.get("data_health_blocks"):
+    elif diag.get("data_health_blocks") and (
+            not diag.get("degraded_mode_active")
+            or "STALE_HELD_QUOTE" in (diag.get("data_health_blocks") or [])):
         blocker = "data_health_block"
+    elif diag.get("paper_trading_locked"):
+        blocker = diag.get("paper_lock_reason") or "paper_trading_locked"
     elif diag.get("regime_allow_buys") is False:
         blocker = "regime_or_vix_blocks_buys"
     elif (diag.get("cash_available_after_floor") is not None
@@ -254,6 +326,109 @@ def _fmt_vix_value(vix_data):
         return "n/a"
 
 
+def _market_data_mode(regime, vix_data, cfg):
+    mode_cfg = (cfg or {}).get("market_data_modes", {})
+    spy_ok = regime.get("spy_data_ok") is True
+    vol_ok = vix_data.get("data_ok") is True
+    vol_source = vix_data.get("volatility_source") or vix_data.get("source")
+    is_proxy = vol_ok and vol_source == "spy_realized_vol_proxy"
+    blocks = []
+    if not spy_ok:
+        blocks.append("SPY_DATA_MISSING")
+    if not vol_ok:
+        blocks.append("VOLATILITY_DATA_MISSING")
+
+    if spy_ok and vol_ok and is_proxy and mode_cfg.get("allow_proxy_mode", True):
+        mode = "PROXY_MODE"
+        size_mult = float(mode_cfg.get("proxy_size_mult", 0.85))
+        reason = "real VIX unavailable; using SPY realized-vol proxy"
+    elif spy_ok and vol_ok and not blocks:
+        mode = "NORMAL_MODE"
+        size_mult = float(mode_cfg.get("normal_size_mult", 1.0))
+        reason = None
+    elif blocks and mode_cfg.get("allow_degraded_paper_trading", True):
+        mode = "DEGRADED_MODE"
+        size_mult = float(mode_cfg.get("degraded_size_mult", 0.70))
+        reason = ",".join(blocks)
+    else:
+        mode = "DEGRADED_MODE_DISABLED" if blocks else "DATA_HEALTH_BLOCKED"
+        size_mult = 1.0
+        reason = ",".join(blocks) if blocks else None
+
+    degraded = mode == "DEGRADED_MODE"
+    proxy = mode == "PROXY_MODE"
+    normal = mode == "NORMAL_MODE"
+    return {
+        "trading_mode": mode,
+        "normal_mode_active": normal,
+        "proxy_mode_active": proxy,
+        "degraded_mode_active": degraded,
+        "degraded_mode_reason": reason if degraded else None,
+        "data_health_blocks": blocks,
+        "allow_buys": normal or proxy or degraded,
+        "mode_size_mult": size_mult,
+        "mode_size_reason": mode if size_mult < 1.0 else None,
+    }
+
+
+def _provider_health_summary(snapshot):
+    snap = snapshot or {}
+    if any((v or {}).get("rate_limit_recent") for v in snap.values() if isinstance(v, dict)):
+        return "rate_limited"
+    if any((v or {}).get("rate_limited") for v in snap.values() if isinstance(v, dict)):
+        return "rate_limited"
+    if any((v or {}).get("status") == "degraded" for v in snap.values() if isinstance(v, dict)):
+        return "degraded"
+    return "healthy"
+
+
+def _apply_paper_loss_lockouts(b, diag, risk_cfg, equity, peak_equity, now):
+    """Return True when new buys should be blocked by paper-only loss controls."""
+    today_open = float(b.get("today_open_equity") or equity or 0.0)
+    daily_return = ((float(equity or 0.0) - today_open) / today_open) if today_open else 0.0
+    drawdown_return = ((float(equity or 0.0) - float(peak_equity or 0.0)) / float(peak_equity or 1.0)) if peak_equity else 0.0
+    daily_limit = float(risk_cfg.get("daily_loss_limit_pct", -0.02))
+    drawdown_limit = float(risk_cfg.get("hard_drawdown_lockout_pct", -0.10))
+    diag["daily_pnl_pct"] = round(daily_return, 4)
+    diag["drawdown_return_pct"] = round(drawdown_return, 4)
+    if daily_limit < 0 and daily_return <= daily_limit:
+        diag["paper_trading_locked"] = True
+        diag["paper_lock_reason"] = "DAILY_LOSS_LIMIT"
+        _log_bot_event(
+            "DAILY_LOSS_LIMIT",
+            equity=round(float(equity or 0.0), 2),
+            today_open_equity=round(today_open, 2),
+            daily_return=round(daily_return, 4),
+            limit=daily_limit,
+            ts=int(now),
+        )
+        return True
+    if drawdown_limit < 0 and drawdown_return <= drawdown_limit:
+        diag["paper_trading_locked"] = True
+        diag["paper_lock_reason"] = "DRAWDOWN_LOCKOUT"
+        _log_bot_event(
+            "DRAWDOWN_LOCKOUT",
+            equity=round(float(equity or 0.0), 2),
+            peak_equity=round(float(peak_equity or 0.0), 2),
+            drawdown_return=round(drawdown_return, 4),
+            limit=drawdown_limit,
+            ts=int(now),
+        )
+        return True
+    return False
+
+
+def _raise_if_tick_deadline_exceeded(deadline_ts, b, diag):
+    if deadline_ts is None or time.time() <= deadline_ts:
+        return
+    diag["partial_result"] = True
+    diag["timeout_reason"] = "BOT_TICK_MAX_RUNTIME_SEC"
+    diag["paper_trading_locked"] = True
+    diag["paper_lock_reason"] = "BOT_TICK_TIMEOUT"
+    _persist_no_buy_diag(b, diag, "partial_timeout")
+    raise TimeoutError("partial_timeout")
+
+
 def buyable_reason(t, s, recent_sells=None, regime_kind="neutral", holdings=None):
     recent_sells = recent_sells or {}
     holdings = holdings or {}
@@ -278,7 +453,7 @@ def buyable_reason(t, s, recent_sells=None, regime_kind="neutral", holdings=None
     if regime_kind == "bear":
         if not (ctx_local.get("rsi", 100) < 35 or ctx_local.get("is_dip")):
             return False, "BEAR_GATE_REQUIRES_DIP_OR_RSI_LT_35"
-    if (regime_kind == "neutral" and ctx_local.get("adx", 100) < 20
+    if (regime_kind in ("neutral", "degraded_neutral") and ctx_local.get("adx", 100) < 20
             and not ctx_local.get("is_dip")):
         if t not in holdings:
             return False, "NEUTRAL_ADX_BELOW_20_NON_DIP"
@@ -714,7 +889,7 @@ def _generic_exit_shadow(h, pr, ctx, rec, stop_loss_pct, trail_stop_pct,
     }
 
 
-def run_bot(force=False, user_forced=False):
+def run_bot(force=False, user_forced=False, max_runtime_sec=None):
     """Bot decision pass. Thread-safe via _bot_run_lock — concurrent triggers
     are dropped rather than queued. Returns (b, traded, last_action).
 
@@ -735,16 +910,22 @@ def run_bot(force=False, user_forced=False):
     try:
         try:
             with acquire_bot_file_lock(block=False):
-                return _run_bot_locked(force=force, user_forced=user_forced)
-        except TimeoutError:
+                return _run_bot_locked(
+                    force=force,
+                    user_forced=user_forced,
+                    max_runtime_sec=max_runtime_sec,
+                )
+        except TimeoutError as exc:
             b = load_bot()
+            if str(exc) == "partial_timeout":
+                return b, False, "partial_timeout"
             return b, False, "already_running"
     finally:
         _set_running(False)
         _bot_run_lock.release()
 
 
-def _run_bot_locked(force=False, user_forced=False):
+def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
     b = load_bot()
     _ensure_v1_state(b)
     _memory_guard(b)
@@ -752,6 +933,7 @@ def _run_bot_locked(force=False, user_forced=False):
     cfg = active_config()
     cfg_hash = config_hash(cfg)
     no_buy_diag = _new_no_buy_diag(now, b, force=force, user_forced=user_forced)
+    deadline_ts = (now + float(max_runtime_sec)) if max_runtime_sec else None
     collapse_diag = []
     stale_scan_skipped = False
 
@@ -799,6 +981,7 @@ def _run_bot_locked(force=False, user_forced=False):
     all_to_check = _pa_stage_tickers(tickers, list(b["holdings"].keys()), b)
     no_buy_diag["checked_tickers"] = list(all_to_check)
     no_buy_diag["pa_stage_status"] = b.get("pa_stage_status")
+    _raise_if_tick_deadline_exceeded(deadline_ts, b, no_buy_diag)
     regime = get_market_regime(cfg)
     if regime.get("regime_v3_raw") not in (None, "fallback"):
         regime_state = b.setdefault("regime_v3_state", {})
@@ -841,6 +1024,7 @@ def _run_bot_locked(force=False, user_forced=False):
     no_buy_diag["spy_data_source"] = regime.get("spy_data_source") or regime.get("regime_data_source")
     no_buy_diag["spy_data_error"] = regime.get("spy_data_error") or regime.get("regime_data_error")
     no_buy_diag["spy_rows"] = regime.get("spy_rows")
+    no_buy_diag["spy_bar_count"] = regime.get("spy_rows")
     no_buy_diag["spy_last_date"] = regime.get("spy_last_date")
     no_buy_diag["spy_mom_label"] = regime.get("spy_mom_label")
     sigs = {}
@@ -880,9 +1064,11 @@ def _run_bot_locked(force=False, user_forced=False):
                        "intra": {}, "earn": {}, "analyst": {}, "insider": {}}
 
     fetch_workers = 2 if PYTHONANYWHERE_MODE else 8
+    _raise_if_tick_deadline_exceeded(deadline_ts, b, no_buy_diag)
     with ThreadPoolExecutor(max_workers=fetch_workers) as ex:
         for t, payload in ex.map(_fetch_one, list(all_to_check)):
             sigs[t] = payload
+            _raise_if_tick_deadline_exceeded(deadline_ts, b, no_buy_diag)
     gc.collect()
     for payload in sigs.values():
         rec = _annotate_signal(payload.get("rec") or {})
@@ -898,6 +1084,12 @@ def _run_bot_locked(force=False, user_forced=False):
     no_buy_diag["stale_ticker_count"] = len(stale_tickers)
     no_buy_diag["stale_tickers"] = stale_tickers[:10]
     no_buy_diag["api_circuit_breakers"] = api_failure_snapshot()
+    no_buy_diag["provider_health_status"] = _provider_health_summary(no_buy_diag["api_circuit_breakers"])
+    no_buy_diag["rate_limit_recent"] = any(
+        (snap or {}).get("rate_limit_recent")
+        for snap in (no_buy_diag.get("api_circuit_breakers") or {}).values()
+        if isinstance(snap, dict)
+    )
     for endpoint, snap in (no_buy_diag.get("api_circuit_breakers") or {}).items():
         if snap.get("rate_limited"):
             _log_bot_event("RATE_LIMIT_HIT", endpoint=endpoint, provider_status=snap)
@@ -912,16 +1104,14 @@ def _run_bot_locked(force=False, user_forced=False):
     last_action = ""
 
     # VIX gating
+    _raise_if_tick_deadline_exceeded(deadline_ts, b, no_buy_diag)
     vix_data = get_vix()
     vix_label = vix_data["regime"]
     vix_mult  = vix_data["mult"]
-    data_health_blocks = []
-    if regime.get("spy_data_ok") is False:
-        data_health_blocks.append("SPY_DATA_MISSING")
-    if vix_data.get("data_ok") is False:
-        data_health_blocks.append("VOLATILITY_DATA_MISSING")
-    regime_data_size_mult = 1.0
-    sizing_vix_mult = vix_mult * regime_data_size_mult
+    mode_info = _market_data_mode(regime, vix_data, cfg)
+    data_health_blocks = mode_info["data_health_blocks"]
+    regime_data_size_mult = mode_info["mode_size_mult"]
+    sizing_vix_mult = vix_mult
     no_buy_diag["vix_label"] = vix_label
     no_buy_diag["vix_value"] = vix_data.get("vix")
     no_buy_diag["vix_data_ok"] = vix_data.get("data_ok")
@@ -929,17 +1119,33 @@ def _run_bot_locked(force=False, user_forced=False):
     no_buy_diag["vix_display"] = vix_data.get("vix_display") or ("proxy" if vix_data.get("data_ok") else "unknown")
     no_buy_diag["volatility_data_ok"] = vix_data.get("data_ok")
     no_buy_diag["volatility_source"] = vix_data.get("volatility_source") or vix_data.get("source")
+    no_buy_diag["volatility_value"] = vix_data.get("volatility_value", vix_data.get("vix"))
     no_buy_diag["volatility_data_error"] = vix_data.get("data_error")
+    no_buy_diag["volatility_error"] = vix_data.get("data_error")
     no_buy_diag["data_health_blocks"] = data_health_blocks
     no_buy_diag["data_health_ok"] = not bool(data_health_blocks)
     no_buy_diag["regime_data_size_mult"] = regime_data_size_mult
+    no_buy_diag.update({
+        "trading_mode": mode_info["trading_mode"],
+        "normal_mode_active": mode_info["normal_mode_active"],
+        "proxy_mode_active": mode_info["proxy_mode_active"],
+        "degraded_mode_active": mode_info["degraded_mode_active"],
+        "degraded_mode_reason": mode_info["degraded_mode_reason"],
+    })
 
     # Regime-conditional risk params
-    if regime_kind == "bull":
+    if mode_info["degraded_mode_active"]:
+        regime_kind = "degraded_neutral"
+        regime["regime_effective"] = regime_kind
+        regime["regime_v3_effective"] = regime_kind
+        no_buy_diag["regime_data_source"] = "degraded_fallback"
+        no_buy_diag["regime_source"] = "degraded_fallback"
+    risk_regime_kind = "neutral" if regime_kind == "degraded_neutral" else regime_kind
+    if risk_regime_kind == "bull":
         STOP_LOSS_PCT = -8.0;  TRAIL_STOP_PCT = 5.0
         regime_size_mult = 1.0; regime_label = "BULL"
         AGING_HOURS = 18
-    elif regime_kind == "bear":
+    elif risk_regime_kind == "bear":
         STOP_LOSS_PCT = -4.0;  TRAIL_STOP_PCT = 3.0
         regime_size_mult = 0.5; regime_label = "BEAR"
         AGING_HOURS = 6
@@ -952,18 +1158,25 @@ def _run_bot_locked(force=False, user_forced=False):
         intra_tilt = regime.get("intra_tilt") or "tilt"
         regime_label = f"{macro_regime_kind.upper()}→{regime_label} (intra {intra_tilt})"
 
-    regime_allow_buys = (vix_mult > 0) and not data_health_blocks
+    regime_allow_buys = (vix_mult > 0) and bool(mode_info["allow_buys"])
     regime_v3_label = regime.get("regime_v3_effective") or regime.get("regime_v3")
     if regime_v3_label == "panic" and not b.get("paper_debug_override", False):
         regime_allow_buys = False
     no_buy_diag["regime_allow_buys"] = bool(regime_allow_buys)
     no_buy_diag["regime_kind"] = regime_kind
     no_buy_diag["regime_v3"] = regime_v3_label
+    no_buy_diag["regime_fallback_active"] = no_buy_diag.get("regime_data_fallback")
     if data_health_blocks:
         regime_label = f"{regime_label} (data health block: {','.join(data_health_blocks)})"
         _log_bot_event("DATA_HEALTH_BLOCK", blocks=data_health_blocks,
                        regime_data_status=regime.get("regime_data_status"),
                        vix_data_status=vix_data.get("data_status"))
+    if mode_info["degraded_mode_active"]:
+        regime_label = "DEGRADED NEUTRAL"
+        _log_bot_event("DEGRADED_MODE_ACTIVE", blocks=data_health_blocks,
+                       size_mult=mode_info["mode_size_mult"])
+    elif mode_info["trading_mode"] == "DEGRADED_MODE_DISABLED":
+        _log_bot_event("DEGRADED_MODE_DISABLED", blocks=data_health_blocks)
 
     risk_cfg = cfg.get("risk", {}) if isinstance(cfg, dict) else {}
     max_positions = int(risk_cfg.get("max_positions", MAX_POSITIONS))
@@ -1262,6 +1475,7 @@ def _run_bot_locked(force=False, user_forced=False):
             del b["holdings"][t]
             _mark_sold(t, now, exit_reason_key)
             traded = True
+            no_buy_diag["sells_executed"] = int(no_buy_diag.get("sells_executed", 0) or 0) + 1
             last_action = f"SELL {t}"
         else:
             b["holdings"][t] = h
@@ -1310,8 +1524,32 @@ def _run_bot_locked(force=False, user_forced=False):
         )
     except Exception:
         buys_today = 0
+        degraded_buys_today = 0
+    else:
+        degraded_buys_today = 0
+        for e in b.get("history", []):
+            try:
+                if (e.get("action") == "BUY"
+                        and e.get("trading_mode") == "DEGRADED_MODE"
+                        and e.get("ts")
+                        and datetime.fromtimestamp(float(e.get("ts")), et_zone).strftime("%Y-%m-%d") == today_key):
+                    degraded_buys_today += 1
+            except Exception:
+                pass
+    mode_cfg = (cfg or {}).get("market_data_modes", {})
+    degraded_max_buys_today = int(mode_cfg.get("degraded_max_new_buys_per_day", 1))
+    degraded_max_buys_per_tick = int(mode_cfg.get("degraded_max_new_buys_per_tick", 1))
+    degraded_max_position_pct = float(mode_cfg.get("degraded_max_position_pct", 0.05))
+    degraded_max_gross_exposure_pct = float(mode_cfg.get("degraded_max_gross_exposure_pct", 0.35))
+    degraded_min_confidence = float(mode_cfg.get("degraded_min_confidence", 65))
     no_buy_diag["buys_today"] = int(buys_today)
     no_buy_diag["max_buys_today"] = max_buys_today
+    no_buy_diag["degraded_buys_today"] = int(degraded_buys_today)
+    no_buy_diag["degraded_max_buys_today"] = degraded_max_buys_today
+    no_buy_diag["degraded_size_mult"] = mode_cfg.get("degraded_size_mult", 0.70)
+    no_buy_diag["degraded_min_confidence"] = degraded_min_confidence
+    no_buy_diag["degraded_gross_exposure_pct"] = no_buy_diag.get("gross_exposure_pct")
+    no_buy_diag["degraded_max_gross_exposure_pct"] = degraded_max_gross_exposure_pct
 
     # Round-8 Bug #3: if ANY held position is priced off a stale quote, this
     # equity figure is partly valued at avg_cost (not a live price). Don't let such
@@ -1330,7 +1568,11 @@ def _run_bot_locked(force=False, user_forced=False):
     b["peak_equity"] = round(peak_equity, 2)
 
     drawdown_pct = (peak_equity - starting_cash) / peak_equity * 100 if peak_equity else 0
-    buys_paused = drawdown_pct > DRAWDOWN_PAUSE
+    lockout_active = _apply_paper_loss_lockouts(b, no_buy_diag, risk_cfg, starting_cash, peak_equity, now)
+    if lockout_active:
+        regime_allow_buys = False
+        no_buy_diag["regime_allow_buys"] = False
+    buys_paused = bool(lockout_active or drawdown_pct > DRAWDOWN_PAUSE)
 
     sector_value = {}
     corr_value = {}
@@ -1465,8 +1707,12 @@ def _run_bot_locked(force=False, user_forced=False):
     no_buy_diag["scan_rows_count"] = len(scan_rows_all)
     no_buy_diag["scan_fresh_rows_count"] = len(fresh_scan_rows)
 
-    daily_buy_room = buys_today < max_buys_today
-    exposure_room = (no_buy_diag.get("gross_exposure_pct") or 0) < MAX_GROSS_EXPOSURE_PCT
+    if mode_info["degraded_mode_active"]:
+        daily_buy_room = degraded_buys_today < degraded_max_buys_today
+        exposure_room = (no_buy_diag.get("gross_exposure_pct") or 0) < degraded_max_gross_exposure_pct
+    else:
+        daily_buy_room = buys_today < max_buys_today
+        exposure_room = (no_buy_diag.get("gross_exposure_pct") or 0) < MAX_GROSS_EXPOSURE_PCT
     if not daily_buy_room:
         _bump(no_buy_diag["skip_reason_counts"], "daily buy cap reached")
     if not exposure_room:
@@ -1524,11 +1770,13 @@ def _run_bot_locked(force=False, user_forced=False):
     no_buy_diag["candidate_pool_count"] = len(candidate_pool)
 
     pt_for_rank = _portfolio_total()
+    _raise_if_tick_deadline_exceeded(deadline_ts, b, no_buy_diag)
     ranked_candidates = rank_candidates(
         candidate_pool, pt_for_rank, STOP_LOSS_PCT, regime_kind,
         sizing_vix_mult, streak_mult, kelly_mult, b,
         min_position_usd=MIN_POSITION_USD, commission=COMMISSION_PER_TRADE,
-        config=cfg,
+        config=cfg, mode_size_mult=mode_info["mode_size_mult"],
+        mode_size_reason=mode_info["mode_size_reason"],
     ) if candidate_pool else []
     no_buy_diag["ranked_count"] = len(ranked_candidates)
     no_buy_diag["tradable_count"] = sum(1 for c in ranked_candidates if c.get("tradable"))
@@ -1590,14 +1838,67 @@ def _run_bot_locked(force=False, user_forced=False):
     total_taken = 0
     max_cycle_buys = int(risk_cfg.get("max_new_buys_per_tick", BOT_MAX_BUYS)) + BOT_SCAN_BUY
     max_cycle_buys = max(0, min(max_cycle_buys, max_buys_today - buys_today))
+    if mode_info["degraded_mode_active"]:
+        degraded_day_room = max(0, degraded_max_buys_today - degraded_buys_today)
+        max_cycle_buys = min(max_cycle_buys, degraded_max_buys_per_tick, degraded_day_room)
+
+    def _log_degraded_decision(cand, event, reason, final_size=None, gross_after=None):
+        rec = cand.get("rec") or {}
+        risk = cand.get("risk") or {}
+        _log_bot_event(
+            event,
+            ticker=cand.get("ticker"),
+            confidence=rec.get("confidence"),
+            display_signal_label=rec.get("display_signal_label"),
+            trade_bucket=cand.get("trade_bucket"),
+            eligibility_result=event,
+            rejection_reason=reason if event.endswith("REJECTED") else None,
+            allowed_reason=reason if event.endswith("ALLOWED") else None,
+            original_size=risk.get("pre_mode_target_notional", risk.get("target_notional")),
+            degraded_size_mult=mode_info["mode_size_mult"],
+            final_size=final_size if final_size is not None else risk.get("target_notional"),
+            gross_exposure_after_trade=gross_after,
+        )
+
+    def _degraded_reject_reason(cand, s, existing, taken_this_tick):
+        rec = cand.get("rec") or {}
+        risk = cand.get("risk") or {}
+        display = rec.get("display_signal_label")
+        if s.get("stale"):
+            return "DEGRADED_STALE_QUOTE_BLOCKED"
+        if display not in ("BUY_CANDIDATE", "STRONG_BUY_CANDIDATE"):
+            return "DEGRADED_NOT_BUY_CANDIDATE"
+        if float(rec.get("confidence", 0) or 0) < degraded_min_confidence:
+            return "DEGRADED_CONFIDENCE_BELOW_65"
+        if cand.get("trade_bucket") == "experimental":
+            return "DEGRADED_EXPERIMENTAL_BLOCKED"
+        if cand.get("edge_source") == "confidence_prior":
+            return "DEGRADED_CONFIDENCE_PRIOR_BLOCKED"
+        penalties = set(cand.get("warnings") or []) | set(risk.get("size_penalties") or [])
+        if "LOW_VOLUME_PENALTY_ONLY" in penalties:
+            return "DEGRADED_LOW_VOLUME_BLOCKED"
+        if existing:
+            return "DEGRADED_PYRAMIDING_BLOCKED"
+        if taken_this_tick >= degraded_max_buys_per_tick:
+            return "DEGRADED_MAX_BUYS_PER_TICK"
+        if degraded_buys_today + taken_this_tick >= degraded_max_buys_today:
+            return "DEGRADED_MAX_BUYS_PER_DAY"
+        return None
+
     for cand in ranked_candidates:
         t = cand["ticker"]
         s = sigs.get(t) or {}
         rec = cand["rec"]
         conf = rec.get("confidence", 0)
         if total_taken >= max_cycle_buys:
-            _bump(no_buy_diag["skip_reason_counts"], "cycle buy cap reached")
-            _record_candidate_observation(b, cand, "skipped", "cycle buy cap reached",
+            reason = "cycle buy cap reached"
+            if mode_info["degraded_mode_active"]:
+                reason = ("DEGRADED_MAX_BUYS_PER_DAY" if degraded_buys_today >= degraded_max_buys_today
+                          else "DEGRADED_MAX_BUYS_PER_TICK")
+                _bump(no_buy_diag["degraded_reject_counts"], reason)
+                _log_degraded_decision(cand, "DEGRADED_MODE_ENTRY_REJECTED", reason)
+            _bump(no_buy_diag["skip_reason_counts"], reason)
+            _record_candidate_observation(b, cand, "skipped", reason,
                                           now, regime_kind)
             continue
         if cand["source"] == "scan" and scan_taken >= BOT_SCAN_BUY:
@@ -1606,15 +1907,32 @@ def _run_bot_locked(force=False, user_forced=False):
                                           now, regime_kind)
             continue
         if not cand.get("tradable"):
-            _bump(no_buy_diag["skip_reason_counts"], cand.get("rank_reason"))
-            _record_candidate_observation(b, cand, "skipped", cand.get("rank_reason"),
+            reason = cand.get("rank_reason")
+            if mode_info["degraded_mode_active"]:
+                reason = ("DEGRADED_FINAL_SIZE_TOO_SMALL"
+                          if "below" in str(cand.get("rank_reason") or "").lower()
+                          else "DEGRADED_NORMAL_EV_GATE_FAILED")
+                _bump(no_buy_diag["degraded_reject_counts"], reason)
+                _log_degraded_decision(cand, "DEGRADED_MODE_ENTRY_REJECTED", reason)
+            _bump(no_buy_diag["skip_reason_counts"], reason)
+            _record_candidate_observation(b, cand, "skipped", reason,
                                           now, regime_kind)
-            collapse_diag.append({"ticker": t, "reason": cand.get("rank_reason"),
+            collapse_diag.append({"ticker": t, "reason": reason,
                                   "signal": rec.get("signal"), "confidence": conf})
             continue
         if b["cash"] - cash_floor < MIN_POSITION_USD:
             break
         existing = b["holdings"].get(t)
+        if mode_info["degraded_mode_active"]:
+            reject = _degraded_reject_reason(cand, s, existing, total_taken)
+            if reject:
+                _bump(no_buy_diag["degraded_reject_counts"], reject)
+                _bump(no_buy_diag["skip_reason_counts"], reject)
+                _log_degraded_decision(cand, "DEGRADED_MODE_ENTRY_REJECTED", reject)
+                _record_candidate_observation(b, cand, "skipped", reject, now, regime_kind)
+                collapse_diag.append({"ticker": t, "reason": reject,
+                                      "signal": rec.get("signal"), "confidence": conf})
+                continue
         if existing:
             exist_pnl = ((cand["price"] - existing["avg_cost"]) / existing["avg_cost"] * 100
                          if existing.get("avg_cost") else 0)
@@ -1648,6 +1966,31 @@ def _run_bot_locked(force=False, user_forced=False):
         if grp:
             grp_current = corr_value.get(grp, 0)
             spend = min(spend, max(0, pt * MAX_CORR_GROUP_PCT - grp_current))
+        if mode_info["degraded_mode_active"]:
+            degraded_pos_room = max(0, pt * degraded_max_position_pct - existing_val)
+            if degraded_pos_room < MIN_POSITION_USD:
+                reason = "DEGRADED_MAX_POSITION_CAP"
+                _bump(no_buy_diag["degraded_reject_counts"], reason)
+                _bump(no_buy_diag["skip_reason_counts"], reason)
+                _log_degraded_decision(cand, "DEGRADED_MODE_ENTRY_REJECTED", reason,
+                                       final_size=0, gross_after=no_buy_diag.get("gross_exposure_pct"))
+                _record_candidate_observation(b, cand, "skipped", reason, now, regime_kind)
+                collapse_diag.append({"ticker": t, "reason": reason,
+                                      "signal": rec.get("signal"), "confidence": conf})
+                continue
+            spend = min(spend, degraded_pos_room)
+            degraded_gross_room = max(0, pt * degraded_max_gross_exposure_pct - exposure_value)
+            if degraded_gross_room < MIN_POSITION_USD:
+                reason = "DEGRADED_GROSS_EXPOSURE_CAP"
+                _bump(no_buy_diag["degraded_reject_counts"], reason)
+                _bump(no_buy_diag["skip_reason_counts"], reason)
+                _log_degraded_decision(cand, "DEGRADED_MODE_ENTRY_REJECTED", reason,
+                                       final_size=0, gross_after=no_buy_diag.get("gross_exposure_pct"))
+                _record_candidate_observation(b, cand, "skipped", reason, now, regime_kind)
+                collapse_diag.append({"ticker": t, "reason": reason,
+                                      "signal": rec.get("signal"), "confidence": conf})
+                continue
+            spend = min(spend, degraded_gross_room)
         variance_diag = candidate_variance_check(
             b.get("holdings", {}), price_by_ticker, t, spend, pt,
             close_history, ctx_by_ticker=ctx_by_ticker, regime=regime_kind,
@@ -1672,6 +2015,12 @@ def _run_bot_locked(force=False, user_forced=False):
         if spend < MIN_POSITION_USD:
             reason = (f"Risk/cap spend ${spend:.0f} below ${MIN_POSITION_USD:.0f} floor "
                       f"(target ${cand['risk']['target_notional']:.0f})")
+            if mode_info["degraded_mode_active"]:
+                reason = "DEGRADED_FINAL_SIZE_TOO_SMALL"
+                _bump(no_buy_diag["degraded_reject_counts"], reason)
+                _log_degraded_decision(cand, "DEGRADED_MODE_ENTRY_REJECTED", reason,
+                                       final_size=spend,
+                                       gross_after=no_buy_diag.get("gross_exposure_pct"))
             _bump(no_buy_diag["skip_reason_counts"], reason)
             _record_candidate_observation(b, cand, "skipped", reason, now, regime_kind)
             collapse_diag.append({"ticker": t, "reason": reason,
@@ -1703,6 +2052,9 @@ def _run_bot_locked(force=False, user_forced=False):
             "vix": vix_data.get("vix"),
             "vix_regime": vix_label,
             "market_regime": regime_label,
+            "trading_mode": mode_info["trading_mode"],
+            "degraded_mode_active": mode_info["degraded_mode_active"],
+            "degraded_mode_reason": mode_info["degraded_mode_reason"],
             "sector": sec,
             "confidence": conf,
             "signal": rec.get("signal"),
@@ -1774,10 +2126,38 @@ def _run_bot_locked(force=False, user_forced=False):
             f"catalyst={cand.get('catalyst_type')} confirmed={cand.get('catalyst_confirmed')}, cfg={cfg_hash}. "
             f"{variance_reason(cand.get('portfolio_variance'))}"
         )
+        if mode_info["proxy_mode_active"]:
+            buy_reason = (
+                f"PROXY MODE: real VIX unavailable; using SPY realized-vol proxy "
+                f"{_fmt_vix_value(vix_data)}, size x{mode_info['mode_size_mult']:.2f}. "
+                + buy_reason
+            )
+        elif mode_info["degraded_mode_active"]:
+            buy_reason = (
+                f"DEGRADED MODE ENTRY: SPY/VIX data missing; restricted paper-only "
+                f"fallback active, size x{mode_info['mode_size_mult']:.2f}. "
+                + buy_reason
+            )
+        if mode_info["degraded_mode_active"]:
+            gross_after = round((exposure_value + cost) / pt, 4) if pt else None
+            _log_degraded_decision(cand, "DEGRADED_MODE_ENTRY_ALLOWED",
+                                   "DEGRADED_MODE_ENTRY_ALLOWED",
+                                   final_size=round(cost, 2),
+                                   gross_after=gross_after)
         _record_trade(b, "BUY", t, sh, cand["price"], rec, cand.get("arts"), buy_reason)
+        if b.get("history"):
+            b["history"][0].update({
+                "trading_mode": mode_info["trading_mode"],
+                "normal_mode_active": mode_info["normal_mode_active"],
+                "proxy_mode_active": mode_info["proxy_mode_active"],
+                "degraded_mode_active": mode_info["degraded_mode_active"],
+                "degraded_mode_reason": mode_info["degraded_mode_reason"],
+            })
         _record_candidate_observation(b, cand, "executed", buy_reason, now, regime_kind)
         traded = True
+        no_buy_diag["buys_executed"] = int(no_buy_diag.get("buys_executed", 0) or 0) + 1
         total_taken += 1
+        exposure_value += cost
         if cand["source"] == "scan":
             scan_taken += 1
             bought.append(f"BUY {t} (scan)")
@@ -1802,9 +2182,20 @@ def _run_bot_locked(force=False, user_forced=False):
         last_action = ", ".join(bought) if not last_action else last_action + ", " + ", ".join(bought)
 
     # ── HOLD / SKIP records ───────────────────────────────────────────────
+    def _tag_last_decision_mode():
+        if b.get("history"):
+            b["history"][0].update({
+                "trading_mode": mode_info["trading_mode"],
+                "normal_mode_active": mode_info["normal_mode_active"],
+                "proxy_mode_active": mode_info["proxy_mode_active"],
+                "degraded_mode_active": mode_info["degraded_mode_active"],
+                "degraded_mode_reason": mode_info["degraded_mode_reason"],
+            })
+
     for cd in collapse_diag[:5]:
         if "reason" in cd:
             _record_skip(b, cd["ticker"], cd["reason"], cd["signal"], cd["confidence"])
+            _tag_last_decision_mode()
             continue
         ms = cd["mults"]
         ec = ms.get("env_components", {})
@@ -1817,11 +2208,26 @@ def _run_bot_locked(force=False, user_forced=False):
             f"streak {ec.get('streak')}]"
         )
         _record_skip(b, cd["ticker"], skip_reason, cd["signal"], cd["confidence"])
+        _tag_last_decision_mode()
     if not traded and not collapse_diag:
         reasons = []
         has_buys = any(s["rec"]["cls"] in ("buy", "strong-buy") for s in sigs.values())
+        if mode_info["proxy_mode_active"]:
+            reasons.append(
+                f"PROXY MODE: real VIX unavailable; using SPY realized-vol proxy "
+                f"{_fmt_vix_value(vix_data)}, size x{mode_info['mode_size_mult']:.2f}"
+            )
+        if no_buy_diag.get("paper_trading_locked") and no_buy_diag.get("paper_lock_reason"):
+            reasons.append(f"paper trading locked: {no_buy_diag.get('paper_lock_reason')}")
         if no_buy_diag.get("data_health_blocks"):
-            reasons.append("buys blocked by data health: " + ",".join(no_buy_diag.get("data_health_blocks") or []))
+            blocks_text = ",".join(no_buy_diag.get("data_health_blocks") or [])
+            if mode_info["degraded_mode_active"]:
+                reasons.append(
+                    f"DEGRADED MODE: restricted paper-only fallback active, "
+                    f"size x{mode_info['mode_size_mult']:.2f}; data health: {blocks_text}"
+                )
+            else:
+                reasons.append("buys blocked by data health: " + blocks_text)
         elif not regime_allow_buys:
             if regime_v3_label == "panic" and not b.get("paper_debug_override"):
                 reasons.append("buys halted (V3 panic hard no-buy)")
@@ -1830,9 +2236,18 @@ def _run_bot_locked(force=False, user_forced=False):
         elif buys_paused:
             reasons.append(f"drawdown circuit-breaker active ({drawdown_pct:.1f}% from peak)")
         elif not daily_buy_room:
-            reasons.append(f"daily buy cap reached ({buys_today}/{max_buys_today})")
+            if mode_info["degraded_mode_active"]:
+                reasons.append(f"degraded daily buy cap reached ({degraded_buys_today}/{degraded_max_buys_today})")
+            else:
+                reasons.append(f"daily buy cap reached ({buys_today}/{max_buys_today})")
         elif not exposure_room:
-            reasons.append(f"gross exposure cap reached ({no_buy_diag.get('gross_exposure_pct'):.0%})")
+            if mode_info["degraded_mode_active"]:
+                reasons.append(
+                    f"degraded gross exposure cap reached ({no_buy_diag.get('gross_exposure_pct'):.0%}/"
+                    f"{degraded_max_gross_exposure_pct:.0%})"
+                )
+            else:
+                reasons.append(f"gross exposure cap reached ({no_buy_diag.get('gross_exposure_pct'):.0%})")
         elif not has_buys:
             reasons.append("no BUY signals across watchlist")
         elif b["cash"] - cash_floor < MIN_POSITION_USD:
@@ -1843,6 +2258,7 @@ def _run_bot_locked(force=False, user_forced=False):
         reasons.append(f"regime={regime_label} · VIX={vix_label}({_fmt_vix_value(vix_data)})")
         reasons_str = " · ".join(reasons) if reasons else "signals not strong enough to act"
         _record_hold(b, reasons_str, sigs)
+        _tag_last_decision_mode()
 
     # Round-8: cap history with SEPARATE budgets per action — 100 BUY + 100 SELL +
     # 20 HOLD/SKIP, ordered newest-first. History is stored newest-first
@@ -2020,7 +2436,20 @@ def _render_bot_page(read_only):
         "buy_window_open": no_buy.get("buy_window_open"),
         "regime_allow_buys": no_buy.get("regime_allow_buys"),
         "regime_kind": no_buy.get("regime_kind"),
+        "regime_source": no_buy.get("regime_source"),
         "regime_v3": no_buy.get("regime_v3"),
+        "trading_mode": no_buy.get("trading_mode"),
+        "normal_mode_active": no_buy.get("normal_mode_active"),
+        "proxy_mode_active": no_buy.get("proxy_mode_active"),
+        "degraded_mode_active": no_buy.get("degraded_mode_active"),
+        "degraded_mode_reason": no_buy.get("degraded_mode_reason"),
+        "degraded_size_mult": no_buy.get("degraded_size_mult"),
+        "degraded_min_confidence": no_buy.get("degraded_min_confidence"),
+        "degraded_reject_counts": no_buy.get("degraded_reject_counts", {}),
+        "degraded_buys_today": no_buy.get("degraded_buys_today", 0),
+        "degraded_max_buys_today": no_buy.get("degraded_max_buys_today"),
+        "degraded_gross_exposure_pct": no_buy.get("degraded_gross_exposure_pct"),
+        "degraded_max_gross_exposure_pct": no_buy.get("degraded_max_gross_exposure_pct"),
         "signal_counts": no_buy.get("signal_counts", {}),
         "display_signal_counts": no_buy.get("display_signal_counts", {}),
         "raw_buy_count": no_buy.get("raw_buy_count", 0),
@@ -2062,6 +2491,7 @@ def _render_bot_page(read_only):
         "vix_data_status": no_buy.get("vix_data_status"),
         "volatility_data_ok": no_buy.get("volatility_data_ok"),
         "volatility_source": no_buy.get("volatility_source"),
+        "volatility_value": no_buy.get("volatility_value"),
         "volatility_data_error": no_buy.get("volatility_data_error"),
         "spy_rows": no_buy.get("spy_rows"),
         "spy_last_date": no_buy.get("spy_last_date"),

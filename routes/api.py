@@ -77,6 +77,19 @@ def api_bot_equity():
 def api_bot_status():
     b = load_bot()
     diag = b.get("last_no_buy_diagnostics") or {}
+    api_breakers = diag.get("api_circuit_breakers", {}) or {}
+    rate_limit_recent = bool(
+        diag.get("rate_limit_recent")
+        or any((snap or {}).get("rate_limit_recent") for snap in api_breakers.values() if isinstance(snap, dict))
+    )
+    provider_health_status = diag.get("provider_health_status")
+    if not provider_health_status:
+        if rate_limit_recent or any((snap or {}).get("rate_limited") for snap in api_breakers.values() if isinstance(snap, dict)):
+            provider_health_status = "rate_limited"
+        elif any((snap or {}).get("status") == "degraded" for snap in api_breakers.values() if isinstance(snap, dict)):
+            provider_health_status = "degraded"
+        else:
+            provider_health_status = "healthy"
     return jsonify({
         "last_no_buy_diagnostics": {
             "main_blocker": diag.get("main_blocker"),
@@ -85,7 +98,20 @@ def api_bot_status():
             "buy_window_open": diag.get("buy_window_open"),
             "regime_allow_buys": diag.get("regime_allow_buys"),
             "regime_kind": diag.get("regime_kind"),
+            "regime_source": diag.get("regime_source"),
             "regime_v3": diag.get("regime_v3"),
+            "trading_mode": diag.get("trading_mode"),
+            "normal_mode_active": diag.get("normal_mode_active"),
+            "proxy_mode_active": diag.get("proxy_mode_active"),
+            "degraded_mode_active": diag.get("degraded_mode_active"),
+            "degraded_mode_reason": diag.get("degraded_mode_reason"),
+            "degraded_size_mult": diag.get("degraded_size_mult"),
+            "degraded_min_confidence": diag.get("degraded_min_confidence"),
+            "degraded_reject_counts": diag.get("degraded_reject_counts", {}),
+            "degraded_buys_today": diag.get("degraded_buys_today", 0),
+            "degraded_max_buys_today": diag.get("degraded_max_buys_today"),
+            "degraded_gross_exposure_pct": diag.get("degraded_gross_exposure_pct"),
+            "degraded_max_gross_exposure_pct": diag.get("degraded_max_gross_exposure_pct"),
             "signal_counts": diag.get("signal_counts", {}),
             "display_signal_counts": diag.get("display_signal_counts", {}),
             "raw_buy_count": diag.get("raw_buy_count", 0),
@@ -94,7 +120,9 @@ def api_bot_status():
             "stale_tickers": diag.get("stale_tickers", []),
             "stale_positions": diag.get("stale_positions", []),
             "risk_unmanaged_positions": diag.get("risk_unmanaged_positions", []),
-            "api_circuit_breakers": diag.get("api_circuit_breakers", {}),
+            "api_circuit_breakers": api_breakers,
+            "provider_health_status": provider_health_status,
+            "rate_limit_recent": rate_limit_recent,
             "candidate_pool_count": diag.get("candidate_pool_count", 0),
             "ranked_count": diag.get("ranked_count", 0),
             "tradable_count": diag.get("tradable_count", 0),
@@ -115,6 +143,7 @@ def api_bot_status():
             "spy_data_error": diag.get("spy_data_error"),
             "regime_data_status": diag.get("regime_data_status"),
             "regime_data_fallback": diag.get("regime_data_fallback"),
+            "regime_fallback_active": diag.get("regime_fallback_active", diag.get("regime_data_fallback")),
             "regime_data_source": diag.get("regime_data_source"),
             "regime_data_error": diag.get("regime_data_error"),
             "regime_data_size_mult": diag.get("regime_data_size_mult"),
@@ -125,8 +154,11 @@ def api_bot_status():
             "vix_data_status": diag.get("vix_data_status"),
             "volatility_data_ok": diag.get("volatility_data_ok"),
             "volatility_source": diag.get("volatility_source"),
+            "volatility_value": diag.get("volatility_value"),
             "volatility_data_error": diag.get("volatility_data_error"),
+            "volatility_error": diag.get("volatility_error", diag.get("volatility_data_error")),
             "spy_rows": diag.get("spy_rows"),
+            "spy_bar_count": diag.get("spy_bar_count", diag.get("spy_rows")),
             "spy_last_date": diag.get("spy_last_date"),
             "spy_mom_label": diag.get("spy_mom_label"),
             "cash": diag.get("cash"),
