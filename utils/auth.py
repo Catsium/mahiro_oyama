@@ -54,3 +54,26 @@ def require_admin_token():
         return True
     abort(403)
     return False
+
+
+def require_machine_token():
+    """Require ADMIN_TOKEN without session mutation or token-stripping redirects.
+
+    This is for machine endpoints such as /bot/tick where a GET request may be
+    triggered by an uptime monitor and must not become a browser session flow.
+    """
+    if not ADMIN_TOKEN:
+        if PYTHONANYWHERE_MODE:
+            abort(403)
+        return True
+    token = (
+        request.headers.get("X-Admin-Token")
+        or request.args.get("admin_token")
+        or request.args.get("token")
+        or request.form.get("admin_token")
+        or request.form.get("token")
+    )
+    if token == ADMIN_TOKEN:
+        return True
+    abort(403)
+    return False
