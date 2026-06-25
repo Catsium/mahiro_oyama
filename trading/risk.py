@@ -117,6 +117,10 @@ def get_vix():
         "mult": 1.0,
         "data_ok": False,
         "data_status": "missing_spy_history",
+        "source": None,
+        "volatility_source": None,
+        "vix_display": "unknown",
+        "data_error": None,
     }
     try:
         df = _daily_bars("SPY")
@@ -128,6 +132,9 @@ def get_vix():
                 r["vix"] = round(rv, 2)
                 r["data_ok"] = True
                 r["data_status"] = "ok"
+                r["source"] = "spy_realized_vol_proxy"
+                r["volatility_source"] = "spy_realized_vol_proxy"
+                r["vix_display"] = "proxy"
                 if   rv > 28: r["regime"] = "PANIC";     r["mult"] = 0.0
                 elif rv > 18: r["regime"] = "HIGH_RISK"; r["mult"] = 0.5
                 else:         r["regime"] = "NORMAL";    r["mult"] = 1.0
@@ -221,6 +228,8 @@ def _spy_macro_fallback(status, df=None, source=None, error=None):
         "regime_data_status": status,
         "regime_data_fallback": True,
         "regime_data_source": source,
+        "spy_data_source": source,
+        "spy_data_error": str(error)[:160] if error else None,
     }
     if error:
         out["regime_data_error"] = str(error)[:160]
@@ -272,6 +281,8 @@ def _spy_macro_from_df(df, source, append_live=True):
             "regime_data_status": "ok",
             "regime_data_fallback": False,
             "regime_data_source": source,
+            "spy_data_source": source,
+            "spy_data_error": None,
         }
     except Exception as e:
         return _spy_macro_fallback("spy_history_error", df=df, source=source, error=e)
@@ -465,8 +476,8 @@ def get_earnings_soon(tk):
         cal = data.get("earningsCalendar") or []
         if cal:
             r = {"soon": True, "date": cal[0].get("date")}
-    except Exception:
-        record_api_failure(endpoint)
+    except Exception as e:
+        record_api_failure(endpoint, e)
         pass
     cache_set(f"earn_{tk}", r)
     return r
@@ -503,8 +514,8 @@ def get_analyst_rec(tk):
                     pass
             r = {"net": round(net, 3), "buy": buy, "hold": hold, "sell": sell,
                  "total": total, "age_hours": age_hours}
-    except Exception:
-        record_api_failure(endpoint)
+    except Exception as e:
+        record_api_failure(endpoint, e)
         pass
     cache_set(f"ar_{tk}", r)
     return r
@@ -543,8 +554,8 @@ def get_insider_sentiment(tk):
             if msprs:
                 avg = sum(msprs) / len(msprs) / 100.0
                 r = {"sentiment": round(avg, 3), "samples": len(msprs), "age_hours": age_hours}
-    except Exception:
-        record_api_failure(endpoint)
+    except Exception as e:
+        record_api_failure(endpoint, e)
         pass
     cache_set(f"is_{tk}", r)
     return r

@@ -48,7 +48,8 @@ FLASK_SECRET_KEY = os.environ.get("FLASK_SECRET_KEY", "").strip()
 ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "").strip()
 
 BOT_TRIGGER_MIN_INTERVAL = env_int("BOT_TRIGGER_MIN_INTERVAL", 60, 30, 900)
-FINNHUB_CALLS_PER_MINUTE = env_int("FINNHUB_CALLS_PER_MINUTE", 55, 1, 60)
+FINNHUB_CALLS_PER_MINUTE = env_int("FINNHUB_CALLS_PER_MINUTE", 50, 1, 50)
+FINNHUB_CALLS_PER_SECOND = env_int("FINNHUB_CALLS_PER_SECOND", 25, 1, 25)
 
 # PA free-tier staging. Holdings are always included; this caps extra tickers.
 PA_TICKERS_PER_BOT_RUN = env_int("PA_TICKERS_PER_BOT_RUN", 8, 1, 25)

@@ -11,6 +11,8 @@ import time
 import threading
 import gc
 import uuid
+import json
+import os
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
@@ -25,7 +27,7 @@ from trading.risk import (
     get_sector, get_corr_group, get_market_regime, get_vix,
     get_earnings_soon, get_analyst_rec, get_insider_sentiment,
 )
-from trading.signals import get_recommendation
+from trading.signals import classify_display_signal, get_recommendation
 from trading.attribution import (
     ensure_attribution_state, exit_profile, record_entry_event,
     record_exit_event, update_exit_post_outcomes, update_forward_outcomes,
@@ -64,19 +66,16 @@ from utils.deploy_config import (
 from utils.config import BOT_ENABLED
 from utils.storage import (
     acquire_bot_file_lock, load_bot, save_bot, load_tickers, SUGGESTION_DB_FILE,
-    storage_debug_info,
+    DATA_DIR, storage_debug_info,
 )
 from utils.threading_utils import _bot_run_lock, _BOT_STATUS, BOT_INTERVAL
 from utils.time_utils import is_market_open, _fmt_times, in_new_buy_window
 
 # ── Bot config ──────────────────────────────────────────────────────────────
 STARTING_CASH      = 10_000.0
-BOT_MAX_BUYS       = 5    # Round-6: back to top-5/cycle (R4/R5 over-buying churned).
-BOT_SCAN_BUY       = 5    # outside-watchlist picks per cycle
-MAX_POSITIONS      = 10   # Round-8: 5 → 10 names total (watchlist+outside). More
-                          # diversification; per-cycle pacing (BOT_MAX_BUYS/BOT_SCAN_BUY=5)
-                          # still fills gradually so it doesn't churn like R4/R5.
-                          # New positions blocked at cap; adds to existing exempt.
+BOT_MAX_BUYS       = 1
+BOT_SCAN_BUY       = 0
+MAX_POSITIONS      = 8
 SCAN_BUY_MIN_CONF  = 60   # execution threshold for outside-watchlist buy
 SUGGESTION_MIN_SCAN_CONF = 68
 SCAN_FRESHNESS_SEC = 120  # outside-watchlist buys require scan data <2 min old
@@ -102,7 +101,7 @@ KNIFE_CATALYST_TYPES = {
 # tenths of a percent of price movement is eaten entirely by commission. Pyramid adds
 # were already gated at $400 (Round-6) — new + outside positions now match.
 MIN_POSITION_USD   = 400
-
+BOT_TICK_MAX_RUNTIME_SEC = 25
 USE_CONFIDENCE_WEIGHTING = True
 
 # Scheduler cooperation
@@ -114,6 +113,39 @@ def _bump(counts, reason):
     counts[key] = counts.get(key, 0) + 1
 
 
+def _append_jsonl(filename, event):
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        path = os.path.join(DATA_DIR, filename)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(event, sort_keys=True, default=str) + "\n")
+    except Exception:
+        pass
+
+
+def _log_bot_event(event_type, **payload):
+    event = {"ts": int(time.time()), "event": str(event_type or "BOT_EVENT")}
+    event.update(payload)
+    _append_jsonl("bot_events.jsonl", event)
+
+
+def _log_tick(diag):
+    if isinstance(diag, dict):
+        _append_jsonl("tick_log.jsonl", diag)
+
+
+def _annotate_signal(rec):
+    if not isinstance(rec, dict):
+        return rec
+    raw = rec.get("signal") or rec.get("cls") or "hold"
+    rec["raw_signal_label"] = raw
+    rec["display_signal_label"] = classify_display_signal(
+        rec.get("cls") or raw,
+        rec.get("confidence", 0),
+    )
+    return rec
+
+
 def _new_no_buy_diag(now, b, force=False, user_forced=False):
     diag = {
         "ts": int(now),
@@ -121,12 +153,17 @@ def _new_no_buy_diag(now, b, force=False, user_forced=False):
         "force": bool(force),
         "user_forced": bool(user_forced),
         "tod_ok": None,
+        "buy_window_open": None,
         "regime_allow_buys": None,
         "regime_kind": None,
         "regime_v3": None,
         "spy_data_ok": None,
         "regime_data_status": None,
         "regime_data_fallback": None,
+        "regime_data_source": None,
+        "regime_data_error": None,
+        "spy_data_source": None,
+        "spy_data_error": None,
         "regime_data_size_mult": None,
         "spy_rows": None,
         "spy_last_date": None,
@@ -135,17 +172,35 @@ def _new_no_buy_diag(now, b, force=False, user_forced=False):
         "vix_value": None,
         "vix_data_ok": None,
         "vix_data_status": None,
+        "vix_display": None,
+        "volatility_data_ok": None,
+        "volatility_source": None,
+        "volatility_data_error": None,
+        "data_health_ok": None,
+        "data_health_blocks": [],
         "cash": round(float(b.get("cash", 0)), 2),
         "cash_floor": None,
         "cash_available_after_floor": None,
+        "gross_exposure_pct": None,
+        "paper_trading_locked": bool(b.get("stopped")),
+        "paper_lock_reason": "user_stopped" if b.get("stopped") else None,
+        "buys_today": 0,
+        "max_buys_today": None,
         "pa_mode": bool(PYTHONANYWHERE_MODE),
         "pa_stage_status": b.get("pa_stage_status"),
         "checked_tickers": [],
         "stale_ticker_count": 0,
         "stale_tickers": [],
+        "stale_positions": [],
+        "risk_unmanaged_positions": [],
         "api_circuit_breakers": {},
         "signal_counts": {},
+        "display_signal_counts": {},
+        "raw_buy_count": 0,
+        "display_buy_candidate_count": 0,
         "buyable_reject_counts": {},
+        "top_buyable_rejects": [],
+        "top_ranked_rejections": [],
         "candidate_pool_count": 0,
         "ranked_count": 0,
         "tradable_count": 0,
@@ -157,6 +212,7 @@ def _new_no_buy_diag(now, b, force=False, user_forced=False):
         "scan_fresh_rows_count": None,
         "scan_payload_misses": 0,
         "main_blocker": None,
+        "tick_runtime_seconds": None,
     }
     return diag
 
@@ -168,12 +224,18 @@ def _set_main_blocker(diag):
         blocker = "market_closed"
     elif diag.get("tod_ok") is False:
         blocker = "outside_new_buy_window"
+    elif diag.get("data_health_blocks"):
+        blocker = "data_health_block"
     elif diag.get("regime_allow_buys") is False:
         blocker = "regime_or_vix_blocks_buys"
     elif (diag.get("cash_available_after_floor") is not None
           and diag.get("cash_available_after_floor", 0) < MIN_POSITION_USD):
         blocker = "cash_below_min_position"
     elif diag.get("candidate_pool_count", 0) <= 0:
+        if int(diag.get("raw_buy_count", 0) or 0) > 0:
+            blocker = "raw_buys_rejected_pre_candidate"
+            diag["main_blocker"] = blocker
+            return blocker
         counts = diag.get("buyable_reject_counts") or diag.get("signal_counts") or {}
         blocker = max(counts, key=counts.get) if counts else "no_buy_candidates"
     elif diag.get("tradable_count", 0) <= 0:
@@ -196,9 +258,9 @@ def buyable_reason(t, s, recent_sells=None, regime_kind="neutral", holdings=None
     recent_sells = recent_sells or {}
     holdings = holdings or {}
     if s.get("price", 0) <= 0:
-        return False, "price<=0"
+        return False, "INVALID_PRICE"
     if s.get("stale"):
-        return False, "stale_quote"
+        return False, "STALE_CANDIDATE_QUOTE"
     if t in recent_sells:
         rec_l = s.get("rec") or {}
         recent_reason = (recent_sells.get(t) or {}).get("reason", "")
@@ -208,32 +270,31 @@ def buyable_reason(t, s, recent_sells=None, regime_kind="neutral", holdings=None
             and rec_l.get("confidence", 0) >= 80
         )
         if not allow_bypass:
-            return False, f"recent_sell_cooldown:{recent_reason or 'unknown'}"
+            return False, f"RECENT_SELL_COOLDOWN:{recent_reason or 'unknown'}"
     sec = get_sector(t)
     if sec is None:
-        return False, "missing_sector"
+        return False, "MISSING_SECTOR"
     ctx_local = s.get("ctx") or {}
     if regime_kind == "bear":
         if not (ctx_local.get("rsi", 100) < 35 or ctx_local.get("is_dip")):
-            return False, "bear_gate_requires_dip_or_rsi<35"
+            return False, "BEAR_GATE_REQUIRES_DIP_OR_RSI_LT_35"
     if (regime_kind == "neutral" and ctx_local.get("adx", 100) < 20
             and not ctx_local.get("is_dip")):
         if t not in holdings:
-            return False, "neutral_gate_adx<20_non_dip"
+            return False, "NEUTRAL_ADX_BELOW_20_NON_DIP"
     catalyst = (s.get("rec") or {}).get("catalyst") or {}
     catalyst_type = catalyst.get("type")
     week_chg = ctx_local.get("week_chg_pct", 0) or 0
     dist_high = ctx_local.get("dist_from_high_pct", 0) or 0
     if catalyst_type in KNIFE_CATALYST_TYPES and week_chg <= -3.0:
-        return False, f"negative_catalyst_falling:{catalyst_type}"
+        return False, f"NEGATIVE_CATALYST_FALLING:{catalyst_type}"
     if week_chg <= -5.0 and dist_high <= -10.0:
-        return False, "falling_knife_week<-5_dist_high<-10"
+        return False, "FALLING_KNIFE_WEEK_LT_-5_DIST_HIGH_LT_-10"
     vol_regime = classify_vol_regime(ctx_local)
     if vol_regime == "explosive" and ctx_local.get("rsi", 50) < 35:
-        return False, "explosive_oversold_block"
-    if not ctx_local.get("is_dip"):
-        if float(ctx_local.get("vol_ratio", 1.0) or 1.0) < 1.2:
-            return False, "non_dip_no_volume_confirmation"
+        return False, "EXPLOSIVE_OVERSOLD_BLOCK"
+    if not ctx_local.get("is_dip") and float(ctx_local.get("vol_ratio", 1.0) or 1.0) < 0.70:
+        return False, "VERY_LOW_VOLUME_CONFIRMATION"
     return True, "buyable"
 
 
@@ -347,12 +408,18 @@ def _record_trade(b, action, t, sh, pr, rec, arts, why, pnl_usd=None):
 def _record_hold(b, reason, sigs):
     """HOLD entry — emitted only when truly idle (no trades, no skips)."""
     et, sgt = _fmt_times()
+
+    def _display_rec(rec):
+        rec = rec or {}
+        return rec.get("display_signal_label", rec.get("signal"))
+
     sig_summary = ", ".join(
-        f"{t}:{s['rec']['signal']}({s['rec']['confidence']}%)"
+        f"{t}:{_display_rec(s.get('rec'))}({(s.get('rec') or {}).get('confidence')}%)"
         for t, s in sorted(sigs.items())
     )
-    best = max(sigs.items(), key=lambda x: x[1]["rec"]["confidence"]) if sigs else None
-    best_str = (f"Top signal: {best[0]} {best[1]['rec']['signal']} @ {best[1]['rec']['confidence']}%"
+    best = max(sigs.items(), key=lambda x: (x[1].get("rec") or {}).get("confidence", 0)) if sigs else None
+    best_rec = (best[1].get("rec") or {}) if best else {}
+    best_str = (f"Top signal: {best[0]} {_display_rec(best_rec)} @ {best_rec.get('confidence')}%"
                 if best else "")
     b["history"].insert(0, {
         "action": "HOLD",
@@ -541,6 +608,11 @@ def _memory_guard(b):
 
 
 def _persist_no_buy_diag(b, diag, blocker=None, traded=False):
+    if diag.get("tick_runtime_seconds") is None:
+        try:
+            diag["tick_runtime_seconds"] = round(time.time() - float(diag.get("ts") or time.time()), 3)
+        except Exception:
+            diag["tick_runtime_seconds"] = None
     if blocker:
         diag["main_blocker"] = blocker
     elif traded:
@@ -548,7 +620,13 @@ def _persist_no_buy_diag(b, diag, blocker=None, traded=False):
     else:
         _set_main_blocker(diag)
     diag["traded"] = bool(traded)
+    _BOT_STATUS.update({
+        "last_tick_status": diag.get("main_blocker"),
+        "last_tick_time": diag.get("ts"),
+        "tick_runtime_seconds": diag.get("tick_runtime_seconds"),
+    })
     b["last_no_buy_diagnostics"] = diag
+    _log_tick(diag)
     try:
         b["last_cache_prune"] = prune_cache_dir(max_files=300, max_age_sec=7 * 86400)
     except Exception:
@@ -758,6 +836,10 @@ def _run_bot_locked(force=False, user_forced=False):
     no_buy_diag["spy_data_ok"] = regime.get("spy_data_ok")
     no_buy_diag["regime_data_status"] = regime.get("regime_data_status")
     no_buy_diag["regime_data_fallback"] = regime.get("regime_data_fallback")
+    no_buy_diag["regime_data_source"] = regime.get("regime_data_source")
+    no_buy_diag["regime_data_error"] = regime.get("regime_data_error")
+    no_buy_diag["spy_data_source"] = regime.get("spy_data_source") or regime.get("regime_data_source")
+    no_buy_diag["spy_data_error"] = regime.get("spy_data_error") or regime.get("regime_data_error")
     no_buy_diag["spy_rows"] = regime.get("spy_rows")
     no_buy_diag["spy_last_date"] = regime.get("spy_last_date")
     no_buy_diag["spy_mom_label"] = regime.get("spy_mom_label")
@@ -782,6 +864,7 @@ def _run_bot_locked(force=False, user_forced=False):
                                          config=cfg)
             rec = dict(rec)
             rec["catalyst"] = catalyst
+            _annotate_signal(rec)
             # Round-4 Bug Fix #1: capture stale flag so SELL/BUY halt on API failure.
             q = get_quote(t) or {}
             return t, {"rec": rec, "price": q.get("price", 0), "stale": bool(q.get("stale")),
@@ -790,8 +873,9 @@ def _run_bot_locked(force=False, user_forced=False):
         except Exception as e:
             try: print(f"[_fetch_one] {t}: {type(e).__name__}: {e}")
             except Exception: pass
-            return t, {"rec": get_recommendation(0.0, {}, regime=regime,
-                                                  config=cfg),
+            fallback_rec = dict(get_recommendation(0.0, {}, regime=regime, config=cfg))
+            _annotate_signal(fallback_rec)
+            return t, {"rec": fallback_rec,
                        "price": 0, "stale": True, "arts": [], "ctx": {},
                        "intra": {}, "earn": {}, "analyst": {}, "insider": {}}
 
@@ -801,12 +885,24 @@ def _run_bot_locked(force=False, user_forced=False):
             sigs[t] = payload
     gc.collect()
     for payload in sigs.values():
-        cls = ((payload.get("rec") or {}).get("cls") or "unknown")
+        rec = _annotate_signal(payload.get("rec") or {})
+        payload["rec"] = rec
+        cls = (rec.get("cls") or "unknown")
         _bump(no_buy_diag["signal_counts"], cls)
+        _bump(no_buy_diag["display_signal_counts"], rec.get("display_signal_label"))
+        if cls in ("buy", "strong-buy"):
+            no_buy_diag["raw_buy_count"] += 1
+        if rec.get("display_signal_label") in ("BUY_CANDIDATE", "STRONG_BUY_CANDIDATE"):
+            no_buy_diag["display_buy_candidate_count"] += 1
     stale_tickers = [tk for tk, payload in sigs.items() if payload.get("stale")]
     no_buy_diag["stale_ticker_count"] = len(stale_tickers)
     no_buy_diag["stale_tickers"] = stale_tickers[:10]
     no_buy_diag["api_circuit_breakers"] = api_failure_snapshot()
+    for endpoint, snap in (no_buy_diag.get("api_circuit_breakers") or {}).items():
+        if snap.get("rate_limited"):
+            _log_bot_event("RATE_LIMIT_HIT", endpoint=endpoint, provider_status=snap)
+        elif snap.get("status") == "degraded":
+            _log_bot_event("PROVIDER_DEGRADED", endpoint=endpoint, provider_status=snap)
 
     obs_updates = _update_candidate_observations(b, sigs, now)
     if obs_updates:
@@ -819,12 +915,23 @@ def _run_bot_locked(force=False, user_forced=False):
     vix_data = get_vix()
     vix_label = vix_data["regime"]
     vix_mult  = vix_data["mult"]
-    regime_data_size_mult = 0.60 if regime.get("spy_data_ok") is False else 1.0
+    data_health_blocks = []
+    if regime.get("spy_data_ok") is False:
+        data_health_blocks.append("SPY_DATA_MISSING")
+    if vix_data.get("data_ok") is False:
+        data_health_blocks.append("VOLATILITY_DATA_MISSING")
+    regime_data_size_mult = 1.0
     sizing_vix_mult = vix_mult * regime_data_size_mult
     no_buy_diag["vix_label"] = vix_label
     no_buy_diag["vix_value"] = vix_data.get("vix")
     no_buy_diag["vix_data_ok"] = vix_data.get("data_ok")
     no_buy_diag["vix_data_status"] = vix_data.get("data_status")
+    no_buy_diag["vix_display"] = vix_data.get("vix_display") or ("proxy" if vix_data.get("data_ok") else "unknown")
+    no_buy_diag["volatility_data_ok"] = vix_data.get("data_ok")
+    no_buy_diag["volatility_source"] = vix_data.get("volatility_source") or vix_data.get("source")
+    no_buy_diag["volatility_data_error"] = vix_data.get("data_error")
+    no_buy_diag["data_health_blocks"] = data_health_blocks
+    no_buy_diag["data_health_ok"] = not bool(data_health_blocks)
     no_buy_diag["regime_data_size_mult"] = regime_data_size_mult
 
     # Regime-conditional risk params
@@ -845,22 +952,28 @@ def _run_bot_locked(force=False, user_forced=False):
         intra_tilt = regime.get("intra_tilt") or "tilt"
         regime_label = f"{macro_regime_kind.upper()}→{regime_label} (intra {intra_tilt})"
 
-    regime_allow_buys = vix_mult > 0
+    regime_allow_buys = (vix_mult > 0) and not data_health_blocks
     regime_v3_label = regime.get("regime_v3_effective") or regime.get("regime_v3")
     if regime_v3_label == "panic" and not b.get("paper_debug_override", False):
         regime_allow_buys = False
     no_buy_diag["regime_allow_buys"] = bool(regime_allow_buys)
     no_buy_diag["regime_kind"] = regime_kind
     no_buy_diag["regime_v3"] = regime_v3_label
-    if regime_data_size_mult < 1.0:
-        regime_label = f"{regime_label} (SPY fallback, size x{regime_data_size_mult:.2f})"
+    if data_health_blocks:
+        regime_label = f"{regime_label} (data health block: {','.join(data_health_blocks)})"
+        _log_bot_event("DATA_HEALTH_BLOCK", blocks=data_health_blocks,
+                       regime_data_status=regime.get("regime_data_status"),
+                       vix_data_status=vix_data.get("data_status"))
 
-    MAX_POS_PCT        = 0.35
-    MAX_SECTOR_PCT     = 0.55
-    MAX_CORR_GROUP_PCT = 0.45
+    risk_cfg = cfg.get("risk", {}) if isinstance(cfg, dict) else {}
+    max_positions = int(risk_cfg.get("max_positions", MAX_POSITIONS))
+    MAX_POS_PCT        = float(risk_cfg.get("max_position_pct", 0.08))
+    MAX_SECTOR_PCT     = float(risk_cfg.get("max_sector_pct", 0.25))
+    MAX_CORR_GROUP_PCT = float(risk_cfg.get("max_corr_group_pct", 0.25))
     DRAWDOWN_PAUSE     = 12.0
-    MIN_CASH_RESERVE   = 0.02
+    MIN_CASH_RESERVE   = float(risk_cfg.get("min_cash_reserve_pct", 0.30))
     MIN_HOLDING_SEC    = 20 * 60
+    MAX_GROSS_EXPOSURE_PCT = float(risk_cfg.get("max_gross_exposure_pct", 0.70))
 
     outcomes = b.get("trade_outcomes", [])
     # Round-7 risk (bug 8 cleanup): the old `win_rate` var here was computed and
@@ -1162,6 +1275,43 @@ def _run_bot_locked(force=False, user_forced=False):
     cash_floor = starting_cash * MIN_CASH_RESERVE
     no_buy_diag["cash_floor"] = round(float(cash_floor), 2)
     no_buy_diag["cash_available_after_floor"] = round(float(b.get("cash", 0) - cash_floor), 2)
+    exposure_value = 0.0
+    stale_positions = []
+    risk_unmanaged_positions = []
+    for tt, h in b.get("holdings", {}).items():
+        sig_t = sigs.get(tt) or {}
+        pr = float(sig_t.get("price") or 0)
+        if pr <= 0 or sig_t.get("stale"):
+            stale_positions.append(tt)
+            risk_unmanaged_positions.append(tt)
+            pr = float(h.get("avg_cost", 0) or 0)
+        exposure_value += float(h.get("shares", 0) or 0) * pr
+    no_buy_diag["gross_exposure_pct"] = round(exposure_value / starting_cash, 4) if starting_cash else 0.0
+    no_buy_diag["stale_positions"] = stale_positions[:10]
+    no_buy_diag["risk_unmanaged_positions"] = risk_unmanaged_positions[:10]
+    if risk_unmanaged_positions:
+        no_buy_diag["data_health_blocks"] = list(dict.fromkeys(
+            list(no_buy_diag.get("data_health_blocks") or []) + ["STALE_HELD_QUOTE"]
+        ))
+        no_buy_diag["data_health_ok"] = False
+        regime_allow_buys = False
+        no_buy_diag["regime_allow_buys"] = False
+        _log_bot_event("STALE_HELD_QUOTE", tickers=risk_unmanaged_positions[:10])
+    max_buys_today = int(risk_cfg.get("max_new_buys_per_day", 2))
+    try:
+        from zoneinfo import ZoneInfo
+        et_zone = ZoneInfo("America/New_York")
+        today_key = datetime.now(et_zone).strftime("%Y-%m-%d")
+        buys_today = sum(
+            1 for e in b.get("history", [])
+            if e.get("action") == "BUY"
+            and e.get("ts")
+            and datetime.fromtimestamp(float(e.get("ts")), et_zone).strftime("%Y-%m-%d") == today_key
+        )
+    except Exception:
+        buys_today = 0
+    no_buy_diag["buys_today"] = int(buys_today)
+    no_buy_diag["max_buys_today"] = max_buys_today
 
     # Round-8 Bug #3: if ANY held position is priced off a stale quote, this
     # equity figure is partly valued at avg_cost (not a live price). Don't let such
@@ -1201,11 +1351,21 @@ def _run_bot_locked(force=False, user_forced=False):
         ok, reason = buyable_reason_local(t, s)
         if not ok:
             _bump(no_buy_diag["buyable_reject_counts"], reason)
+            if len(no_buy_diag["top_buyable_rejects"]) < 10:
+                rec = s.get("rec") or {}
+                no_buy_diag["top_buyable_rejects"].append({
+                    "ticker": t,
+                    "raw_signal_label": rec.get("raw_signal_label") or rec.get("signal"),
+                    "display_signal_label": rec.get("display_signal_label"),
+                    "confidence": rec.get("confidence"),
+                    "rejection_reason": reason,
+                })
         return ok
 
     # #3 TOD gate: no NEW buys outside 09:45-15:30 ET unless a human forces it.
     tod_ok = user_forced or in_new_buy_window()
     no_buy_diag["tod_ok"] = bool(tod_ok)
+    no_buy_diag["buy_window_open"] = bool(in_new_buy_window())
 
     b.pop("rotation_streak", None)
     rotation_actions = []
@@ -1251,9 +1411,16 @@ def _run_bot_locked(force=False, user_forced=False):
         }
 
     # Kelly remains, but V1 applies it inside risk_pct instead of final spend.
-    if len(outcomes) < 20:
+    kelly_cfg = cfg.get("kelly", {}) if isinstance(cfg, dict) else {}
+    kelly_enabled = bool(kelly_cfg.get("enabled", False))
+    kelly_min_samples = int(kelly_cfg.get("min_samples", 100))
+    if not kelly_enabled:
         kelly_mult = 1.0
-        kelly_diag = "warm-up <20 trades, kelly=1.0"
+        kelly_diag = "kelly disabled by config"
+        kelly_raw = 0.0
+    elif len(outcomes) < kelly_min_samples:
+        kelly_mult = 1.0
+        kelly_diag = f"warm-up <{kelly_min_samples} trades, kelly=1.0"
         kelly_raw = 0.0
     else:
         from trading.signals import _regime_key
@@ -1298,7 +1465,14 @@ def _run_bot_locked(force=False, user_forced=False):
     no_buy_diag["scan_rows_count"] = len(scan_rows_all)
     no_buy_diag["scan_fresh_rows_count"] = len(fresh_scan_rows)
 
-    if not buys_paused and regime_allow_buys and tod_ok:
+    daily_buy_room = buys_today < max_buys_today
+    exposure_room = (no_buy_diag.get("gross_exposure_pct") or 0) < MAX_GROSS_EXPOSURE_PCT
+    if not daily_buy_room:
+        _bump(no_buy_diag["skip_reason_counts"], "daily buy cap reached")
+    if not exposure_room:
+        _bump(no_buy_diag["skip_reason_counts"], "gross exposure cap reached")
+
+    if not buys_paused and regime_allow_buys and tod_ok and daily_buy_room and exposure_room:
         for t, s in sigs.items():
             if (t in tickers and s["rec"]["cls"] in ("buy", "strong-buy")
                     and buyable(t, s)):
@@ -1323,6 +1497,7 @@ def _run_bot_locked(force=False, user_forced=False):
                     no_buy_diag["scan_payload_misses"] += 1
                     continue
                 rec = dict(cached.get("rec") or {})
+                _annotate_signal(rec)
                 ctx_o = cached.get("ctx") or {}
                 arts = cached.get("arts") or []
                 q_o = cached.get("quote") or {}
@@ -1399,10 +1574,22 @@ def _run_bot_locked(force=False, user_forced=False):
     for c in ranked_candidates:
         if not c.get("tradable"):
             _bump(no_buy_diag["skip_reason_counts"], c.get("rank_reason"))
+            if len(no_buy_diag["top_ranked_rejections"]) < 10:
+                rec = c.get("rec") or {}
+                no_buy_diag["top_ranked_rejections"].append({
+                    "ticker": c.get("ticker"),
+                    "raw_signal_label": rec.get("raw_signal_label") or rec.get("signal"),
+                    "display_signal_label": rec.get("display_signal_label"),
+                    "confidence": rec.get("confidence"),
+                    "rank_reason": c.get("rank_reason"),
+                    "net_edge_pct": c.get("net_edge_pct"),
+                    "required_edge_pct": c.get("required_edge_pct"),
+                })
 
     scan_taken = 0
     total_taken = 0
-    max_cycle_buys = BOT_MAX_BUYS + BOT_SCAN_BUY
+    max_cycle_buys = int(risk_cfg.get("max_new_buys_per_tick", BOT_MAX_BUYS)) + BOT_SCAN_BUY
+    max_cycle_buys = max(0, min(max_cycle_buys, max_buys_today - buys_today))
     for cand in ranked_candidates:
         t = cand["ticker"]
         s = sigs.get(t) or {}
@@ -1440,8 +1627,8 @@ def _run_bot_locked(force=False, user_forced=False):
                 continue
             sizing_note = f"pyramid +{exist_pnl:.1f}% ({since_last_min:.0f}m since add)"
         else:
-            if len(b["holdings"]) >= MAX_POSITIONS:
-                reason = f"position cap reached ({MAX_POSITIONS})"
+            if len(b["holdings"]) >= max_positions:
+                reason = f"position cap reached ({max_positions})"
                 _bump(no_buy_diag["skip_reason_counts"], reason)
                 _record_candidate_observation(b, cand, "skipped", reason, now, regime_kind)
                 continue
@@ -1633,13 +1820,19 @@ def _run_bot_locked(force=False, user_forced=False):
     if not traded and not collapse_diag:
         reasons = []
         has_buys = any(s["rec"]["cls"] in ("buy", "strong-buy") for s in sigs.values())
-        if not regime_allow_buys:
+        if no_buy_diag.get("data_health_blocks"):
+            reasons.append("buys blocked by data health: " + ",".join(no_buy_diag.get("data_health_blocks") or []))
+        elif not regime_allow_buys:
             if regime_v3_label == "panic" and not b.get("paper_debug_override"):
                 reasons.append("buys halted (V3 panic hard no-buy)")
             else:
                 reasons.append(f"buys halted (VIX={vix_label} {_fmt_vix_value(vix_data)})")
         elif buys_paused:
             reasons.append(f"drawdown circuit-breaker active ({drawdown_pct:.1f}% from peak)")
+        elif not daily_buy_room:
+            reasons.append(f"daily buy cap reached ({buys_today}/{max_buys_today})")
+        elif not exposure_room:
+            reasons.append(f"gross exposure cap reached ({no_buy_diag.get('gross_exposure_pct'):.0%})")
         elif not has_buys:
             reasons.append("no BUY signals across watchlist")
         elif b["cash"] - cash_floor < MIN_POSITION_USD:
@@ -1822,17 +2015,29 @@ def _render_bot_page(read_only):
     no_buy = b.get("last_no_buy_diagnostics") or {}
     safe_no_buy = {
         "main_blocker": no_buy.get("main_blocker"),
+        "market_open": no_buy.get("market_open"),
         "tod_ok": no_buy.get("tod_ok"),
+        "buy_window_open": no_buy.get("buy_window_open"),
         "regime_allow_buys": no_buy.get("regime_allow_buys"),
+        "regime_kind": no_buy.get("regime_kind"),
+        "regime_v3": no_buy.get("regime_v3"),
         "signal_counts": no_buy.get("signal_counts", {}),
+        "display_signal_counts": no_buy.get("display_signal_counts", {}),
+        "raw_buy_count": no_buy.get("raw_buy_count", 0),
+        "display_buy_candidate_count": no_buy.get("display_buy_candidate_count", 0),
         "stale_ticker_count": no_buy.get("stale_ticker_count", 0),
         "stale_tickers": no_buy.get("stale_tickers", []),
+        "stale_positions": no_buy.get("stale_positions", []),
+        "risk_unmanaged_positions": no_buy.get("risk_unmanaged_positions", []),
         "api_circuit_breakers": no_buy.get("api_circuit_breakers", {}),
         "candidate_pool_count": no_buy.get("candidate_pool_count", 0),
+        "ranked_count": no_buy.get("ranked_count", 0),
         "tradable_count": no_buy.get("tradable_count", 0),
         "top_ranked": (no_buy.get("top_ranked") or [])[:5],
+        "top_ranked_rejections": (no_buy.get("top_ranked_rejections") or [])[:5],
         "skip_reason_counts": no_buy.get("skip_reason_counts", {}),
         "buyable_reject_counts": no_buy.get("buyable_reject_counts", {}),
+        "top_buyable_rejects": (no_buy.get("top_buyable_rejects") or [])[:5],
         "scan_payload_misses": no_buy.get("scan_payload_misses", 0),
         "scan_age_sec": no_buy.get("scan_age_sec"),
         "scan_rows_count": no_buy.get("scan_rows_count"),
@@ -1840,17 +2045,36 @@ def _render_bot_page(read_only):
         "last_bot_error": _BOT_STATUS.get("last_error"),
         "last_bot_error_ts": _BOT_STATUS.get("last_error_ts"),
         "pa_stage_status": no_buy.get("pa_stage_status"),
+        "data_health_ok": no_buy.get("data_health_ok"),
+        "data_health_blocks": no_buy.get("data_health_blocks", []),
         "spy_data_ok": no_buy.get("spy_data_ok"),
+        "spy_data_source": no_buy.get("spy_data_source"),
+        "spy_data_error": no_buy.get("spy_data_error"),
         "regime_data_status": no_buy.get("regime_data_status"),
         "regime_data_fallback": no_buy.get("regime_data_fallback"),
+        "regime_data_source": no_buy.get("regime_data_source"),
+        "regime_data_error": no_buy.get("regime_data_error"),
         "regime_data_size_mult": no_buy.get("regime_data_size_mult"),
         "vix_label": no_buy.get("vix_label"),
         "vix_value": no_buy.get("vix_value"),
+        "vix_display": no_buy.get("vix_display"),
         "vix_data_ok": no_buy.get("vix_data_ok"),
         "vix_data_status": no_buy.get("vix_data_status"),
+        "volatility_data_ok": no_buy.get("volatility_data_ok"),
+        "volatility_source": no_buy.get("volatility_source"),
+        "volatility_data_error": no_buy.get("volatility_data_error"),
         "spy_rows": no_buy.get("spy_rows"),
         "spy_last_date": no_buy.get("spy_last_date"),
         "spy_mom_label": no_buy.get("spy_mom_label"),
+        "cash": no_buy.get("cash"),
+        "cash_floor": no_buy.get("cash_floor"),
+        "cash_available_after_floor": no_buy.get("cash_available_after_floor"),
+        "gross_exposure_pct": no_buy.get("gross_exposure_pct"),
+        "buys_today": no_buy.get("buys_today"),
+        "max_buys_today": no_buy.get("max_buys_today"),
+        "paper_trading_locked": no_buy.get("paper_trading_locked"),
+        "paper_lock_reason": no_buy.get("paper_lock_reason"),
+        "tick_runtime_seconds": no_buy.get("tick_runtime_seconds"),
     }
     storage_debug = {}
     if not read_only:

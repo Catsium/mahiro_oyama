@@ -42,6 +42,9 @@ data/backups/
 data/design_backups/
 data/bot_state.json
 data/price_history.json
+data/provider_health.json
+data/bot_events.jsonl
+data/tick_log.jsonl
 data/*.lock
 
 # Keep if tickers.json is your normal watchlist config.
@@ -67,3 +70,4 @@ DECISIONS.md
 .planning/PROJECT.md
 .planning/config.json
 tests/test_stabilization.py
+.codex/environments/environment.toml

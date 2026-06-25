@@ -88,7 +88,7 @@ from trading.regime_v3 import (  # noqa: E402
     classify_regime,
     regime_risk_mult,
 )
-from trading.signals import _attribute_outcome, get_recommendation  # noqa: E402
+from trading.signals import _attribute_outcome, classify_display_signal, get_recommendation  # noqa: E402
 from trading.exit_ladders import (  # noqa: E402
     apply_regime_exit_tightening,
     compose_exit_profile,
@@ -230,7 +230,14 @@ class TradingV1SizingTests(unittest.TestCase):
                                      min_position_usd=100)
         self.assertLess(lo_eval["risk"]["target_notional"],
                         hi_eval["risk"]["target_notional"])
-        self.assertIn("non-dip volume <1.2", lo_eval["risk"]["size_penalties"])
+        self.assertIn("LOW_VOLUME_PENALTY_ONLY", lo_eval["risk"]["size_penalties"])
+        self.assertEqual(lo_eval["warnings"], ["LOW_VOLUME_PENALTY_ONLY"])
+
+    def test_weak_raw_buys_do_not_display_as_buy(self):
+        self.assertEqual(classify_display_signal("buy", 28), "BULLISH_LEAN")
+        self.assertEqual(classify_display_signal("buy", 34), "BULLISH_LEAN")
+        self.assertEqual(classify_display_signal("buy", 54), "WATCH_OR_LEAN")
+        self.assertEqual(classify_display_signal("buy", 55), "BUY_CANDIDATE")
 
     def test_confidence_prior_watchlist_warmup_requires_min_confidence(self):
         cand = self._candidate("WARM", 35, "trend", atr_pct=2.0, score=4.0)
@@ -259,13 +266,15 @@ class TradingV1SizingTests(unittest.TestCase):
                 "neutral:trend": {"n": 50, "too_late_rate_pct": 46}
             }
         }
+        late = self._candidate("LATE", 80, "trend")
+        late["ctx"]["vol_ratio"] = 1.5
         cand = evaluate_candidate(
-            self._candidate("LATE", 80, "trend"),
+            late,
             10_000, -6, "neutral", 1, 1, 1, edge_stats,
             min_position_usd=100,
         )
         self.assertIn("exit quality too-late penalty", cand["risk"]["size_penalties"])
-        self.assertEqual(cand["risk"]["size_mult"], 0.6)
+        self.assertEqual(cand["risk"]["size_mult"], 0.75)
 
 
 class TradingClusterExitLadderTests(unittest.TestCase):
@@ -1217,31 +1226,34 @@ class PythonAnywhereHardeningTests(unittest.TestCase):
                 "ctx": {"adx": 30, "rsi": 50, "week_chg_pct": 0,
                         "dist_from_high_pct": 0, "vol_ratio": 1.5},
             }
-            self.assertEqual(bot.buyable_reason("X", {"price": 0})[1], "price<=0")
-            self.assertEqual(bot.buyable_reason("X", {"price": 1, "stale": True})[1], "stale_quote")
+            self.assertEqual(bot.buyable_reason("X", {"price": 0})[1], "INVALID_PRICE")
+            self.assertEqual(bot.buyable_reason("X", {"price": 1, "stale": True})[1], "STALE_CANDIDATE_QUOTE")
             self.assertEqual(
                 bot.buyable_reason("X", base, {"X": {"reason": "loss"}}, "bull", {})[1],
-                "recent_sell_cooldown:loss",
+                "RECENT_SELL_COOLDOWN:loss",
             )
-            self.assertEqual(bot.buyable_reason("NOSEC", base, {}, "bull", {})[1], "missing_sector")
+            self.assertEqual(bot.buyable_reason("NOSEC", base, {}, "bull", {})[1], "MISSING_SECTOR")
             bear = dict(base)
             bear["ctx"] = dict(base["ctx"], rsi=45, is_dip=False)
             self.assertEqual(bot.buyable_reason("X", bear, {}, "bear", {})[1],
-                             "bear_gate_requires_dip_or_rsi<35")
+                             "BEAR_GATE_REQUIRES_DIP_OR_RSI_LT_35")
             neutral = dict(base)
             neutral["ctx"] = dict(base["ctx"], adx=10, is_dip=False)
             self.assertEqual(bot.buyable_reason("X", neutral, {}, "neutral", {})[1],
-                             "neutral_gate_adx<20_non_dip")
+                             "NEUTRAL_ADX_BELOW_20_NON_DIP")
             knife = dict(base)
             knife["rec"] = {"cls": "buy", "confidence": 70,
                             "catalyst": {"type": "guidance_cut"}}
             knife["ctx"] = dict(base["ctx"], week_chg_pct=-4)
-            self.assertTrue(bot.buyable_reason("X", knife, {}, "bull", {})[1].startswith("negative_catalyst_falling"))
+            self.assertTrue(bot.buyable_reason("X", knife, {}, "bull", {})[1].startswith("NEGATIVE_CATALYST_FALLING"))
             low_vol = dict(base)
             low_vol["ctx"] = dict(base["ctx"], is_dip=False, vol_ratio=1.0)
+            self.assertEqual(bot.buyable_reason("X", low_vol, {}, "bull", {})[1], "buyable")
+            very_low_vol = dict(base)
+            very_low_vol["ctx"] = dict(base["ctx"], is_dip=False, vol_ratio=0.5)
             self.assertEqual(
-                bot.buyable_reason("X", low_vol, {}, "bull", {})[1],
-                "non_dip_no_volume_confirmation",
+                bot.buyable_reason("X", very_low_vol, {}, "bull", {})[1],
+                "VERY_LOW_VOLUME_CONFIRMATION",
             )
         finally:
             bot.get_sector = old_sector
@@ -1254,6 +1266,55 @@ class PythonAnywhereHardeningTests(unittest.TestCase):
         diag["tod_ok"] = False
         bot._set_main_blocker(diag)
         self.assertEqual(diag["main_blocker"], "outside_new_buy_window")
+
+        diag = bot._new_no_buy_diag(int(time.time()), {"cash": 1000}, False, False)
+        diag["market_open"] = True
+        diag["tod_ok"] = True
+        diag["raw_buy_count"] = 2
+        diag["candidate_pool_count"] = 0
+        bot._set_main_blocker(diag)
+        self.assertEqual(diag["main_blocker"], "raw_buys_rejected_pre_candidate")
+
+    def test_get_vix_reports_spy_proxy_source(self):
+        import pandas as pd
+        import trading.risk as risk
+
+        idx = pd.date_range("2026-01-01", periods=40, freq="B")
+        df = pd.DataFrame({"Close": [100 + i * 0.4 for i in range(40)]}, index=idx)
+        old_cache_get = risk.cache_get
+        old_cache_set = risk.cache_set
+        old_daily = risk._daily_bars
+        old_append = risk._append_live_bar
+        try:
+            risk.cache_get = lambda *_args, **_kwargs: None
+            risk.cache_set = lambda *_args, **_kwargs: None
+            risk._daily_bars = lambda _tk: df
+            risk._append_live_bar = lambda d, _tk: d
+            out = risk.get_vix()
+        finally:
+            risk.cache_get = old_cache_get
+            risk.cache_set = old_cache_set
+            risk._daily_bars = old_daily
+            risk._append_live_bar = old_append
+        self.assertTrue(out["data_ok"])
+        self.assertEqual(out["source"], "spy_realized_vol_proxy")
+        self.assertEqual(out["vix_display"], "proxy")
+
+    def test_record_hold_uses_display_signal_labels(self):
+        import trading.bot as bot
+
+        state = {"history": [], "total_trades": 0}
+        rec = {
+            "cls": "buy",
+            "signal": "BUY",
+            "confidence": 34,
+            "display_signal_label": "BULLISH_LEAN",
+        }
+        bot._record_hold(state, "no execution", {"AAA": {"rec": rec}})
+        row = state["history"][0]
+        self.assertIn("AAA:BULLISH_LEAN(34%)", row["signals"])
+        self.assertIn("Top signal: AAA BULLISH_LEAN @ 34%", row["reason"])
+        self.assertNotIn("AAA:BUY(34%)", row["signals"])
 
     def test_bot_interval_cooldown_persists_no_buy_diagnostics(self):
         import trading.bot as bot
@@ -1349,7 +1410,7 @@ class PythonAnywhereHardeningTests(unittest.TestCase):
         self.assertEqual(saved[-1]["last_no_buy_diagnostics"]["main_blocker"],
                          "no_buy_candidates")
 
-    def test_missing_spy_regime_data_downsizes_but_allows_buys(self):
+    def test_missing_spy_regime_data_blocks_new_buys(self):
         import trading.bot as bot
 
         state = {
@@ -1407,7 +1468,16 @@ class PythonAnywhereHardeningTests(unittest.TestCase):
                 "spy_mom_label": "1M / 22 trading days",
                 "top_sectors": [],
             }
-            bot.get_vix = lambda: {"regime": "NORMAL", "mult": 1.0, "vix": 12.0}
+            bot.get_vix = lambda: {
+                "regime": "NORMAL",
+                "mult": 1.0,
+                "vix": 12.0,
+                "data_ok": True,
+                "data_status": "ok",
+                "source": "spy_realized_vol_proxy",
+                "volatility_source": "spy_realized_vol_proxy",
+                "vix_display": "proxy",
+            }
             bot.get_news = lambda _tk: ([], 0.0)
             bot.get_history = lambda _tk: {
                 "adx": 30, "rsi": 55, "week_chg_pct": 0,
@@ -1442,11 +1512,13 @@ class PythonAnywhereHardeningTests(unittest.TestCase):
         finally:
             for name, value in old.items():
                 setattr(bot, name, value)
-        self.assertAlmostEqual(captured["vix_mult"], 0.60)
+        self.assertNotIn("vix_mult", captured)
         diag = out_state["last_no_buy_diagnostics"]
-        self.assertTrue(diag["regime_allow_buys"])
+        self.assertFalse(diag["regime_allow_buys"])
+        self.assertEqual(diag["main_blocker"], "data_health_block")
+        self.assertIn("SPY_DATA_MISSING", diag["data_health_blocks"])
         self.assertTrue(diag["regime_data_fallback"])
-        self.assertEqual(diag["regime_data_size_mult"], 0.60)
+        self.assertEqual(diag["regime_data_size_mult"], 1.0)
 
     def test_scan_payload_cache_prevents_buy_pass_refetch(self):
         import trading.bot as bot
@@ -1596,6 +1668,13 @@ class PythonAnywhereHardeningTests(unittest.TestCase):
                 "last_no_buy_diagnostics": {
                     "main_blocker": "no_buy_candidates",
                     "candidate_pool_count": 0,
+                    "raw_buy_count": 1,
+                    "display_buy_candidate_count": 0,
+                    "data_health_blocks": ["SPY_DATA_MISSING"],
+                    "top_buyable_rejects": [
+                        {"ticker": "AAA", "rejection_reason": "VERY_LOW_VOLUME_CONFIRMATION"}
+                    ],
+                    "tick_runtime_seconds": 0.25,
                     "storage_base_dir": r"C:\secret",
                     "bot_file_path": r"C:\secret\bot_state.json",
                 },
@@ -1607,6 +1686,10 @@ class PythonAnywhereHardeningTests(unittest.TestCase):
             api.load_bot = old_load
         self.assertEqual(out["last_no_buy_diagnostics"]["main_blocker"],
                          "no_buy_candidates")
+        self.assertEqual(out["last_no_buy_diagnostics"]["raw_buy_count"], 1)
+        self.assertEqual(out["last_no_buy_diagnostics"]["data_health_blocks"],
+                         ["SPY_DATA_MISSING"])
+        self.assertEqual(out["last_no_buy_diagnostics"]["tick_runtime_seconds"], 0.25)
         self.assertNotIn("bot_file_path", str(out))
         self.assertNotIn("storage_base_dir", str(out))
 
@@ -1752,6 +1835,16 @@ class PythonAnywhereHardeningTests(unittest.TestCase):
         self.assertIn("require_admin_token()", body)
         self.assertIn('@app.route("/bot/suggestion-feedback", methods=["POST"])', source)
 
+    def test_bot_tick_route_requires_admin_and_returns_json(self):
+        source = Path("routes/portfolio.py").read_text(encoding="utf-8")
+        start = source.index('def bot_tick():')
+        end = source.index('@app.route("/bot/suggestion-feedback"')
+        body = source[start:end]
+        self.assertIn('@app.route("/bot/tick", methods=["POST"])', source)
+        self.assertIn("require_admin_token()", body)
+        self.assertIn("run_bot(force=True, user_forced=True)", body)
+        self.assertIn("max_runtime_seconds", body)
+
     def test_price_history_atomic_updates_preserve_tickers(self):
         import os
         import tempfile
@@ -1782,9 +1875,13 @@ class PythonAnywhereHardeningTests(unittest.TestCase):
 
         old_dir = cache._CACHE_DIR
         old_persistent = cache.PERSISTENT_CACHE
+        old_failures = dict(cache._api_failures)
+        old_provider_health_file = cache._PROVIDER_HEALTH_FILE
         try:
             with tempfile.TemporaryDirectory() as td:
                 cache._CACHE_DIR = td
+                cache._PROVIDER_HEALTH_FILE = os.path.join(td, "provider_health.json")
+                cache._api_failures.clear()
                 cache.PERSISTENT_CACHE = True
                 old_path = os.path.join(td, "old.pkl")
                 new_path = os.path.join(td, "new.pkl")
@@ -1796,10 +1893,13 @@ class PythonAnywhereHardeningTests(unittest.TestCase):
                 self.assertGreaterEqual(out["removed"], 1)
                 cache.record_api_failure("endpoint:test")
                 self.assertFalse(cache.should_skip_api("endpoint:test", cooldown_sec=300))
-                cache.record_api_failure("endpoint:test")
+                cache.record_api_failure("endpoint:test", "429 too many requests")
                 cache.record_api_failure("endpoint:test")
                 self.assertTrue(cache.should_skip_api("endpoint:test", cooldown_sec=300))
-                self.assertIn("endpoint:test", cache.api_failure_snapshot())
+                snap = cache.api_failure_snapshot()
+                self.assertIn("endpoint:test", snap)
+                self.assertTrue(snap["endpoint:test"]["rate_limited"])
+                self.assertEqual(snap["endpoint:test"]["status"], "rate_limited")
                 cache.record_api_success("endpoint:test")
                 self.assertFalse(cache.should_skip_api("endpoint:test", cooldown_sec=300))
 
@@ -1810,6 +1910,9 @@ class PythonAnywhereHardeningTests(unittest.TestCase):
         finally:
             cache._CACHE_DIR = old_dir
             cache.PERSISTENT_CACHE = old_persistent
+            cache._PROVIDER_HEALTH_FILE = old_provider_health_file
+            cache._api_failures.clear()
+            cache._api_failures.update(old_failures)
 
     def test_finnhub_enrichment_fetchers_respect_circuit_breaker(self):
         import types

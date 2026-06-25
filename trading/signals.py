@@ -40,6 +40,28 @@ def _regime_key(regime):
     return "neutral"
 
 
+def classify_display_signal(raw_cls, confidence):
+    """Human label for signal strength; execution still uses raw cls + gates."""
+    cls = str(raw_cls or "hold").lower()
+    try:
+        conf = float(confidence or 0)
+    except Exception:
+        conf = 0.0
+    if cls in ("buy", "strong-buy"):
+        if conf < 40:
+            return "BULLISH_LEAN"
+        if conf < 55:
+            return "WATCH_OR_LEAN"
+        if conf < 70:
+            return "BUY_CANDIDATE"
+        return "STRONG_BUY_CANDIDATE"
+    if cls == "sell":
+        return "SELL"
+    if cls == "strong-sell":
+        return "STRONG_SELL"
+    return "HOLD"
+
+
 def _decay_multiplier(age_hours, half_life_hours):
     """Exponential decay: signal value is multiplied by 0.5 every half_life_hours."""
     if age_hours <= 0:
