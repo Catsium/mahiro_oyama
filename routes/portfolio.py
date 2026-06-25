@@ -12,13 +12,14 @@ from app import app
 from market.quotes import get_quote, is_valid_ticker
 from market.snapshots import signal_snapshot
 from trading.bot import (
-    bot_state, _render_bot_page, STARTING_CASH, run_bot, BOT_TICK_MAX_RUNTIME_SEC,
+    bot_state, _render_bot_page, STARTING_CASH, run_bot, warm_scan_if_due,
+    BOT_TICK_MAX_RUNTIME_SEC,
 )
 from trading.risk import get_market_regime
 from trading.suggestion_store import record_suggestion_feedback
 from utils.auth import require_admin_token, require_machine_token
 from utils.config import BOT_ENABLED
-from utils.deploy_config import PYTHONANYWHERE_MODE
+from utils.deploy_config import FINNHUB_KEY, PERSISTENT_CACHE, PYTHONANYWHERE_MODE
 from utils.storage import (
     acquire_bot_file_lock, load_tickers, save_tickers, save_bot, load_bot,
     SUGGESTION_DB_FILE,
@@ -258,6 +259,12 @@ def bot_tick():
         return auth
     if _bot_run_lock.locked():
         return jsonify({"status": "already_running"}), 409
+    try:
+        scan_warm_started = bool(warm_scan_if_due())
+        scan_warm_error = None
+    except Exception as e:
+        scan_warm_started = False
+        scan_warm_error = f"{type(e).__name__}: {e}"
     start = time.time()
     b, traded, last_action = run_bot(
         force=True,
@@ -266,22 +273,72 @@ def bot_tick():
     )
     diag = b.get("last_no_buy_diagnostics") or {}
     runtime = round(time.time() - start, 3)
+    diagnostics = {
+        "main_blocker": diag.get("main_blocker"),
+        "market_open": diag.get("market_open"),
+        "tod_ok": diag.get("tod_ok"),
+        "buy_window_open": diag.get("buy_window_open"),
+        "trading_mode": diag.get("trading_mode"),
+        "normal_mode_active": diag.get("normal_mode_active"),
+        "proxy_mode_active": diag.get("proxy_mode_active"),
+        "degraded_mode_active": diag.get("degraded_mode_active"),
+        "degraded_mode_reason": diag.get("degraded_mode_reason"),
+        "degraded_size_mult": diag.get("degraded_size_mult"),
+        "degraded_min_confidence": diag.get("degraded_min_confidence"),
+        "degraded_reject_counts": diag.get("degraded_reject_counts", {}),
+        "data_health_ok": diag.get("data_health_ok"),
+        "data_health_blocks": diag.get("data_health_blocks", []),
+        "spy_data_ok": diag.get("spy_data_ok"),
+        "spy_data_source": diag.get("spy_data_source"),
+        "spy_data_error": diag.get("spy_data_error"),
+        "regime_data_status": diag.get("regime_data_status"),
+        "regime_data_source": diag.get("regime_data_source"),
+        "regime_data_error": diag.get("regime_data_error"),
+        "vix_label": diag.get("vix_label"),
+        "vix_value": diag.get("vix_value"),
+        "vix_data_ok": diag.get("vix_data_ok"),
+        "volatility_data_ok": diag.get("volatility_data_ok"),
+        "volatility_source": diag.get("volatility_source"),
+        "volatility_value": diag.get("volatility_value"),
+        "volatility_data_error": diag.get("volatility_data_error"),
+        "signal_counts": diag.get("signal_counts", {}),
+        "display_signal_counts": diag.get("display_signal_counts", {}),
+        "raw_buy_count": diag.get("raw_buy_count", 0),
+        "display_buy_candidate_count": diag.get("display_buy_candidate_count", 0),
+        "candidate_pool_count": diag.get("candidate_pool_count", 0),
+        "ranked_count": diag.get("ranked_count", 0),
+        "tradable_count": diag.get("tradable_count", 0),
+        "top_ranked": (diag.get("top_ranked") or [])[:5],
+        "top_ranked_rejections": (diag.get("top_ranked_rejections") or [])[:5],
+        "skip_reason_counts": diag.get("skip_reason_counts", {}),
+        "buyable_reject_counts": diag.get("buyable_reject_counts", {}),
+        "top_buyable_rejects": (diag.get("top_buyable_rejects") or [])[:5],
+        "scan_fresh": diag.get("scan_fresh"),
+        "scan_age_sec": diag.get("scan_age_sec"),
+        "scan_rows_count": diag.get("scan_rows_count"),
+        "scan_fresh_rows_count": diag.get("scan_fresh_rows_count"),
+        "cash": diag.get("cash"),
+        "cash_floor": diag.get("cash_floor"),
+        "cash_available_after_floor": diag.get("cash_available_after_floor"),
+        "gross_exposure_pct": diag.get("gross_exposure_pct"),
+        "buys_today": diag.get("buys_today"),
+        "max_buys_today": diag.get("max_buys_today"),
+        "tick_runtime_seconds": diag.get("tick_runtime_seconds"),
+    }
     return jsonify({
         "status": diag.get("main_blocker") or last_action or "complete",
         "traded": bool(traded),
         "last_action": last_action,
         "runtime_seconds": runtime,
         "max_runtime_seconds": BOT_TICK_MAX_RUNTIME_SEC,
-        "last_no_buy_diagnostics": {
-            "main_blocker": diag.get("main_blocker"),
-            "data_health_blocks": diag.get("data_health_blocks", []),
-            "raw_buy_count": diag.get("raw_buy_count", 0),
-            "candidate_pool_count": diag.get("candidate_pool_count", 0),
-            "tradable_count": diag.get("tradable_count", 0),
-            "top_buyable_rejects": (diag.get("top_buyable_rejects") or [])[:5],
-            "top_ranked_rejections": (diag.get("top_ranked_rejections") or [])[:5],
-            "tick_runtime_seconds": diag.get("tick_runtime_seconds"),
+        "scan_warm_started": scan_warm_started,
+        "scan_warm_error": scan_warm_error,
+        "environment": {
+            "pythonanywhere_mode": bool(PYTHONANYWHERE_MODE),
+            "persistent_cache": bool(PERSISTENT_CACHE),
+            "finnhub_key_configured": bool(FINNHUB_KEY),
         },
+        "last_no_buy_diagnostics": diagnostics,
     })
 
 
