@@ -262,7 +262,8 @@ def estimate_gross_edge_pct(edge_stats, regime_kind, cluster, confidence, score=
 def evaluate_candidate(candidate, total_equity, regime_stop_pct, regime_kind,
                        vix_mult, streak_mult, kelly_mult, edge_stats,
                        min_position_usd=400.0,
-                       commission=COMMISSION_PER_TRADE, config=None):
+                       commission=COMMISSION_PER_TRADE, config=None,
+                       mode_size_mult=1.0, mode_size_reason=None):
     cfg = config or DEFAULT_CONFIG
     signal_cfg = cfg.get("signal", {})
     rec = candidate.get("rec") or {}
@@ -291,6 +292,9 @@ def evaluate_candidate(candidate, total_equity, regime_stop_pct, regime_kind,
     eq_mult = exit_quality_size_mult(edge_stats, regime_kind, cluster)
     if eq_mult < 1.0:
         apply_size_mult(risk, eq_mult, "exit quality too-late penalty")
+    if float(mode_size_mult or 1.0) < 1.0:
+        risk["pre_mode_target_notional"] = risk.get("target_notional")
+        apply_size_mult(risk, mode_size_mult, mode_size_reason or "MARKET_DATA_MODE")
     friction = estimate_friction_pct(max(risk["target_notional"], 1.0), ctx,
                                      commission=commission, source=source)
     attr_edge = None
@@ -363,6 +367,9 @@ def evaluate_candidate(candidate, total_equity, regime_stop_pct, regime_kind,
         "tradable": bool(tradable),
         "rank_reason": reason,
         "edge_source": edge["edge_source"],
+        "trade_bucket": candidate.get("trade_bucket") or (
+            "confidence_prior" if edge["edge_source"] == "confidence_prior" else "validated"
+        ),
         "edge_samples": edge["edge_samples"],
         "edge_horizon": edge["edge_horizon"],
         "required_edge_pct": round(required_edge, 4),
@@ -375,11 +382,13 @@ def evaluate_candidate(candidate, total_equity, regime_stop_pct, regime_kind,
 def rank_candidates(candidates, total_equity, regime_stop_pct, regime_kind,
                     vix_mult, streak_mult, kelly_mult, edge_stats,
                     min_position_usd=400.0,
-                    commission=COMMISSION_PER_TRADE, config=None):
+                    commission=COMMISSION_PER_TRADE, config=None,
+                    mode_size_mult=1.0, mode_size_reason=None):
     ranked = [
         evaluate_candidate(c, total_equity, regime_stop_pct, regime_kind, vix_mult,
                            streak_mult, kelly_mult, edge_stats, min_position_usd,
-                           commission, config=config)
+                           commission, config=config, mode_size_mult=mode_size_mult,
+                           mode_size_reason=mode_size_reason)
         for c in candidates
     ]
     ranked.sort(key=lambda c: (c.get("tradable", False), c.get("ev_score", -999),

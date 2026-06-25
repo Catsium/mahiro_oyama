@@ -12,13 +12,13 @@ import pandas as pd
 
 from market import fh
 from market.data_manager import get_daily as _daily_bars
-from market.quotes import _append_live_bar
+from market.quotes import _append_live_bar, get_regime_daily
 from utils.cache import (
     cache_get, cache_set, record_api_failure, record_api_success, should_skip_api,
 )
 from utils.deploy_config import PYTHONANYWHERE_MODE
 from utils.time_utils import is_market_open
-from trading.config import config_hash
+from trading.config import DEFAULT_CONFIG, config_hash
 from trading.regime_v3 import (
     SECTOR_ETFS, build_regime_v3, get_breadth_universe, load_live_close_history,
 )
@@ -28,6 +28,10 @@ from trading.regime_v3 import (
 SPY_MOM_LOOKBACK_BARS = 22
 SPY_MIN_REGIME_ROWS = 50
 SPY_MOM_LABEL = "1M / 22 trading days"
+
+
+def _regime_daily_bars(ticker, full=False):
+    return get_regime_daily(ticker, full=full)
 
 
 SECTOR_MAP = {
@@ -109,27 +113,33 @@ def get_vix():
     carries realized-vol %, not the VIX index — thresholds are set on that scale.
     """
     c = cache_get("vix", max_age=3600)
-    if c is not None and "data_ok" in c:
+    if c is not None and "data_ok" in c and "volatility_window_days" in c:
         return c
+    mode_cfg = DEFAULT_CONFIG.get("market_data_modes", {})
+    window = int(mode_cfg.get("proxy_vol_window_days", 20))
+    min_bars = int(mode_cfg.get("proxy_min_spy_bars", 60))
     r = {
         "vix": None,
+        "volatility_value": None,
         "regime": "UNKNOWN",
         "mult": 1.0,
         "data_ok": False,
         "data_status": "missing_spy_history",
         "source": None,
         "volatility_source": None,
+        "volatility_window_days": window,
         "vix_display": "unknown",
         "data_error": None,
     }
     try:
-        df = _daily_bars("SPY")
-        if df is not None and not df.empty and len(df) >= 21:
+        df = _regime_daily_bars("SPY")
+        if df is not None and not df.empty and len(df) >= min_bars:
             df = _append_live_bar(df.copy(), "SPY")
-            rets = df["Close"].pct_change().dropna().tail(20)
-            if len(rets) >= 10:
+            rets = df["Close"].pct_change().dropna().tail(window)
+            if len(rets) >= window:
                 rv = float(rets.std() * (252 ** 0.5) * 100)
                 r["vix"] = round(rv, 2)
+                r["volatility_value"] = round(rv, 2)
                 r["data_ok"] = True
                 r["data_status"] = "ok"
                 r["source"] = "spy_realized_vol_proxy"
@@ -160,8 +170,8 @@ def credit_signal():
         return c
     r = {"credit_label": "neutral", "credit_pct": 50.0}
     try:
-        hyg = _daily_bars("HYG")
-        iei = _daily_bars("IEI")
+        hyg = _regime_daily_bars("HYG")
+        iei = _regime_daily_bars("IEI")
         if hyg is None or iei is None or len(hyg) < 90 or len(iei) < 90:
             cache_set("credit_signal", r)
             return r
@@ -291,9 +301,9 @@ def _spy_macro_from_df(df, source, append_live=True):
 def get_market_regime_pa_light():
     """PA free-tier regime from cheap legacy SPY, credit, and realized-vol gates."""
     try:
-        macro = _spy_macro_from_df(_daily_bars("SPY"), "data_manager", append_live=True)
+        macro = _spy_macro_from_df(_regime_daily_bars("SPY"), "regime_daily", append_live=True)
     except Exception as e:
-        macro = _spy_macro_fallback("spy_history_error", source="data_manager", error=e)
+        macro = _spy_macro_fallback("spy_history_error", source="regime_daily", error=e)
 
     macro_regime = macro["regime"]
     from market.history import get_intraday_context
@@ -382,10 +392,10 @@ def get_market_regime(config=None):
             macro = _spy_macro_fallback("spy_history_error", source="yfinance_3mo", error=e)
     if not macro.get("spy_data_ok"):
         try:
-            df = _daily_bars("SPY")
-            macro = _spy_macro_from_df(df, "data_manager", append_live=True)
+            df = _regime_daily_bars("SPY")
+            macro = _spy_macro_from_df(df, "regime_daily", append_live=True)
         except Exception as e:
-            macro = _spy_macro_fallback("spy_history_error", source="data_manager", error=e)
+            macro = _spy_macro_fallback("spy_history_error", source="regime_daily", error=e)
 
     macro_regime = macro["regime"]
 

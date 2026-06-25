@@ -26,6 +26,8 @@ RISK_CONFIG = {
     "max_positions": 8,
     "max_new_buys_per_tick": 1,
     "max_new_buys_per_day": 2,
+    "daily_loss_limit_pct": -0.02,
+    "hard_drawdown_lockout_pct": -0.10,
     "experimental_trade_size_mult": 0.25,
     "validated_trade_size_mult": 1.0,
 }
@@ -189,6 +191,29 @@ SUGGESTION_CONFIG = {
     "feedback_retention_days": 180,
 }
 
+MARKET_DATA_MODES_CONFIG = {
+    "allow_proxy_mode": True,
+    "allow_degraded_paper_trading": True,
+    "normal_size_mult": 1.0,
+    "proxy_size_mult": 0.85,
+    "proxy_vol_window_days": 20,
+    "proxy_min_spy_bars": 60,
+    "degraded_size_mult": 0.70,
+    "degraded_min_confidence": 65,
+    "degraded_max_new_buys_per_tick": 1,
+    "degraded_max_new_buys_per_day": 1,
+    "degraded_max_position_pct": 0.05,
+    "degraded_max_gross_exposure_pct": 0.35,
+    "degraded_block_pyramiding": True,
+    "degraded_block_experimental": True,
+    "degraded_block_confidence_prior": True,
+    "degraded_block_low_volume_penalty": True,
+    "degraded_require_buy_candidate": True,
+    "degraded_require_fresh_quote": True,
+    "degraded_require_normal_ev_gates": True,
+    "degraded_require_normal_risk_caps": True,
+}
+
 SWEEP_PARAMS = {
     "signal.min_buy_confidence": [50, 55, 60],
     "signal.min_expected_edge_pct": [0.25, 0.40, 0.60],
@@ -235,6 +260,7 @@ DEFAULT_CONFIG = {
     "catalyst_score": CATALYST_SCORE,
     "backtest": BACKTEST_CONFIG,
     "suggestion": SUGGESTION_CONFIG,
+    "market_data_modes": MARKET_DATA_MODES_CONFIG,
     "sweep_params": SWEEP_PARAMS,
     "preset_sweeps": PRESET_SWEEPS,
 }

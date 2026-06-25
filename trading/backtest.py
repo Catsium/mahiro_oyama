@@ -168,6 +168,50 @@ def _price(df, date):
         return None
 
 
+def _bar_at(df, date):
+    if df is None or date is None:
+        return None
+    try:
+        row = df.loc[date]
+    except Exception:
+        return None
+    try:
+        return {
+            "open": float(row.get("Open", row.get("Close"))),
+            "high": float(row.get("High", row.get("Close"))),
+            "low": float(row.get("Low", row.get("Close"))),
+            "close": float(row.get("Close")),
+        }
+    except Exception:
+        return None
+
+
+def _entry_price_for_next_bar(df, dates, di):
+    """Use next bar open for simulated execution to avoid same-close fills."""
+    next_i = int(di) + 1
+    if next_i >= len(dates):
+        return None
+    bar = _bar_at(df, dates[next_i])
+    if not bar:
+        return None
+    price = bar.get("open") or bar.get("close")
+    return float(price) if price and price > 0 else None
+
+
+def _exit_price_for_bar(bar, stop_price=None, take_profit_price=None):
+    """Approximate daily OHLC execution, preferring explicit touched stop/target."""
+    if not bar:
+        return None
+    low = float(bar.get("low") or 0.0)
+    high = float(bar.get("high") or 0.0)
+    if stop_price and low > 0 and low <= float(stop_price):
+        return float(stop_price)
+    if take_profit_price and high >= float(take_profit_price):
+        return float(take_profit_price)
+    close = float(bar.get("close") or 0.0)
+    return close if close > 0 else None
+
+
 def _ctx_at(df, date, window):
     """Build a pure-technical ctx as of `date` from a bounded trailing window (keeps the
     per-day cost O(window) instead of O(n))."""
@@ -507,6 +551,8 @@ def _simulate(panel, spy_df, dates, weights, mode, learn, window, edge_stats=Non
                                        trail_static, di, legacy, profile=profile)
             if not sell:
                 continue
+            exec_pr = _exit_price_for_bar(_bar_at(panel.get(tk), date)) or pr
+            pr = exec_pr
             sh = h["shares"]; avg = h["avg_cost"]
             cost_basis = sh * avg
             gross = (pr - avg) / avg * 100 if avg else 0
