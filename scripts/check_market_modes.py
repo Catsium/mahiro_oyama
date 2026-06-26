@@ -1,7 +1,14 @@
 """Print paper-bot market-data mode diagnostics without placing trades."""
 import json
+import sys
+from pathlib import Path
 
-from trading.bot import _market_data_mode
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from trading.bot import _market_data_mode, is_execution_candidate
 from trading.config import active_config
 from trading.risk import get_market_regime, get_vix
 from utils.storage import load_bot
@@ -13,6 +20,7 @@ REQUIRED_STATUS_FIELDS = (
     "proxy_mode_active",
     "degraded_mode_active",
     "degraded_mode_reason",
+    "min_buy_confidence",
     "degraded_size_mult",
     "degraded_min_confidence",
     "data_health_blocks",
@@ -61,12 +69,22 @@ def main():
     missing = [field for field in REQUIRED_STATUS_FIELDS if field not in diag]
 
     sample_degraded = {
+        "cls": "buy",
+        "signal": "BUY",
         "ticker": "SAMPLE",
-        "confidence": 64,
+        "confidence": 55,
         "display_signal_label": "BUY_CANDIDATE",
-        "eligible": False,
-        "rejection_reason": "DEGRADED_CONFIDENCE_BELOW_65",
     }
+    sample_degraded["eligible"] = is_execution_candidate(
+        sample_degraded,
+        cfg,
+        degraded_mode_active=True,
+    )
+    sample_degraded["reason"] = (
+        "BUY_CANDIDATE >= min thresholds"
+        if sample_degraded["eligible"]
+        else "blocked by execution candidate policy"
+    )
 
     out = {
         "spy_source": regime.get("spy_data_source") or regime.get("regime_data_source"),

@@ -52,8 +52,8 @@ FINNHUB_CALLS_PER_MINUTE = env_int("FINNHUB_CALLS_PER_MINUTE", 50, 1, 50)
 FINNHUB_CALLS_PER_SECOND = env_int("FINNHUB_CALLS_PER_SECOND", 25, 1, 25)
 
 # PA free-tier staging. Holdings are always included; this caps extra tickers.
-PA_TICKERS_PER_BOT_RUN = env_int("PA_TICKERS_PER_BOT_RUN", 8, 1, 25)
-PA_SCAN_BATCH_SIZE = env_int("PA_SCAN_BATCH_SIZE", 8, 1, 25)
+PA_TICKERS_PER_BOT_RUN = env_int("PA_TICKERS_PER_BOT_RUN", 6, 1, 8)
+PA_SCAN_BATCH_SIZE = env_int("PA_SCAN_BATCH_SIZE", 4, 1, 8)
 PA_PAGE_TICKER_LIMIT = env_int("PA_PAGE_TICKER_LIMIT", 12, 1, 56)
 
 # Persistent cache survives web-worker reloads. Local dev can opt in explicitly.

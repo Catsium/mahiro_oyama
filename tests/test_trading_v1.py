@@ -243,7 +243,10 @@ class TradingV1SizingTests(unittest.TestCase):
     def test_risk_and_kelly_defaults_match_paper_contract(self):
         risk = DEFAULT_CONFIG["risk"]
         kelly = DEFAULT_CONFIG["kelly"]
+        signal = DEFAULT_CONFIG["signal"]
         modes = DEFAULT_CONFIG["market_data_modes"]
+        self.assertEqual(signal["min_buy_confidence"], 55)
+        self.assertEqual(risk["min_trade_size"], 400.0)
         self.assertEqual(risk["max_new_buys_per_tick"], 1)
         self.assertEqual(risk["max_new_buys_per_day"], 2)
         self.assertEqual(risk["max_positions"], 8)
@@ -257,7 +260,15 @@ class TradingV1SizingTests(unittest.TestCase):
         self.assertEqual(kelly["max_mult"], 1.0)
         self.assertEqual(modes["proxy_size_mult"], 0.85)
         self.assertEqual(modes["degraded_size_mult"], 0.70)
-        self.assertEqual(modes["degraded_min_confidence"], 65)
+        self.assertEqual(modes["degraded_min_confidence"], 55)
+        self.assertEqual(modes["degraded_max_new_buys_per_tick"], 1)
+        self.assertEqual(modes["degraded_max_new_buys_per_day"], 1)
+        self.assertEqual(modes["degraded_max_position_pct"], 0.05)
+        self.assertEqual(modes["degraded_max_gross_exposure_pct"], 0.35)
+        self.assertTrue(modes["degraded_require_buy_candidate"])
+        self.assertTrue(modes["degraded_require_fresh_quote"])
+        self.assertTrue(modes["degraded_require_normal_ev_gates"])
+        self.assertTrue(modes["degraded_require_normal_risk_caps"])
 
     def test_scan_source_gets_smaller_risk_budget(self):
         base = self._candidate("BASE", 75, "trend")
@@ -288,6 +299,43 @@ class TradingV1SizingTests(unittest.TestCase):
         self.assertEqual(classify_display_signal("buy", 34), "BULLISH_LEAN")
         self.assertEqual(classify_display_signal("buy", 54), "WATCH_OR_LEAN")
         self.assertEqual(classify_display_signal("buy", 55), "BUY_CANDIDATE")
+
+    def test_execution_candidate_helper_uses_display_label_and_shared_threshold(self):
+        import trading.bot as bot
+
+        cfg = DEFAULT_CONFIG
+        self.assertFalse(bot.is_execution_candidate({
+            "cls": "hold", "signal": "HOLD",
+            "display_signal_label": "BUY_CANDIDATE", "confidence": 80,
+        }, cfg))
+        self.assertFalse(bot.is_execution_candidate({
+            "cls": "buy", "signal": "BUY",
+            "display_signal_label": "BULLISH_LEAN", "confidence": 33,
+        }, cfg))
+        self.assertFalse(bot.is_execution_candidate({
+            "cls": "buy", "signal": "BUY",
+            "display_signal_label": "WATCH_OR_LEAN", "confidence": 54,
+        }, cfg))
+        self.assertFalse(bot.is_execution_candidate({
+            "cls": "buy", "signal": "BUY",
+            "display_signal_label": "BUY_CANDIDATE", "confidence": 54,
+        }, cfg))
+        self.assertFalse(bot.is_execution_candidate({
+            "cls": "buy", "signal": "BUY",
+            "display_signal_label": "BUY_CANDIDATE", "confidence": 54,
+        }, cfg, degraded_mode_active=True))
+        self.assertTrue(bot.is_execution_candidate({
+            "cls": "buy", "signal": "BUY",
+            "display_signal_label": "BUY_CANDIDATE", "confidence": 55,
+        }, cfg))
+        self.assertTrue(bot.is_execution_candidate({
+            "cls": "buy", "signal": "BUY",
+            "display_signal_label": "BUY_CANDIDATE", "confidence": 55,
+        }, cfg, degraded_mode_active=True))
+        self.assertTrue(bot.is_execution_candidate({
+            "cls": "strong-buy", "signal": "STRONG_BUY",
+            "display_signal_label": "STRONG_BUY_CANDIDATE", "confidence": 70,
+        }, cfg, degraded_mode_active=True))
 
     def test_confidence_prior_watchlist_warmup_requires_min_confidence(self):
         cand = self._candidate("WARM", 35, "trend", atr_pct=2.0, score=4.0)
@@ -1323,6 +1371,15 @@ class PythonAnywhereHardeningTests(unittest.TestCase):
         diag["raw_buy_count"] = 2
         diag["candidate_pool_count"] = 0
         bot._set_main_blocker(diag)
+        self.assertEqual(diag["main_blocker"], "weak_raw_buys_only")
+
+        diag = bot._new_no_buy_diag(int(time.time()), {"cash": 1000}, False, False)
+        diag["market_open"] = True
+        diag["tod_ok"] = True
+        diag["raw_buy_count"] = 2
+        diag["display_buy_candidate_count"] = 1
+        diag["candidate_pool_count"] = 0
+        bot._set_main_blocker(diag)
         self.assertEqual(diag["main_blocker"], "raw_buys_rejected_pre_candidate")
 
         diag = bot._new_no_buy_diag(int(time.time()), {"cash": 1000}, False, False)
@@ -1341,6 +1398,27 @@ class PythonAnywhereHardeningTests(unittest.TestCase):
         bot._set_main_blocker(diag)
         self.assertEqual(diag["main_blocker"], "DAILY_LOSS_LIMIT")
 
+    def test_record_skip_preserves_raw_display_and_original_reason(self):
+        import trading.bot as bot
+
+        state = {"history": []}
+        bot._record_skip(
+            state,
+            "XYZ",
+            "DEGRADED_FINAL_SIZE_TOO_SMALL",
+            "BUY",
+            58,
+            display_signal="BUY_CANDIDATE",
+            original_reason="Risk budget target $0 below $400 floor",
+            skip_stage="sizing_floor",
+        )
+        row = state["history"][0]
+        self.assertEqual(row["signal"], "BUY_CANDIDATE")
+        self.assertEqual(row["raw_signal"], "BUY")
+        self.assertEqual(row["display_signal"], "BUY_CANDIDATE")
+        self.assertEqual(row["original_reason"], "Risk budget target $0 below $400 floor")
+        self.assertEqual(row["skip_stage"], "sizing_floor")
+
     def test_tick_log_entry_contains_required_contract_fields(self):
         import trading.bot as bot
 
@@ -1354,6 +1432,23 @@ class PythonAnywhereHardeningTests(unittest.TestCase):
         self.assertEqual(event["timestamp"], 123)
         self.assertEqual(event["top_rejection_reasons"],
                          ["CONFIDENCE_BELOW_MIN_BUY", "EDGE_TOO_LOW"])
+
+    def test_market_modes_script_does_not_publish_old_degraded_threshold(self):
+        source = Path("scripts/check_market_modes.py").read_text(encoding="utf-8")
+        self.assertIn("is_execution_candidate", source)
+        self.assertIn('"confidence": 55', source)
+        self.assertIn('"display_signal_label": "BUY_CANDIDATE"', source)
+        self.assertNotIn("DEGRADED_CONFIDENCE_BELOW_65", source)
+        self.assertNotIn('"confidence": 64', source)
+
+    def test_candidate_pool_builders_use_execution_candidate_helper(self):
+        source = Path("trading/bot.py").read_text(encoding="utf-8")
+        start = source.index("candidate_pool = []")
+        end = source.index("ranked_candidates = rank_candidates", start)
+        body = source[start:end]
+        self.assertGreaterEqual(body.count("is_execution_candidate("), 2)
+        self.assertNotIn("raw_cls not in", body)
+        self.assertNotIn('s.get("rec", {}).get("cls"', body)
 
     def test_paper_loss_lockout_sets_daily_loss_reason(self):
         import trading.bot as bot
@@ -1417,16 +1512,37 @@ class PythonAnywhereHardeningTests(unittest.TestCase):
         calls = {}
         old = {
             "require_machine_token": portfolio.require_machine_token,
+            "warm_scan_if_due": portfolio.warm_scan_if_due,
             "run_bot": portfolio.run_bot,
             "jsonify": portfolio.jsonify,
+            "PYTHONANYWHERE_MODE": portfolio.PYTHONANYWHERE_MODE,
         }
         try:
+            portfolio.PYTHONANYWHERE_MODE = False
             portfolio.require_machine_token = lambda: calls.setdefault("auth", True)
+            portfolio.warm_scan_if_due = lambda: calls.setdefault("warm_scan", True)
             portfolio.jsonify = lambda obj=None, **kwargs: obj if obj is not None else kwargs
 
             def fake_run_bot(**kwargs):
                 calls["run_kwargs"] = kwargs
-                return {"last_no_buy_diagnostics": {"main_blocker": "partial_timeout"}}, False, "partial_timeout"
+                return {"last_no_buy_diagnostics": {
+                    "main_blocker": "weak_raw_buys_only",
+                    "trading_mode": "DEGRADED_MODE",
+                    "degraded_mode_active": True,
+                    "data_health_blocks": ["SPY_DATA_MISSING"],
+                    "raw_buy_count": 2,
+                    "display_buy_candidate_count": 0,
+                    "candidate_pool_count": 0,
+                    "ranked_count": 0,
+                    "tradable_count": 0,
+                    "scan_age_sec": 10,
+                    "scan_fresh_rows_count": 3,
+                    "min_buy_confidence": 55,
+                    "degraded_size_mult": 0.70,
+                    "degraded_min_confidence": 55,
+                    "cash_available_after_floor": 7000,
+                    "gross_exposure_pct": 0.1,
+                }}, False, "hold"
 
             portfolio.run_bot = fake_run_bot
             payload = portfolio.bot_tick()
@@ -1434,9 +1550,97 @@ class PythonAnywhereHardeningTests(unittest.TestCase):
             for name, value in old.items():
                 setattr(portfolio, name, value)
         self.assertTrue(calls["auth"])
+        self.assertTrue(calls["warm_scan"])
         self.assertEqual(calls["run_kwargs"]["max_runtime_sec"],
                          portfolio.BOT_TICK_MAX_RUNTIME_SEC)
+        diag = payload["last_no_buy_diagnostics"]
+        self.assertEqual(payload["status"], "weak_raw_buys_only")
+        self.assertTrue(payload["scan_warm_started"])
+        self.assertIn("environment", payload)
+        self.assertEqual(diag["trading_mode"], "DEGRADED_MODE")
+        self.assertEqual(diag["display_buy_candidate_count"], 0)
+        self.assertEqual(diag["scan_fresh_rows_count"], 3)
+        self.assertEqual(diag["min_buy_confidence"], 55)
+        self.assertEqual(diag["degraded_min_confidence"], 55)
+        self.assertEqual(diag["degraded_size_mult"], 0.70)
+
+    def test_bot_tick_skips_scan_warm_on_pythonanywhere_and_reports_timeout(self):
+        import routes.portfolio as portfolio
+
+        calls = {}
+        old = {
+            "require_machine_token": portfolio.require_machine_token,
+            "warm_scan_if_due": portfolio.warm_scan_if_due,
+            "run_bot": portfolio.run_bot,
+            "jsonify": portfolio.jsonify,
+            "PYTHONANYWHERE_MODE": portfolio.PYTHONANYWHERE_MODE,
+        }
+        try:
+            portfolio.PYTHONANYWHERE_MODE = True
+            portfolio.require_machine_token = lambda: calls.setdefault("auth", True)
+            portfolio.warm_scan_if_due = lambda: (_ for _ in ()).throw(
+                AssertionError("PA /bot/tick must not warm scan")
+            )
+            portfolio.jsonify = lambda obj=None, **kwargs: obj if obj is not None else kwargs
+
+            def fake_run_bot(**kwargs):
+                calls["run_kwargs"] = kwargs
+                return {"last_no_buy_diagnostics": {
+                    "main_blocker": "partial_timeout",
+                    "partial_result": True,
+                    "timeout_reason": "BOT_TICK_MAX_RUNTIME_SEC",
+                    "paper_trading_locked": True,
+                    "paper_lock_reason": "BOT_TICK_TIMEOUT",
+                    "fetch_timeout_tickers": ["AAPL", "NVDA"],
+                }}, False, "partial_timeout"
+
+            portfolio.run_bot = fake_run_bot
+            payload = portfolio.bot_tick()
+        finally:
+            for name, value in old.items():
+                setattr(portfolio, name, value)
+
+        diag = payload["last_no_buy_diagnostics"]
+        self.assertTrue(calls["auth"])
         self.assertEqual(payload["status"], "partial_timeout")
+        self.assertFalse(payload["traded"])
+        self.assertEqual(payload["last_action"], "partial_timeout")
+        self.assertFalse(payload["scan_warm_started"])
+        self.assertEqual(diag["timeout_reason"], "BOT_TICK_MAX_RUNTIME_SEC")
+        self.assertEqual(diag["paper_lock_reason"], "BOT_TICK_TIMEOUT")
+        self.assertEqual(diag["fetch_timeout_tickers"], ["AAPL", "NVDA"])
+
+    def test_bot_fetch_and_scan_paths_are_deadline_safe(self):
+        source = Path("trading/bot.py").read_text(encoding="utf-8")
+        bot_start = source.index("def _run_bot_locked(")
+        scan_start = source.index("def run_scan():")
+        bot_body = source[bot_start:scan_start]
+        scan_body = source[scan_start:source.index("def warm_scan_if_due")]
+
+        self.assertNotIn(".map(_fetch_one", bot_body)
+        self.assertIn("wait(", bot_body)
+        self.assertIn("FIRST_COMPLETED", bot_body)
+        self.assertIn("shutdown(wait=False, cancel_futures=True)", bot_body)
+        self.assertIn("fetch_timeout_tickers", bot_body)
+        self.assertIn("_call_with_deadline(lambda: get_market_regime(cfg)", bot_body)
+        self.assertIn("_call_with_deadline(get_vix", bot_body)
+
+        self.assertNotIn(".map(_scan_one", scan_body)
+        self.assertIn("scan_deadline = time.time() + (20 if PYTHONANYWHERE_MODE else 45)", scan_body)
+        self.assertIn("wait(", scan_body)
+        self.assertIn("shutdown(wait=False, cancel_futures=True)", scan_body)
+
+    def test_pa_batch_defaults_are_free_tier_safe(self):
+        source = Path("utils/deploy_config.py").read_text(encoding="utf-8")
+        self.assertIn('PA_TICKERS_PER_BOT_RUN = env_int("PA_TICKERS_PER_BOT_RUN", 6, 1, 8)', source)
+        self.assertIn('PA_SCAN_BATCH_SIZE = env_int("PA_SCAN_BATCH_SIZE", 4, 1, 8)', source)
+
+    def test_legacy_sizing_skip_path_preserves_skip_metadata(self):
+        source = Path("trading/bot.py").read_text(encoding="utf-8")
+        self.assertNotIn('_record_skip(b, cd["ticker"], skip_reason, cd["signal"], cd["confidence"])', source)
+        self.assertIn('display_signal=cd.get("display_signal")', source)
+        self.assertIn('original_reason=cd.get("original_reason") or skip_reason', source)
+        self.assertIn('skip_stage=cd.get("skip_stage") or "sizing_floor"', source)
 
     def test_get_vix_reports_spy_proxy_source(self):
         import pandas as pd
@@ -1508,8 +1712,10 @@ class PythonAnywhereHardeningTests(unittest.TestCase):
             bot.prune_cache_dir = old_prune
         self.assertFalse(traded)
         self.assertEqual(action, "interval_cooldown")
-        self.assertEqual(out_state["last_no_buy_diagnostics"]["main_blocker"],
-                         "interval_cooldown")
+        diag = out_state["last_no_buy_diagnostics"]
+        self.assertEqual(diag["main_blocker"], "interval_cooldown")
+        self.assertEqual(diag["min_buy_confidence"], 55)
+        self.assertEqual(diag["degraded_min_confidence"], 55)
         self.assertEqual(saved[-1]["last_cache_prune"], {"removed": 0, "kept": 0})
 
     def test_bot_no_trade_run_persists_no_buy_diagnostics(self):
@@ -1831,7 +2037,9 @@ class PythonAnywhereHardeningTests(unittest.TestCase):
         import routes.api as api
 
         old_load = api.load_bot
+        old_jsonify = api.jsonify
         try:
+            api.jsonify = lambda obj=None, **kwargs: obj if obj is not None else kwargs
             api.load_bot = lambda: {
                 "last_no_buy_diagnostics": {
                     "main_blocker": "no_buy_candidates",
@@ -1842,8 +2050,9 @@ class PythonAnywhereHardeningTests(unittest.TestCase):
                     "trading_mode": "DEGRADED_MODE",
                     "degraded_mode_active": True,
                     "degraded_mode_reason": "SPY_DATA_MISSING",
+                    "min_buy_confidence": 55,
                     "degraded_size_mult": 0.70,
-                    "degraded_min_confidence": 65,
+                    "degraded_min_confidence": 55,
                     "degraded_reject_counts": {"DEGRADED_LOW_VOLUME_BLOCKED": 1},
                     "volatility_value": 14.2,
                     "regime_source": "degraded_fallback",
@@ -1860,6 +2069,7 @@ class PythonAnywhereHardeningTests(unittest.TestCase):
             out = api.api_bot_status()
         finally:
             api.load_bot = old_load
+            api.jsonify = old_jsonify
         self.assertEqual(out["last_no_buy_diagnostics"]["main_blocker"],
                          "no_buy_candidates")
         self.assertEqual(out["last_no_buy_diagnostics"]["raw_buy_count"], 1)
@@ -1868,6 +2078,8 @@ class PythonAnywhereHardeningTests(unittest.TestCase):
         self.assertEqual(out["last_no_buy_diagnostics"]["trading_mode"],
                          "DEGRADED_MODE")
         self.assertTrue(out["last_no_buy_diagnostics"]["degraded_mode_active"])
+        self.assertEqual(out["last_no_buy_diagnostics"]["min_buy_confidence"], 55)
+        self.assertEqual(out["last_no_buy_diagnostics"]["degraded_min_confidence"], 55)
         self.assertEqual(out["last_no_buy_diagnostics"]["volatility_value"], 14.2)
         self.assertEqual(out["last_no_buy_diagnostics"]["regime_source"],
                          "degraded_fallback")
@@ -1969,6 +2181,33 @@ class PythonAnywhereHardeningTests(unittest.TestCase):
             self.assertEqual(config_hash(DEFAULT_CONFIG), base_hash)
         finally:
             dc.PYTHONANYWHERE_MODE = old_pa
+
+    def test_pythonanywhere_runtime_defaults_are_free_tier_safe(self):
+        import importlib
+        import os
+        import utils.deploy_config as deploy_config
+
+        names = ("PA_TICKERS_PER_BOT_RUN", "PA_SCAN_BATCH_SIZE")
+        old_env = {name: os.environ.get(name) for name in names}
+        try:
+            for name in names:
+                os.environ.pop(name, None)
+            deploy_config = importlib.reload(deploy_config)
+            self.assertEqual(deploy_config.PA_TICKERS_PER_BOT_RUN, 6)
+            self.assertEqual(deploy_config.PA_SCAN_BATCH_SIZE, 4)
+
+            os.environ["PA_TICKERS_PER_BOT_RUN"] = "99"
+            os.environ["PA_SCAN_BATCH_SIZE"] = "99"
+            deploy_config = importlib.reload(deploy_config)
+            self.assertEqual(deploy_config.PA_TICKERS_PER_BOT_RUN, 8)
+            self.assertEqual(deploy_config.PA_SCAN_BATCH_SIZE, 8)
+        finally:
+            for name, value in old_env.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+            importlib.reload(deploy_config)
 
     def test_pa_state_caps_trim_oversized_state(self):
         import utils.deploy_config as dc

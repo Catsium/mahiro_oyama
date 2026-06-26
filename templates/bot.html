@@ -344,7 +344,7 @@
             </tr>
             <tr id="buy-{{ loop.index }}" class="detail">
               <td colspan="5">
-                <div><strong style="color:#fff">{{ tx.signal }}</strong><span class="text-muted"> at {{ tx.confidence }}% confidence</span></div>
+                <div><strong style="color:#fff">{{ tx.display_signal or tx.signal }}</strong><span class="text-muted"> at {{ tx.confidence }}% confidence</span></div>
                 <div class="note" style="margin-top:6px"><span class="text-muted">Decision reasoning:</span> {{ tx.reason }}</div>
                 <div class="text-muted" style="font-size:.78rem;margin-top:6px">
                   Executed @ ${{ '{:,.2f}'.format(tx.price) }} · Total spent: ${{ '{:,.2f}'.format(tx.total) }}
@@ -406,7 +406,7 @@
             </tr>
             <tr id="sell-{{ loop.index }}" class="detail">
               <td colspan="5">
-                <div><strong style="color:#fff">{{ tx.signal }}</strong><span class="text-muted"> at {{ tx.confidence }}% confidence</span></div>
+                <div><strong style="color:#fff">{{ tx.display_signal or tx.signal }}</strong><span class="text-muted"> at {{ tx.confidence }}% confidence</span></div>
                 <div class="note" style="margin-top:6px"><span class="text-muted">Decision reasoning:</span> {{ tx.reason }}</div>
                 <div class="text-muted" style="font-size:.78rem;margin-top:6px">
                   Executed @ ${{ '{:,.2f}'.format(tx.price) }} · Total received: ${{ '{:,.2f}'.format(tx.total) }}
@@ -463,7 +463,7 @@
           </tr>
           <tr id="dec-{{ loop.index }}" class="detail">
             <td colspan="5">
-              <div><strong style="color:#fff">{{ tx.signal }}</strong>{% if not is_hold %}<span class="text-muted"> at {{ tx.confidence }}% confidence</span>{% endif %}</div>
+              <div><strong style="color:#fff">{{ tx.display_signal or tx.signal }}</strong>{% if not is_hold %}<span class="text-muted"> at {{ tx.confidence }}% confidence</span>{% endif %}</div>
               <div class="note" style="margin-top:6px"><span class="text-muted">Decision reasoning:</span> {{ tx.reason }}</div>
               {% if is_hold and tx.signals %}
               <div class="text-muted" style="font-size:.78rem;margin-top:6px">Signals across watchlist: {{ tx.signals }}</div>
