@@ -13,7 +13,7 @@ import gc
 import uuid
 import json
 import os
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime
 
 from flask import render_template
@@ -207,13 +207,17 @@ def is_execution_candidate(rec, cfg, *, degraded_mode_active=False):
         conf = float(rec.get("confidence", 0) or 0)
     except Exception:
         conf = 0.0
+    min_buy_confidence = float(signal_cfg.get("min_buy_confidence", 55))
+    degraded_min_confidence = float(
+        mode_cfg.get("degraded_min_confidence", min_buy_confidence)
+    )
     if raw_cls not in ("buy", "strong-buy"):
         return False
     if display not in ("BUY_CANDIDATE", "STRONG_BUY_CANDIDATE"):
         return False
-    if conf < float(signal_cfg.get("min_buy_confidence", 55)):
+    if conf < min_buy_confidence:
         return False
-    if degraded_mode_active and conf < float(mode_cfg.get("degraded_min_confidence", 65)):
+    if degraded_mode_active and conf < degraded_min_confidence:
         return False
     return True
 
@@ -443,15 +447,40 @@ def _apply_paper_loss_lockouts(b, diag, risk_cfg, equity, peak_equity, now):
     return False
 
 
-def _raise_if_tick_deadline_exceeded(deadline_ts, b, diag):
-    if deadline_ts is None or time.time() <= deadline_ts:
-        return
+def _raise_tick_timeout(b, diag):
     diag["partial_result"] = True
     diag["timeout_reason"] = "BOT_TICK_MAX_RUNTIME_SEC"
     diag["paper_trading_locked"] = True
     diag["paper_lock_reason"] = "BOT_TICK_TIMEOUT"
     _persist_no_buy_diag(b, diag, "partial_timeout")
     raise TimeoutError("partial_timeout")
+
+
+def _raise_if_tick_deadline_exceeded(deadline_ts, b, diag):
+    if deadline_ts is None or time.time() <= deadline_ts:
+        return
+    _raise_tick_timeout(b, diag)
+
+
+def _call_with_deadline(fn, deadline_ts):
+    if deadline_ts is None:
+        return fn(), True
+    remaining = deadline_ts - time.time()
+    if remaining <= 0:
+        return None, False
+    executor = ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(fn)
+    try:
+        done, _pending = wait(
+            {future},
+            timeout=max(0.05, remaining),
+            return_when=FIRST_COMPLETED,
+        )
+        if future not in done:
+            return None, False
+        return future.result(timeout=0), True
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
 
 
 def buyable_reason(t, s, recent_sells=None, regime_kind="neutral", holdings=None):
@@ -968,8 +997,16 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
     _memory_guard(b)
     now = time.time()
     cfg = active_config()
+    signal_cfg = (cfg or {}).get("signal", {})
+    mode_cfg = (cfg or {}).get("market_data_modes", {})
+    min_buy_confidence = float(signal_cfg.get("min_buy_confidence", 55))
+    degraded_min_confidence = float(
+        mode_cfg.get("degraded_min_confidence", min_buy_confidence)
+    )
     cfg_hash = config_hash(cfg)
     no_buy_diag = _new_no_buy_diag(now, b, force=force, user_forced=user_forced)
+    no_buy_diag["min_buy_confidence"] = min_buy_confidence
+    no_buy_diag["degraded_min_confidence"] = degraded_min_confidence
     deadline_ts = (now + float(max_runtime_sec)) if max_runtime_sec else None
     collapse_diag = []
     stale_scan_skipped = False
@@ -1019,7 +1056,10 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
     no_buy_diag["checked_tickers"] = list(all_to_check)
     no_buy_diag["pa_stage_status"] = b.get("pa_stage_status")
     _raise_if_tick_deadline_exceeded(deadline_ts, b, no_buy_diag)
-    regime = get_market_regime(cfg)
+    regime, ok = _call_with_deadline(lambda: get_market_regime(cfg), deadline_ts)
+    if not ok:
+        no_buy_diag["timeout_stage"] = "market_regime"
+        _raise_tick_timeout(b, no_buy_diag)
     if regime.get("regime_v3_raw") not in (None, "fallback"):
         regime_state = b.setdefault("regime_v3_state", {})
         confirmed_v3 = apply_confirmation(
@@ -1102,10 +1142,55 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
 
     fetch_workers = 2 if PYTHONANYWHERE_MODE else 8
     _raise_if_tick_deadline_exceeded(deadline_ts, b, no_buy_diag)
-    with ThreadPoolExecutor(max_workers=fetch_workers) as ex:
-        for t, payload in ex.map(_fetch_one, list(all_to_check)):
-            sigs[t] = payload
-            _raise_if_tick_deadline_exceeded(deadline_ts, b, no_buy_diag)
+    fetch_list = list(all_to_check)
+    executor = ThreadPoolExecutor(max_workers=fetch_workers)
+    futures = {executor.submit(_fetch_one, t): t for t in fetch_list}
+    try:
+        while futures:
+            if deadline_ts is not None:
+                remaining = deadline_ts - time.time()
+                if remaining <= 0:
+                    no_buy_diag["fetch_timeout_tickers"] = list(futures.values())[:10]
+                    _raise_tick_timeout(b, no_buy_diag)
+                timeout = max(0.05, min(1.0, remaining))
+            else:
+                timeout = 1.0
+            done, _pending = wait(
+                futures,
+                timeout=timeout,
+                return_when=FIRST_COMPLETED,
+            )
+            if not done:
+                if deadline_ts is not None and time.time() >= deadline_ts:
+                    no_buy_diag["fetch_timeout_tickers"] = list(futures.values())[:10]
+                    _raise_tick_timeout(b, no_buy_diag)
+                continue
+            for fut in done:
+                expected_ticker = futures.pop(fut)
+                try:
+                    t, payload = fut.result(timeout=0)
+                except Exception as e:
+                    try:
+                        print(f"[bot-fetch-timeout-safe] {expected_ticker}: {type(e).__name__}: {e}")
+                    except Exception:
+                        pass
+                    fallback_rec = dict(get_recommendation(0.0, {}, regime=regime, config=cfg))
+                    _annotate_signal(fallback_rec)
+                    t, payload = expected_ticker, {
+                        "rec": fallback_rec,
+                        "price": 0,
+                        "stale": True,
+                        "arts": [],
+                        "ctx": {},
+                        "intra": {},
+                        "earn": {},
+                        "analyst": {},
+                        "insider": {},
+                    }
+                sigs[t] = payload
+                _raise_if_tick_deadline_exceeded(deadline_ts, b, no_buy_diag)
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
     gc.collect()
     for payload in sigs.values():
         rec = _annotate_signal(payload.get("rec") or {})
@@ -1142,7 +1227,10 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
 
     # VIX gating
     _raise_if_tick_deadline_exceeded(deadline_ts, b, no_buy_diag)
-    vix_data = get_vix()
+    vix_data, ok = _call_with_deadline(get_vix, deadline_ts)
+    if not ok:
+        no_buy_diag["timeout_stage"] = "volatility"
+        _raise_tick_timeout(b, no_buy_diag)
     vix_label = vix_data["regime"]
     vix_mult  = vix_data["mult"]
     mode_info = _market_data_mode(regime, vix_data, cfg)
@@ -1573,18 +1661,15 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
                     degraded_buys_today += 1
             except Exception:
                 pass
-    mode_cfg = (cfg or {}).get("market_data_modes", {})
     degraded_max_buys_today = int(mode_cfg.get("degraded_max_new_buys_per_day", 1))
     degraded_max_buys_per_tick = int(mode_cfg.get("degraded_max_new_buys_per_tick", 1))
     degraded_max_position_pct = float(mode_cfg.get("degraded_max_position_pct", 0.05))
     degraded_max_gross_exposure_pct = float(mode_cfg.get("degraded_max_gross_exposure_pct", 0.35))
-    degraded_min_confidence = float(mode_cfg.get("degraded_min_confidence", 65))
     no_buy_diag["buys_today"] = int(buys_today)
     no_buy_diag["max_buys_today"] = max_buys_today
     no_buy_diag["degraded_buys_today"] = int(degraded_buys_today)
     no_buy_diag["degraded_max_buys_today"] = degraded_max_buys_today
     no_buy_diag["degraded_size_mult"] = mode_cfg.get("degraded_size_mult", 0.70)
-    no_buy_diag["degraded_min_confidence"] = degraded_min_confidence
     no_buy_diag["degraded_gross_exposure_pct"] = no_buy_diag.get("gross_exposure_pct")
     no_buy_diag["degraded_max_gross_exposure_pct"] = degraded_max_gross_exposure_pct
 
@@ -1931,7 +2016,7 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
         if display not in ("BUY_CANDIDATE", "STRONG_BUY_CANDIDATE"):
             return "DEGRADED_NOT_BUY_CANDIDATE"
         if float(rec.get("confidence", 0) or 0) < degraded_min_confidence:
-            return "DEGRADED_CONFIDENCE_BELOW_65"
+            return "DEGRADED_CONFIDENCE_BELOW_MIN"
         if cand.get("trade_bucket") == "experimental":
             return "DEGRADED_EXPERIMENTAL_BLOCKED"
         if cand.get("edge_source") == "confidence_prior":
@@ -2276,7 +2361,16 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
             f"[env = regime {ec.get('regime')} × market-vol {ec.get('market_vol')} × "
             f"streak {ec.get('streak')}]"
         )
-        _record_skip(b, cd["ticker"], skip_reason, cd["signal"], cd["confidence"])
+        _record_skip(
+            b,
+            cd["ticker"],
+            skip_reason,
+            cd.get("raw_signal") or cd.get("signal"),
+            cd.get("confidence"),
+            display_signal=cd.get("display_signal"),
+            original_reason=cd.get("original_reason") or skip_reason,
+            skip_stage=cd.get("skip_stage") or "sizing_floor",
+        )
         _tag_last_decision_mode()
     if not traded and not collapse_diag:
         reasons = []
@@ -2631,7 +2725,7 @@ def _scan_snapshot():
 def run_scan():
     """Scan SCAN_UNIVERSE in parallel, build sorted leaderboard."""
     cfg = active_config()
-    regime = get_market_regime(cfg)
+    scan_deadline = time.time() + (20 if PYTHONANYWHERE_MODE else 45)
     universe = SCAN_UNIVERSE
     existing_rows = []
     if PYTHONANYWHERE_MODE:
@@ -2640,6 +2734,11 @@ def run_scan():
         rotated = SCAN_UNIVERSE[start:] + SCAN_UNIVERSE[:start]
         universe = rotated[:PA_SCAN_BATCH_SIZE]
         _scan_result["pa_next_index"] = (start + len(universe)) % len(SCAN_UNIVERSE)
+    regime, ok = _call_with_deadline(lambda: get_market_regime(cfg), scan_deadline)
+    if not ok:
+        rows = list(existing_rows) if PYTHONANYWHERE_MODE and existing_rows else []
+        rows.sort(key=lambda r: (-r["direction"], -r["confidence"], -r["score"]))
+        return rows
 
     def _scan_one(t):
         try:
@@ -2686,10 +2785,30 @@ def run_scan():
 
     rows = []
     workers = 2 if PYTHONANYWHERE_MODE else 8
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        for r in ex.map(_scan_one, universe):
-            if r is not None:
-                rows.append(r)
+    executor = ThreadPoolExecutor(max_workers=workers)
+    futures = {executor.submit(_scan_one, t): t for t in universe}
+    try:
+        while futures:
+            remaining = scan_deadline - time.time()
+            if remaining <= 0:
+                break
+            done, _pending = wait(
+                futures,
+                timeout=max(0.05, min(1.0, remaining)),
+                return_when=FIRST_COMPLETED,
+            )
+            if not done:
+                continue
+            for fut in done:
+                futures.pop(fut, None)
+                try:
+                    r = fut.result(timeout=0)
+                except Exception:
+                    r = None
+                if r is not None:
+                    rows.append(r)
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
     gc.collect()
     if PYTHONANYWHERE_MODE and existing_rows:
         merged = {r["ticker"]: r for r in existing_rows}

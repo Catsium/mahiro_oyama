@@ -259,12 +259,14 @@ def bot_tick():
         return auth
     if _bot_run_lock.locked():
         return jsonify({"status": "already_running"}), 409
-    try:
-        scan_warm_started = bool(warm_scan_if_due())
-        scan_warm_error = None
-    except Exception as e:
-        scan_warm_started = False
-        scan_warm_error = f"{type(e).__name__}: {e}"
+    scan_warm_started = False
+    scan_warm_error = None
+    if not PYTHONANYWHERE_MODE:
+        try:
+            scan_warm_started = bool(warm_scan_if_due())
+        except Exception as e:
+            scan_warm_started = False
+            scan_warm_error = f"{type(e).__name__}: {e}"
     start = time.time()
     b, traded, last_action = run_bot(
         force=True,
@@ -283,6 +285,7 @@ def bot_tick():
         "proxy_mode_active": diag.get("proxy_mode_active"),
         "degraded_mode_active": diag.get("degraded_mode_active"),
         "degraded_mode_reason": diag.get("degraded_mode_reason"),
+        "min_buy_confidence": diag.get("min_buy_confidence"),
         "degraded_size_mult": diag.get("degraded_size_mult"),
         "degraded_min_confidence": diag.get("degraded_min_confidence"),
         "degraded_reject_counts": diag.get("degraded_reject_counts", {}),
@@ -323,6 +326,12 @@ def bot_tick():
         "gross_exposure_pct": diag.get("gross_exposure_pct"),
         "buys_today": diag.get("buys_today"),
         "max_buys_today": diag.get("max_buys_today"),
+        "partial_result": diag.get("partial_result"),
+        "timeout_reason": diag.get("timeout_reason"),
+        "timeout_stage": diag.get("timeout_stage"),
+        "fetch_timeout_tickers": diag.get("fetch_timeout_tickers", []),
+        "paper_trading_locked": diag.get("paper_trading_locked"),
+        "paper_lock_reason": diag.get("paper_lock_reason"),
         "tick_runtime_seconds": diag.get("tick_runtime_seconds"),
     }
     return jsonify({

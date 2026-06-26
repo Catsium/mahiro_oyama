@@ -105,6 +105,7 @@ def api_bot_status():
             "proxy_mode_active": diag.get("proxy_mode_active"),
             "degraded_mode_active": diag.get("degraded_mode_active"),
             "degraded_mode_reason": diag.get("degraded_mode_reason"),
+            "min_buy_confidence": diag.get("min_buy_confidence"),
             "degraded_size_mult": diag.get("degraded_size_mult"),
             "degraded_min_confidence": diag.get("degraded_min_confidence"),
             "degraded_reject_counts": diag.get("degraded_reject_counts", {}),
