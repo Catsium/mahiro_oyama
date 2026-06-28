@@ -59,6 +59,8 @@ from trading.regime_v3 import (
 )
 from utils.cache import api_failure_snapshot, cache_get, cache_set, prune_cache_dir   # noqa: F401
 from utils.deploy_config import (
+    FINNHUB_KEY,
+    FMP_KEY,
     PA_SCAN_BATCH_SIZE,
     PA_TICKERS_PER_BOT_RUN,
     PYTHONANYWHERE_MODE,
@@ -117,6 +119,7 @@ REQUIRED_TICK_LOG_FIELDS = (
     "volatility_source",
     "volatility_error",
     "data_health_blocks",
+    "data_health_warnings",
     "raw_buy_count",
     "display_buy_candidate_count",
     "candidate_pool_count",
@@ -251,8 +254,10 @@ def _new_no_buy_diag(now, b, force=False, user_forced=False):
         "regime_data_fallback": None,
         "regime_data_source": None,
         "regime_data_error": None,
+        "regime_data_warnings": [],
         "spy_data_source": None,
         "spy_data_error": None,
+        "stale_daily_cache_age_hours": None,
         "regime_data_size_mult": None,
         "spy_rows": None,
         "spy_last_date": None,
@@ -268,6 +273,7 @@ def _new_no_buy_diag(now, b, force=False, user_forced=False):
         "volatility_data_error": None,
         "data_health_ok": None,
         "data_health_blocks": [],
+        "data_health_warnings": [],
         "cash": round(float(b.get("cash", 0)), 2),
         "cash_floor": None,
         "cash_available_after_floor": None,
@@ -277,6 +283,9 @@ def _new_no_buy_diag(now, b, force=False, user_forced=False):
         "buys_today": 0,
         "max_buys_today": None,
         "pa_mode": bool(PYTHONANYWHERE_MODE),
+        "finnhub_key_configured": bool(FINNHUB_KEY),
+        "fmp_key_configured": bool(FMP_KEY),
+        "stooq_status": "skipped_on_pythonanywhere" if PYTHONANYWHERE_MODE else None,
         "pa_stage_status": b.get("pa_stage_status"),
         "checked_tickers": [],
         "stale_ticker_count": 0,
@@ -406,7 +415,8 @@ def _provider_health_summary(snapshot):
         return "rate_limited"
     if any((v or {}).get("rate_limited") for v in snap.values() if isinstance(v, dict)):
         return "rate_limited"
-    if any((v or {}).get("status") == "degraded" for v in snap.values() if isinstance(v, dict)):
+    healthy_statuses = {"ok", "healthy", "skipped_on_pythonanywhere", "skipped_missing_key"}
+    if any((v or {}).get("status") not in healthy_statuses for v in snap.values() if isinstance(v, dict)):
         return "degraded"
     return "healthy"
 
@@ -1090,6 +1100,9 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
         "spy_last_close": regime.get("spy_last_close"),
         "spy_base_22_close": regime.get("spy_base_22_close"),
         "spy_mom_label": regime.get("spy_mom_label"),
+        "regime_data_source": regime.get("regime_data_source"),
+        "regime_data_warnings": regime.get("regime_data_warnings", []),
+        "stale_daily_cache_age_hours": regime.get("stale_daily_cache_age_hours"),
     }
     macro_regime_kind = regime.get("regime", "neutral")
     regime_kind = regime.get("regime_effective", macro_regime_kind)
@@ -1098,6 +1111,10 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
     no_buy_diag["regime_data_fallback"] = regime.get("regime_data_fallback")
     no_buy_diag["regime_data_source"] = regime.get("regime_data_source")
     no_buy_diag["regime_data_error"] = regime.get("regime_data_error")
+    no_buy_diag["regime_data_warnings"] = regime.get("regime_data_warnings", [])
+    no_buy_diag["data_health_warnings"] = regime.get("data_health_warnings", [])
+    no_buy_diag["stale_daily_cache_age_hours"] = regime.get("stale_daily_cache_age_hours")
+    no_buy_diag["stale_daily_cache_age_sec"] = regime.get("stale_daily_cache_age_sec")
     no_buy_diag["spy_data_source"] = regime.get("spy_data_source") or regime.get("regime_data_source")
     no_buy_diag["spy_data_error"] = regime.get("spy_data_error") or regime.get("regime_data_error")
     no_buy_diag["spy_rows"] = regime.get("spy_rows")
@@ -1215,7 +1232,7 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
     for endpoint, snap in (no_buy_diag.get("api_circuit_breakers") or {}).items():
         if snap.get("rate_limited"):
             _log_bot_event("RATE_LIMIT_HIT", endpoint=endpoint, provider_status=snap)
-        elif snap.get("status") == "degraded":
+        elif snap.get("status") not in {"ok", "healthy", "skipped_on_pythonanywhere", "skipped_missing_key"}:
             _log_bot_event("PROVIDER_DEGRADED", endpoint=endpoint, provider_status=snap)
 
     obs_updates = _update_candidate_observations(b, sigs, now)
@@ -1247,6 +1264,10 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
     no_buy_diag["volatility_value"] = vix_data.get("volatility_value", vix_data.get("vix"))
     no_buy_diag["volatility_data_error"] = vix_data.get("data_error")
     no_buy_diag["volatility_error"] = vix_data.get("data_error")
+    no_buy_diag["data_health_warnings"] = list(dict.fromkeys(
+        list(no_buy_diag.get("data_health_warnings") or [])
+        + list(vix_data.get("data_health_warnings") or [])
+    ))
     no_buy_diag["data_health_blocks"] = data_health_blocks
     no_buy_diag["data_health_ok"] = not bool(data_health_blocks)
     no_buy_diag["regime_data_size_mult"] = regime_data_size_mult
@@ -2609,6 +2630,9 @@ def _render_bot_page(read_only):
         "degraded_size_mult": no_buy.get("degraded_size_mult"),
         "degraded_min_confidence": no_buy.get("degraded_min_confidence"),
         "degraded_reject_counts": no_buy.get("degraded_reject_counts", {}),
+        "finnhub_key_configured": no_buy.get("finnhub_key_configured"),
+        "fmp_key_configured": no_buy.get("fmp_key_configured"),
+        "stooq_status": no_buy.get("stooq_status"),
         "degraded_buys_today": no_buy.get("degraded_buys_today", 0),
         "degraded_max_buys_today": no_buy.get("degraded_max_buys_today"),
         "degraded_gross_exposure_pct": no_buy.get("degraded_gross_exposure_pct"),
@@ -2639,6 +2663,7 @@ def _render_bot_page(read_only):
         "pa_stage_status": no_buy.get("pa_stage_status"),
         "data_health_ok": no_buy.get("data_health_ok"),
         "data_health_blocks": no_buy.get("data_health_blocks", []),
+        "data_health_warnings": no_buy.get("data_health_warnings", []),
         "spy_data_ok": no_buy.get("spy_data_ok"),
         "spy_data_source": no_buy.get("spy_data_source"),
         "spy_data_error": no_buy.get("spy_data_error"),
@@ -2646,6 +2671,8 @@ def _render_bot_page(read_only):
         "regime_data_fallback": no_buy.get("regime_data_fallback"),
         "regime_data_source": no_buy.get("regime_data_source"),
         "regime_data_error": no_buy.get("regime_data_error"),
+        "regime_data_warnings": no_buy.get("regime_data_warnings", []),
+        "stale_daily_cache_age_hours": no_buy.get("stale_daily_cache_age_hours"),
         "regime_data_size_mult": no_buy.get("regime_data_size_mult"),
         "vix_label": no_buy.get("vix_label"),
         "vix_value": no_buy.get("vix_value"),

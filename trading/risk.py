@@ -102,15 +102,11 @@ def get_corr_group(t):
 
 # ── Market-volatility gating (#13) ──────────────────────────────────────────
 def get_vix():
-    """Market-volatility gate. Returns {vix:float, regime:'NORMAL'|'HIGH_RISK'|
-    'PANIC', mult:float}. Cached 1 hour. Used to halt buys (PANIC) or halve sizing
-    (HIGH_RISK).
+    """Market-volatility gate using SPY realized volatility.
 
-    The old implementation read yfinance ^VIX, which is dead on PythonAnywhere free
-    (yfinance is blocked) — so it silently returned mult=1.0 forever and the gate
-    never fired. We now derive SPY 20-day annualized REALIZED volatility (%) from
-    Stooq daily bars (which work on PA) + the live Finnhub bar. The `vix` field
-    carries realized-vol %, not the VIX index — thresholds are set on that scale.
+    PythonAnywhere uses the regime daily-bar path: Finnhub first, optional FMP
+    daily fallback, then bounded stale cache. The `vix` field carries realized
+    volatility %, not the VIX index.
     """
     c = cache_get("vix", max_age=3600)
     if c is not None and "data_ok" in c and "volatility_window_days" in c:
@@ -134,6 +130,8 @@ def get_vix():
     try:
         df = _regime_daily_bars("SPY")
         if df is not None and not df.empty and len(df) >= min_bars:
+            attrs = getattr(df, "attrs", {}) or {}
+            warnings = list(attrs.get("warnings") or [])
             df = _append_live_bar(df.copy(), "SPY")
             rets = df["Close"].pct_change().dropna().tail(window)
             if len(rets) >= window:
@@ -144,6 +142,9 @@ def get_vix():
                 r["data_status"] = "ok"
                 r["source"] = "spy_realized_vol_proxy"
                 r["volatility_source"] = "spy_realized_vol_proxy"
+                r["spy_data_source"] = attrs.get("source")
+                if warnings:
+                    r["data_health_warnings"] = warnings
                 r["vix_display"] = "proxy"
                 if   rv > 28: r["regime"] = "PANIC";     r["mult"] = 0.0
                 elif rv > 18: r["regime"] = "HIGH_RISK"; r["mult"] = 0.5
@@ -214,6 +215,8 @@ def _fmt_optional_float(value, digits=1):
 
 
 def _spy_macro_fallback(status, df=None, source=None, error=None):
+    attrs = getattr(df, "attrs", {}) or {}
+    source = attrs.get("source") or source
     rows = 0
     last_date = None
     last_close = None
@@ -241,6 +244,13 @@ def _spy_macro_fallback(status, df=None, source=None, error=None):
         "spy_data_source": source,
         "spy_data_error": str(error)[:160] if error else None,
     }
+    warnings = attrs.get("warnings") or []
+    if warnings:
+        out["regime_data_warnings"] = list(warnings)
+        out["data_health_warnings"] = list(warnings)
+    if attrs.get("stale_daily_cache_age_hours") is not None:
+        out["stale_daily_cache_age_hours"] = attrs.get("stale_daily_cache_age_hours")
+        out["stale_daily_cache_age_sec"] = attrs.get("stale_daily_cache_age_sec")
     if error:
         out["regime_data_error"] = str(error)[:160]
     return out
@@ -250,6 +260,10 @@ def _spy_macro_from_df(df, source, append_live=True):
     if df is None:
         return _spy_macro_fallback("missing_spy_history", source=source)
     try:
+        attrs = getattr(df, "attrs", {}) or {}
+        source = attrs.get("source") or source
+        status = attrs.get("status") or "ok"
+        warnings = list(attrs.get("warnings") or [])
         if getattr(df, "empty", False):
             return _spy_macro_fallback("missing_spy_history", df=df, source=source)
         df = df.copy()
@@ -277,7 +291,7 @@ def _spy_macro_from_df(df, source, append_live=True):
             regime = "bear"
         else:
             regime = "neutral"
-        return {
+        out = {
             "regime": regime,
             "spy_mom_30d": mom,
             "above_ma50": above_ma50,
@@ -288,12 +302,19 @@ def _spy_macro_from_df(df, source, append_live=True):
             "spy_base_22_close": round(mom_base, 4),
             "spy_mom_lookback_bars": SPY_MOM_LOOKBACK_BARS,
             "spy_mom_label": SPY_MOM_LABEL,
-            "regime_data_status": "ok",
-            "regime_data_fallback": False,
+            "regime_data_status": status,
+            "regime_data_fallback": status != "ok",
             "regime_data_source": source,
             "spy_data_source": source,
             "spy_data_error": None,
         }
+        if warnings:
+            out["regime_data_warnings"] = warnings
+            out["data_health_warnings"] = warnings
+        if attrs.get("stale_daily_cache_age_hours") is not None:
+            out["stale_daily_cache_age_hours"] = attrs.get("stale_daily_cache_age_hours")
+            out["stale_daily_cache_age_sec"] = attrs.get("stale_daily_cache_age_sec")
+        return out
     except Exception as e:
         return _spy_macro_fallback("spy_history_error", df=df, source=source, error=e)
 
@@ -470,7 +491,7 @@ def get_market_regime(config=None):
 # ── Earnings calendar ──────────────────────────────────────────────────────
 def get_earnings_soon(tk):
     """Cached 1 hour — earnings dates don't move intraday."""
-    c = cache_get(f"earn_{tk}", max_age=3600)
+    c = cache_get(f"earn_{tk}", max_age=24 * 3600)
     if c is not None:
         return c
     r = {"soon": False, "date": None}
@@ -497,7 +518,7 @@ def get_earnings_soon(tk):
 def get_analyst_rec(tk):
     """Net analyst score (-1..+1), buy/hold/sell counts, age_hours.
     Cached 1 hour."""
-    c = cache_get(f"ar_{tk}", max_age=3600)
+    c = cache_get(f"ar_{tk}", max_age=24 * 3600)
     if c is not None:
         return c
     r = {"net": 0.0, "buy": 0, "hold": 0, "sell": 0, "total": 0, "age_hours": None}
@@ -534,7 +555,7 @@ def get_analyst_rec(tk):
 # ── Insider sentiment (Finnhub) ────────────────────────────────────────────
 def get_insider_sentiment(tk):
     """Aggregated MSPR over last 90 days, plus age_hours. Cached 1 hour."""
-    c = cache_get(f"is_{tk}", max_age=3600)
+    c = cache_get(f"is_{tk}", max_age=24 * 3600)
     if c is not None:
         return c
     r = {"sentiment": 0.0, "samples": 0, "age_hours": None}

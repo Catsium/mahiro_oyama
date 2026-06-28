@@ -44,6 +44,8 @@ def _detect_pythonanywhere():
 PYTHONANYWHERE_MODE = env_bool("PYTHONANYWHERE_MODE", _detect_pythonanywhere())
 
 FINNHUB_KEY = os.environ.get("FINNHUB_KEY", "").strip()
+FMP_KEY = (os.environ.get("FMP_KEY", "").strip()
+           or os.environ.get("FMP_API_KEY", "").strip())
 FLASK_SECRET_KEY = os.environ.get("FLASK_SECRET_KEY", "").strip()
 ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "").strip()
 

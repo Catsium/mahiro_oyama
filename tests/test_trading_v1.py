@@ -1488,9 +1488,298 @@ class PythonAnywhereHardeningTests(unittest.TestCase):
             cache._api_failures.clear()
             cache._api_failures.update(old_failures)
             cache._save_provider_health = old_save
-        self.assertEqual(snap["finnhub"]["status"], "degraded")
+        self.assertEqual(snap["finnhub"]["status"], "rate_limited")
         self.assertTrue(snap["finnhub"]["rate_limited"])
         self.assertTrue(snap["finnhub"]["rate_limit_recent"])
+
+    def test_pythonanywhere_regime_daily_skips_stooq_and_uses_finnhub_then_fmp(self):
+        import pandas as pd
+        import market.quotes as quotes
+
+        def df(source):
+            out = pd.DataFrame(
+                {"Open": [1.0], "High": [1.0], "Low": [1.0], "Close": [1.0], "Volume": [100]},
+                index=pd.to_datetime(["2026-06-26"]),
+            )
+            out.attrs["source"] = source
+            out.attrs["status"] = "ok"
+            return out
+
+        old = {
+            "PYTHONANYWHERE_MODE": quotes.PYTHONANYWHERE_MODE,
+            "_direct_stooq_daily": quotes._direct_stooq_daily,
+            "_finnhub_daily": quotes._finnhub_daily,
+            "_fmp_daily": quotes._fmp_daily,
+            "cache_get_stale": quotes.cache_get_stale,
+        }
+        calls = []
+        try:
+            quotes.PYTHONANYWHERE_MODE = True
+            quotes._direct_stooq_daily = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("Stooq must be skipped on PythonAnywhere")
+            )
+            quotes._finnhub_daily = lambda *_args, **_kwargs: calls.append("finnhub") or df("finnhub_daily")
+            quotes._fmp_daily = lambda *_args, **_kwargs: calls.append("fmp") or df("fmp_daily")
+            quotes.cache_get_stale = lambda *_args, **_kwargs: (quotes.CACHE_MISS, None)
+            out = quotes.get_regime_daily("SPY")
+            self.assertEqual(out.attrs["source"], "finnhub_daily")
+            self.assertEqual(calls, ["finnhub"])
+
+            calls.clear()
+            quotes._finnhub_daily = lambda *_args, **_kwargs: calls.append("finnhub") or None
+            quotes._fmp_daily = lambda *_args, **_kwargs: calls.append("fmp") or df("fmp_daily")
+            out = quotes.get_regime_daily("SPY")
+            self.assertEqual(out.attrs["source"], "fmp_daily")
+            self.assertEqual(calls, ["finnhub", "fmp"])
+        finally:
+            for name, value in old.items():
+                setattr(quotes, name, value)
+
+    def test_local_regime_daily_may_use_stooq_then_fallbacks(self):
+        import pandas as pd
+        import market.quotes as quotes
+
+        def df(source):
+            out = pd.DataFrame(
+                {"Open": [1.0], "High": [1.0], "Low": [1.0], "Close": [1.0], "Volume": [100]},
+                index=pd.to_datetime(["2026-06-26"]),
+            )
+            out.attrs["source"] = source
+            return out
+
+        old = {
+            "PYTHONANYWHERE_MODE": quotes.PYTHONANYWHERE_MODE,
+            "_direct_stooq_daily": quotes._direct_stooq_daily,
+            "_finnhub_daily": quotes._finnhub_daily,
+            "_fmp_daily": quotes._fmp_daily,
+        }
+        calls = []
+        try:
+            quotes.PYTHONANYWHERE_MODE = False
+            quotes._direct_stooq_daily = lambda *_args, **_kwargs: calls.append("stooq") or df("stooq_regime_daily")
+            quotes._finnhub_daily = lambda *_args, **_kwargs: calls.append("finnhub") or df("finnhub_daily")
+            quotes._fmp_daily = lambda *_args, **_kwargs: calls.append("fmp") or df("fmp_daily")
+            out = quotes.get_regime_daily("SPY")
+            self.assertEqual(out.attrs["source"], "stooq_regime_daily")
+            self.assertEqual(calls, ["stooq"])
+
+            calls.clear()
+            quotes._direct_stooq_daily = lambda *_args, **_kwargs: calls.append("stooq") or None
+            quotes._finnhub_daily = lambda *_args, **_kwargs: calls.append("finnhub") or None
+            out = quotes.get_regime_daily("SPY")
+            self.assertEqual(out.attrs["source"], "fmp_daily")
+            self.assertEqual(calls, ["stooq", "finnhub", "fmp"])
+        finally:
+            for name, value in old.items():
+                setattr(quotes, name, value)
+
+    def test_regime_daily_uses_visible_bounded_stale_cache_after_provider_failures(self):
+        import pandas as pd
+        import market.quotes as quotes
+
+        df = pd.DataFrame(
+            {"Open": [1.0], "High": [1.0], "Low": [1.0], "Close": [1.0], "Volume": [100]},
+            index=pd.to_datetime(["2026-06-26"]),
+        )
+        old = {
+            "PYTHONANYWHERE_MODE": quotes.PYTHONANYWHERE_MODE,
+            "_direct_stooq_daily": quotes._direct_stooq_daily,
+            "_finnhub_daily": quotes._finnhub_daily,
+            "_fmp_daily": quotes._fmp_daily,
+            "cache_get_stale": quotes.cache_get_stale,
+        }
+        seen = {}
+        try:
+            quotes.PYTHONANYWHERE_MODE = True
+            quotes._direct_stooq_daily = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("Stooq must be skipped on PythonAnywhere")
+            )
+            quotes._finnhub_daily = lambda *_args, **_kwargs: None
+            quotes._fmp_daily = lambda *_args, **_kwargs: None
+
+            def fake_stale(key, max_age, default):
+                seen["max_age"] = max_age
+                if key == "fh_daily_SPY":
+                    return df, 3600
+                return default, None
+
+            quotes.cache_get_stale = fake_stale
+            out = quotes.get_regime_daily("SPY")
+        finally:
+            for name, value in old.items():
+                setattr(quotes, name, value)
+        self.assertEqual(seen["max_age"], 72 * 3600)
+        self.assertEqual(out.attrs["source"], "stale_cache:finnhub_daily")
+        self.assertEqual(out.attrs["status"], "stale_cache")
+        self.assertIn("STALE_DAILY_CACHE_USED", out.attrs["warnings"])
+        self.assertEqual(out.attrs["stale_daily_cache_age_hours"], 1.0)
+
+    def test_fmp_daily_normalizes_and_marks_daily_source(self):
+        import json
+        import pandas as pd
+        import market.quotes as quotes
+
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return json.dumps([
+                    {"date": "2026-06-26", "open": "2", "high": "3", "low": "1", "close": "2.5", "volume": "200"},
+                    {"date": "2026-06-25", "open": "1", "high": "2", "low": "1", "close": "1.5", "volume": "100"},
+                    {"date": None, "close": "bad"},
+                ]).encode("utf-8")
+
+        old = {
+            "FMP_KEY": quotes.FMP_KEY,
+            "cache_get": quotes.cache_get,
+            "cache_set": quotes.cache_set,
+            "should_skip_api": quotes.should_skip_api,
+            "record_api_failure": quotes.record_api_failure,
+            "record_api_success": quotes.record_api_success,
+            "urlopen": quotes.urllib.request.urlopen,
+        }
+        saved = {}
+        requested = {}
+        try:
+            quotes.FMP_KEY = "secret-key"
+            quotes.cache_get = lambda *_args, **_kwargs: quotes.CACHE_MISS
+            quotes.cache_set = lambda key, value: saved.setdefault(key, value)
+            quotes.should_skip_api = lambda *_args, **_kwargs: False
+            quotes.record_api_failure = lambda *_args, **_kwargs: None
+            quotes.record_api_success = lambda *_args, **_kwargs: None
+            quotes.urllib.request.urlopen = lambda req, timeout=0: requested.setdefault("url", req.full_url) and Response()
+            out = quotes._fmp_daily("SPY")
+        finally:
+            for name, value in old.items():
+                if name == "urlopen":
+                    quotes.urllib.request.urlopen = value
+                else:
+                    setattr(quotes, name, value)
+        self.assertIsInstance(out, pd.DataFrame)
+        self.assertEqual(list(out.columns), ["Open", "High", "Low", "Close", "Volume"])
+        self.assertEqual(str(out.index[0].date()), "2026-06-25")
+        self.assertEqual(str(out.index[-1].date()), "2026-06-26")
+        self.assertEqual(out.attrs["source"], "fmp_daily")
+        self.assertIn("/stable/historical-price-eod/full?", requested["url"])
+        self.assertIn("symbol=SPY", requested["url"])
+        self.assertIn("fmp_daily_SPY", saved)
+
+    def test_provider_test_requires_token_and_returns_json(self):
+        import types
+        import routes.api as api
+
+        old = {
+            "require_machine_token": api.require_machine_token,
+            "request": api.request,
+            "jsonify": api.jsonify,
+            "cache_get": api.cache_get,
+            "cache_set": api.cache_set,
+            "_build_provider_test_payload": api._build_provider_test_payload,
+        }
+        try:
+            api.request = types.SimpleNamespace(args={})
+            api.require_machine_token = lambda: ("forbidden", 403)
+            self.assertEqual(api.api_provider_test(), ("forbidden", 403))
+
+            api.require_machine_token = lambda: True
+            api.jsonify = lambda obj=None, **kwargs: obj if obj is not None else kwargs
+            api.cache_get = lambda *_args, **_kwargs: None
+            api.cache_set = lambda *_args, **_kwargs: None
+            api._build_provider_test_payload = lambda: {
+                "environment": {"pythonanywhere_mode": True},
+                "providers": {},
+                "provider_circuit_state": {},
+            }
+            out = api.api_provider_test()
+        finally:
+            for name, value in old.items():
+                setattr(api, name, value)
+        self.assertIn("environment", out)
+        self.assertIn("providers", out)
+
+    def test_provider_test_continues_after_failure_and_caches(self):
+        import types
+        import routes.api as api
+
+        old = {
+            "require_machine_token": api.require_machine_token,
+            "request": api.request,
+            "jsonify": api.jsonify,
+            "cache_get": api.cache_get,
+            "cache_set": api.cache_set,
+            "_provider_test_definitions": api._provider_test_definitions,
+            "api_failure_snapshot": api.api_failure_snapshot,
+        }
+        cached = {}
+
+        def bad(_start):
+            raise RuntimeError("boom token=secret")
+
+        def good(start):
+            return {"ok": True, "status": "ok", "source": "good", "runtime_seconds": api._provider_elapsed(start)}
+
+        try:
+            api.require_machine_token = lambda: True
+            api.request = types.SimpleNamespace(args={"force": "1"})
+            api.jsonify = lambda obj=None, **kwargs: obj if obj is not None else kwargs
+            api.cache_get = lambda *_args, **_kwargs: None
+            api.cache_set = lambda key, value: cached.setdefault(key, value)
+            api.api_failure_snapshot = lambda: {}
+            api._provider_test_definitions = lambda: [
+                ("bad_provider", "bad", bad),
+                ("good_provider", "good", good),
+            ]
+            out = api.api_provider_test()
+        finally:
+            for name, value in old.items():
+                setattr(api, name, value)
+        self.assertFalse(out["providers"]["bad_provider"]["ok"])
+        self.assertEqual(out["providers"]["bad_provider"]["status"], "error")
+        self.assertNotIn("secret", out["providers"]["bad_provider"]["error"])
+        self.assertTrue(out["providers"]["good_provider"]["ok"])
+        self.assertIn(api._PROVIDER_TEST_CACHE_KEY, cached)
+
+    def test_provider_test_skips_do_not_record_failures(self):
+        import time as time_mod
+        import routes.api as api
+        import utils.cache as cache
+
+        old_api = {
+            "PYTHONANYWHERE_MODE": api.PYTHONANYWHERE_MODE,
+            "FMP_KEY": api.FMP_KEY,
+        }
+        old_failures = dict(cache._api_failures)
+        try:
+            cache._api_failures.clear()
+            api.PYTHONANYWHERE_MODE = True
+            api.FMP_KEY = ""
+            stooq = api._check_stooq_direct_spy(time_mod.time())
+            fmp = api._check_fmp_daily_spy(time_mod.time())
+            snap = cache.api_failure_snapshot()
+        finally:
+            for name, value in old_api.items():
+                setattr(api, name, value)
+            cache._api_failures.clear()
+            cache._api_failures.update(old_failures)
+        self.assertEqual(stooq["status"], "skipped_on_pythonanywhere")
+        self.assertEqual(fmp["status"], "skipped_missing_key")
+        self.assertEqual(snap, {})
+
+    def test_provider_test_path_does_not_use_executor_map(self):
+        source = Path("routes/api.py").read_text(encoding="utf-8")
+        start = source.index("def _run_provider_check(")
+        end = source.index('@app.route("/api/chart/')
+        body = source[start:end]
+        self.assertNotIn(".map(", body)
+        self.assertIn("executor.submit", body)
+        self.assertIn("return_when=FIRST_COMPLETED", body)
+        self.assertIn("shutdown(wait=False, cancel_futures=True)", body)
+        self.assertIn('_finnhub_daily("SPY", use_cache=False)', body)
+        self.assertIn('_fmp_daily("SPY", use_cache=False)', body)
 
     def test_health_route_is_passive(self):
         import routes.portfolio as portfolio
@@ -2321,7 +2610,7 @@ class PythonAnywhereHardeningTests(unittest.TestCase):
                 self.assertIn("endpoint:test", snap)
                 self.assertTrue(snap["endpoint:test"]["rate_limited"])
                 self.assertTrue(snap["endpoint:test"]["rate_limit_recent"])
-                self.assertEqual(snap["endpoint:test"]["status"], "degraded")
+                self.assertEqual(snap["endpoint:test"]["status"], "provider_error")
                 cache.record_api_success("endpoint:test")
                 self.assertFalse(cache.should_skip_api("endpoint:test", cooldown_sec=300))
 
