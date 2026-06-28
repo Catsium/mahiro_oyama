@@ -72,7 +72,7 @@ def get_news(tk):
     """News + aggregate sentiment for ticker. Tries Finnhub company_news first
     (free tier, reliable on shared IPs); falls back to yfinance.news (often
     empty since Yahoo blocked anonymous scraping)."""
-    c = cache_get(f"n_{tk}")
+    c = cache_get(f"n_{tk}", max_age=3600)
     if c is not None:
         return c
     arts, weighted_scores, weights = [], [], []

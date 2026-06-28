@@ -2,21 +2,303 @@
 /api/backtest, /api/signal_validation."""
 import re
 import time
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from datetime import date, timedelta
 from flask import jsonify, request
 
 from app import app
+from market import fh
 from market.charts import get_chart, PERIOD_MAP
+from market.quotes import _direct_stooq_daily as _provider_stq_daily
+from market.quotes import _finnhub_daily, _fmp_daily
 from trading.bot import BOT_MAX_BUYS
 from trading.attribution import summarize_attribution
 from trading.config import active_config, config_hash
 from trading.indicators import _ctx_from_series
 from trading.signals import get_recommendation
 from trading.sizing import slippage_bps, SLIPPAGE_BPS
-from utils.auth import require_admin_token
-from utils.cache import api_failure_snapshot, cache_get
-from utils.deploy_config import PYTHONANYWHERE_MODE
+from utils.auth import require_admin_token, require_machine_token
+from utils.cache import api_failure_snapshot, cache_get, cache_set, sanitize_provider_error
+from utils.deploy_config import FINNHUB_KEY, FMP_KEY, PERSISTENT_CACHE, PYTHONANYWHERE_MODE
 from utils.storage import load_bot, load_tickers
 from utils.threading_utils import _BOT_STATUS
+
+PROVIDER_TEST_MAX_RUNTIME_SEC = 15
+PROVIDER_TEST_PER_PROVIDER_TIMEOUT_SEC = 3
+PROVIDER_TEST_CACHE_SEC = 60
+_PROVIDER_TEST_CACHE_KEY = "provider_test:v1"
+
+
+def _provider_elapsed(start):
+    return round(max(0.0, time.time() - start), 3)
+
+
+def _provider_skipped(source, status, reason):
+    return {
+        "ok": False,
+        "status": status,
+        "source": source,
+        "reason": reason,
+        "runtime_seconds": 0.0,
+    }
+
+
+def _provider_error(source, start, error, status="error"):
+    return {
+        "ok": False,
+        "status": status,
+        "runtime_seconds": _provider_elapsed(start),
+        "source": source,
+        "error_type": type(error).__name__,
+        "error": sanitize_provider_error(error),
+    }
+
+
+def _provider_df_result(source, start, df):
+    if df is None or getattr(df, "empty", True):
+        return {
+            "ok": False,
+            "status": "empty_response",
+            "runtime_seconds": _provider_elapsed(start),
+            "source": source,
+            "rows": 0,
+        }
+    try:
+        latest_date = str(df.index[-1].date())
+    except Exception:
+        latest_date = None
+    return {
+        "ok": True,
+        "status": "ok",
+        "runtime_seconds": _provider_elapsed(start),
+        "source": getattr(df, "attrs", {}).get("source") or source,
+        "rows": int(len(df)),
+        "latest_date": latest_date,
+    }
+
+
+def _run_provider_check(source, fn, deadline_ts):
+    start = time.time()
+    remaining = min(
+        PROVIDER_TEST_PER_PROVIDER_TIMEOUT_SEC,
+        max(0.0, float(deadline_ts or start) - start),
+    )
+    if remaining <= 0:
+        return {
+            "ok": False,
+            "status": "timeout",
+            "runtime_seconds": 0.0,
+            "source": source,
+            "error_type": "TimeoutError",
+            "error": "provider-test overall timeout budget exhausted",
+        }
+    executor = ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(fn, start)
+    try:
+        done, _pending = wait(
+            {future},
+            timeout=max(0.05, remaining),
+            return_when=FIRST_COMPLETED,
+        )
+        if future not in done:
+            return {
+                "ok": False,
+                "status": "timeout",
+                "runtime_seconds": _provider_elapsed(start),
+                "source": source,
+                "error_type": "TimeoutError",
+                "error": "provider test timed out",
+            }
+        result = future.result(timeout=0)
+        if not isinstance(result, dict):
+            return {
+                "ok": False,
+                "status": "provider_error",
+                "runtime_seconds": _provider_elapsed(start),
+                "source": source,
+                "error_type": "TypeError",
+                "error": "provider test returned a non-object result",
+            }
+        result.setdefault("ok", False)
+        result.setdefault("status", "provider_error" if not result.get("ok") else "ok")
+        result.setdefault("source", source)
+        result.setdefault("runtime_seconds", _provider_elapsed(start))
+        return result
+    except Exception as e:
+        return _provider_error(source, start, e)
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+
+
+def _check_finnhub_quote_spy(start):
+    if not FINNHUB_KEY:
+        return _provider_skipped("finnhub", "skipped_missing_key", "FINNHUB_KEY is not configured")
+    q = fh.quote("SPY") or {}
+    price = q.get("c") or q.get("price") or 0
+    if price and float(price) > 0:
+        return {
+            "ok": True,
+            "status": "ok",
+            "runtime_seconds": _provider_elapsed(start),
+            "source": "finnhub",
+            "price": float(price),
+        }
+    return {
+        "ok": False,
+        "status": "empty_response",
+        "runtime_seconds": _provider_elapsed(start),
+        "source": "finnhub",
+        "price": price,
+    }
+
+
+def _check_finnhub_daily_spy(start):
+    if not FINNHUB_KEY:
+        return _provider_skipped("finnhub", "skipped_missing_key", "FINNHUB_KEY is not configured")
+    return _provider_df_result("finnhub", start, _finnhub_daily("SPY", use_cache=False))
+
+
+def _check_finnhub_news_aapl(start):
+    if not FINNHUB_KEY:
+        return _provider_skipped("finnhub", "skipped_missing_key", "FINNHUB_KEY is not configured")
+    today = date.today()
+    raw = fh.company_news(
+        "AAPL",
+        _from=(today - timedelta(days=7)).strftime("%Y-%m-%d"),
+        to=today.strftime("%Y-%m-%d"),
+    ) or []
+    return {
+        "ok": True,
+        "status": "ok",
+        "runtime_seconds": _provider_elapsed(start),
+        "source": "finnhub",
+        "count": len(raw) if isinstance(raw, list) else 0,
+    }
+
+
+def _check_finnhub_earnings_aapl(start):
+    if not FINNHUB_KEY:
+        return _provider_skipped("finnhub", "skipped_missing_key", "FINNHUB_KEY is not configured")
+    today = date.today()
+    data = fh.earnings_calendar(
+        _from=today.strftime("%Y-%m-%d"),
+        to=(today + timedelta(days=5)).strftime("%Y-%m-%d"),
+        symbol="AAPL",
+    ) or {}
+    rows = data.get("earningsCalendar") or []
+    return {
+        "ok": True,
+        "status": "ok",
+        "runtime_seconds": _provider_elapsed(start),
+        "source": "finnhub",
+        "count": len(rows) if isinstance(rows, list) else 0,
+        "available": isinstance(rows, list),
+    }
+
+
+def _check_finnhub_analyst_aapl(start):
+    if not FINNHUB_KEY:
+        return _provider_skipped("finnhub", "skipped_missing_key", "FINNHUB_KEY is not configured")
+    rows = fh.recommendation_trends("AAPL") or []
+    return {
+        "ok": True,
+        "status": "ok",
+        "runtime_seconds": _provider_elapsed(start),
+        "source": "finnhub",
+        "count": len(rows) if isinstance(rows, list) else 0,
+    }
+
+
+def _check_finnhub_insider_aapl(start):
+    if not FINNHUB_KEY:
+        return _provider_skipped("finnhub", "skipped_missing_key", "FINNHUB_KEY is not configured")
+    today = date.today()
+    data = fh.stock_insider_sentiment(
+        symbol="AAPL",
+        _from=(today - timedelta(days=90)).strftime("%Y-%m-%d"),
+        to=today.strftime("%Y-%m-%d"),
+    ) or {}
+    rows = data.get("data") or []
+    return {
+        "ok": True,
+        "status": "ok",
+        "runtime_seconds": _provider_elapsed(start),
+        "source": "finnhub",
+        "available": isinstance(rows, list),
+        "count": len(rows) if isinstance(rows, list) else 0,
+    }
+
+
+def _check_stooq_direct_spy(start):
+    if PYTHONANYWHERE_MODE:
+        return _provider_skipped(
+            "stooq",
+            "skipped_on_pythonanywhere",
+            "Stooq is not used in PythonAnywhere free mode",
+        )
+    return _provider_df_result(
+        "stooq",
+        start,
+        _provider_stq_daily("SPY", cache_prefix="provider_test_stooq"),
+    )
+
+
+def _check_fmp_daily_spy(start):
+    if not FMP_KEY:
+        return _provider_skipped("fmp", "skipped_missing_key", "FMP_KEY/FMP_API_KEY is not configured")
+    return _provider_df_result("fmp", start, _fmp_daily("SPY", use_cache=False))
+
+
+def _provider_test_definitions():
+    return [
+        ("finnhub_quote_SPY", "finnhub", _check_finnhub_quote_spy),
+        ("finnhub_daily_SPY", "finnhub", _check_finnhub_daily_spy),
+        ("finnhub_news_AAPL", "finnhub", _check_finnhub_news_aapl),
+        ("finnhub_earnings_AAPL", "finnhub", _check_finnhub_earnings_aapl),
+        ("finnhub_analyst_AAPL", "finnhub", _check_finnhub_analyst_aapl),
+        ("finnhub_insider_AAPL", "finnhub", _check_finnhub_insider_aapl),
+        ("stooq_direct_SPY", "stooq", _check_stooq_direct_spy),
+        ("fmp_daily_SPY", "fmp", _check_fmp_daily_spy),
+    ]
+
+
+def _build_provider_test_payload():
+    start_ts = time.time()
+    deadline_ts = start_ts + PROVIDER_TEST_MAX_RUNTIME_SEC
+    providers = {}
+    for name, source, fn in _provider_test_definitions():
+        providers[name] = _run_provider_check(source, fn, deadline_ts)
+    return {
+        "environment": {
+            "pythonanywhere_mode": bool(PYTHONANYWHERE_MODE),
+            "persistent_cache": bool(PERSISTENT_CACHE),
+            "finnhub_key_configured": bool(FINNHUB_KEY),
+            "fmp_key_configured": bool(FMP_KEY),
+        },
+        "providers": providers,
+        "provider_circuit_state": api_failure_snapshot(),
+        "runtime_seconds": round(time.time() - start_ts, 3),
+        "max_runtime_seconds": PROVIDER_TEST_MAX_RUNTIME_SEC,
+        "per_provider_timeout_seconds": PROVIDER_TEST_PER_PROVIDER_TIMEOUT_SEC,
+    }
+
+
+@app.route("/api/provider-test")
+def api_provider_test():
+    auth = require_machine_token()
+    if auth is not True:
+        return auth
+    force = str(request.args.get("force") or "").lower() in {"1", "true", "yes", "on"}
+    if not force:
+        cached = cache_get(_PROVIDER_TEST_CACHE_KEY, max_age=PROVIDER_TEST_CACHE_SEC)
+        if isinstance(cached, dict):
+            out = dict(cached)
+            out["cached"] = True
+            return jsonify(out)
+    out = _build_provider_test_payload()
+    out["cached"] = False
+    cache_set(_PROVIDER_TEST_CACHE_KEY, out)
+    return jsonify(out)
 
 
 @app.route("/api/chart/<ticker>/<rng>")
@@ -86,7 +368,11 @@ def api_bot_status():
     if not provider_health_status:
         if rate_limit_recent or any((snap or {}).get("rate_limited") for snap in api_breakers.values() if isinstance(snap, dict)):
             provider_health_status = "rate_limited"
-        elif any((snap or {}).get("status") == "degraded" for snap in api_breakers.values() if isinstance(snap, dict)):
+        elif any(
+            (snap or {}).get("status") not in {"ok", "healthy", "skipped_on_pythonanywhere", "skipped_missing_key"}
+            for snap in api_breakers.values()
+            if isinstance(snap, dict)
+        ):
             provider_health_status = "degraded"
         else:
             provider_health_status = "healthy"
@@ -109,6 +395,9 @@ def api_bot_status():
             "degraded_size_mult": diag.get("degraded_size_mult"),
             "degraded_min_confidence": diag.get("degraded_min_confidence"),
             "degraded_reject_counts": diag.get("degraded_reject_counts", {}),
+            "finnhub_key_configured": diag.get("finnhub_key_configured", bool(FINNHUB_KEY)),
+            "fmp_key_configured": diag.get("fmp_key_configured", bool(FMP_KEY)),
+            "stooq_status": diag.get("stooq_status"),
             "degraded_buys_today": diag.get("degraded_buys_today", 0),
             "degraded_max_buys_today": diag.get("degraded_max_buys_today"),
             "degraded_gross_exposure_pct": diag.get("degraded_gross_exposure_pct"),
@@ -139,6 +428,7 @@ def api_bot_status():
             "pa_stage_status": diag.get("pa_stage_status"),
             "data_health_ok": diag.get("data_health_ok"),
             "data_health_blocks": diag.get("data_health_blocks", []),
+            "data_health_warnings": diag.get("data_health_warnings", []),
             "spy_data_ok": diag.get("spy_data_ok"),
             "spy_data_source": diag.get("spy_data_source"),
             "spy_data_error": diag.get("spy_data_error"),
@@ -147,6 +437,8 @@ def api_bot_status():
             "regime_fallback_active": diag.get("regime_fallback_active", diag.get("regime_data_fallback")),
             "regime_data_source": diag.get("regime_data_source"),
             "regime_data_error": diag.get("regime_data_error"),
+            "regime_data_warnings": diag.get("regime_data_warnings", []),
+            "stale_daily_cache_age_hours": diag.get("stale_daily_cache_age_hours"),
             "regime_data_size_mult": diag.get("regime_data_size_mult"),
             "vix_label": diag.get("vix_label"),
             "vix_value": diag.get("vix_value"),
@@ -171,6 +463,7 @@ def api_bot_status():
             "paper_trading_locked": diag.get("paper_trading_locked"),
             "paper_lock_reason": diag.get("paper_lock_reason"),
             "tick_runtime_seconds": diag.get("tick_runtime_seconds"),
+            "runtime_seconds": diag.get("tick_runtime_seconds"),
             "checked_tickers": diag.get("checked_tickers", []),
             "traded": diag.get("traded", False),
             "ts": diag.get("ts"),

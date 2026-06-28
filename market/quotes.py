@@ -2,16 +2,23 @@
 import time
 from datetime import datetime, timedelta
 from io import StringIO
+import json
+import urllib.parse
+import urllib.request
 
 import pandas as pd
 
 from market import fh
 from market.data_manager import get_daily as _managed_daily
 from utils.cache import (
-    CACHE_MISS, cache_get, cache_set, record_api_failure, record_api_success, should_skip_api,
+    CACHE_MISS, cache_get, cache_get_stale, cache_set, record_api_failure, record_api_success,
+    sanitize_provider_error, should_skip_api,
 )
-from utils.deploy_config import PYTHONANYWHERE_MODE
+from utils.deploy_config import FMP_KEY, PYTHONANYWHERE_MODE
 from utils.storage import load_price_hist, append_price_snapshot
+
+REGIME_STALE_CACHE_MAX_HOURS = 72
+REGIME_STALE_CACHE_MAX_SEC = REGIME_STALE_CACHE_MAX_HOURS * 3600
 
 
 def record_price(tk, price):
@@ -26,7 +33,11 @@ def _direct_stooq_daily(tk, full=False, cache_prefix="stooq"):
     cache_key = f"{cache_prefix}_full_{tk}" if full else f"{cache_prefix}_{tk}"
     c = cache_get(cache_key, max_age=300, default=CACHE_MISS)
     if c is not CACHE_MISS:
-        return c if isinstance(c, pd.DataFrame) and not c.empty else None
+        if isinstance(c, pd.DataFrame) and not c.empty:
+            c.attrs.setdefault("source", f"{cache_prefix}_daily")
+            c.attrs.setdefault("status", "ok")
+            return c
+        return None
     try:
         import urllib.request
 
@@ -53,6 +64,8 @@ def _direct_stooq_daily(tk, full=False, cache_prefix="stooq"):
             return None
         if not full:
             df = df.tail(400)
+        df.attrs["source"] = f"{cache_prefix}_daily"
+        df.attrs["status"] = "ok"
         cache_set(cache_key, df)
         record_api_success(endpoint)
         return df
@@ -66,22 +79,27 @@ def _direct_stooq_daily(tk, full=False, cache_prefix="stooq"):
         return None
 
 
-def _finnhub_daily(tk, full=False):
+def _finnhub_daily(tk, full=False, use_cache=True):
     """Daily OHLCV from Finnhub candles. Primary PA free-tier history source."""
     endpoint = f"finnhub_daily:{tk}:{int(bool(full))}"
     if should_skip_api(endpoint):
         return None
     cache_key = f"fh_daily_full_{tk}" if full else f"fh_daily_{tk}"
-    c = cache_get(cache_key, max_age=6 * 3600, default=CACHE_MISS)
-    if c is not CACHE_MISS:
-        return c if isinstance(c, pd.DataFrame) and not c.empty else None
+    if use_cache:
+        c = cache_get(cache_key, max_age=6 * 3600, default=CACHE_MISS)
+        if c is not CACHE_MISS:
+            if isinstance(c, pd.DataFrame) and not c.empty:
+                c.attrs.setdefault("source", "finnhub_daily")
+                c.attrs.setdefault("status", "ok")
+                return c
+            return None
     try:
         end = int(time.time())
         days = 3650 if full else 600
         start = int((datetime.utcnow() - timedelta(days=days)).timestamp())
         raw = fh.stock_candles(tk, "D", start, end) or {}
         if raw.get("s") != "ok" or not raw.get("c"):
-            cache_set(cache_key, None)
+            record_api_failure(endpoint, "empty Finnhub daily candles", status="empty_response")
             return None
         df = pd.DataFrame({
             "Open": raw.get("o", []),
@@ -93,11 +111,14 @@ def _finnhub_daily(tk, full=False):
         df.index.name = "Date"
         df = df.apply(pd.to_numeric, errors="coerce").dropna(subset=["Close"])
         if df.empty:
-            cache_set(cache_key, None)
+            record_api_failure(endpoint, "empty Finnhub daily frame", status="empty_response")
             return None
         if not full:
             df = df.tail(400)
-        cache_set(cache_key, df)
+        df.attrs["source"] = "finnhub_daily"
+        df.attrs["status"] = "ok"
+        if use_cache:
+            cache_set(cache_key, df)
         record_api_success(endpoint)
         return df
     except Exception as e:
@@ -105,7 +126,90 @@ def _finnhub_daily(tk, full=False):
             print(f"[finnhub-daily] {tk} failed: {type(e).__name__}: {e}")
         except Exception:
             pass
-        cache_set(cache_key, None)
+        record_api_failure(endpoint, e)
+        return None
+
+
+def _fmp_daily(tk, full=False, use_cache=True):
+    """
+    Daily OHLCV from Financial Modeling Prep.
+
+    This is a daily/history fallback only; it is not a quote, news, or intraday
+    provider for live trading ticks.
+    """
+    if not FMP_KEY:
+        return None
+    endpoint = f"fmp_daily:{tk}:{int(bool(full))}"
+    if should_skip_api(endpoint):
+        return None
+    cache_key = f"fmp_daily_full_{tk}" if full else f"fmp_daily_{tk}"
+    if use_cache:
+        c = cache_get(cache_key, max_age=6 * 3600, default=CACHE_MISS)
+        if c is not CACHE_MISS:
+            if isinstance(c, pd.DataFrame) and not c.empty:
+                c.attrs.setdefault("source", "fmp_daily")
+                c.attrs.setdefault("status", "ok")
+                return c
+            return None
+    try:
+        params = urllib.parse.urlencode({"symbol": str(tk).upper(), "apikey": FMP_KEY})
+        url = f"https://financialmodelingprep.com/stable/historical-price-eod/full?{params}"
+        req = urllib.request.Request(url, headers={"User-Agent": "stock-tracker/1.0"})
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            payload = json.loads(resp.read().decode("utf-8", errors="ignore") or "null")
+
+        rows = payload
+        if isinstance(payload, dict):
+            rows = (
+                payload.get("historical")
+                or payload.get("data")
+                or payload.get("results")
+                or payload.get("historicalPriceFull")
+                or []
+            )
+            if isinstance(rows, dict):
+                rows = rows.get("historical") or rows.get("data") or []
+        if not isinstance(rows, list) or not rows:
+            record_api_failure(endpoint, "empty FMP daily response", status="empty_response")
+            return None
+
+        normalized = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            normalized.append({
+                "Date": row.get("date") or row.get("Date"),
+                "Open": row.get("open") if row.get("open") is not None else row.get("Open"),
+                "High": row.get("high") if row.get("high") is not None else row.get("High"),
+                "Low": row.get("low") if row.get("low") is not None else row.get("Low"),
+                "Close": row.get("close") if row.get("close") is not None else row.get("Close"),
+                "Volume": row.get("volume") if row.get("volume") is not None else row.get("Volume"),
+            })
+
+        df = pd.DataFrame(normalized)
+        if df.empty or "Date" not in df.columns:
+            record_api_failure(endpoint, "empty FMP daily frame", status="empty_response")
+            return None
+        df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+        for col in ("Open", "High", "Low", "Close", "Volume"):
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        df = df.dropna(subset=["Date", "Close"]).set_index("Date").sort_index()
+        if df.empty:
+            record_api_failure(endpoint, "empty FMP daily normalized frame", status="empty_response")
+            return None
+        if not full:
+            df = df.tail(400)
+        df.attrs["source"] = "fmp_daily"
+        df.attrs["status"] = "ok"
+        if use_cache:
+            cache_set(cache_key, df)
+        record_api_success(endpoint)
+        return df
+    except Exception as e:
+        try:
+            print(f"[fmp-daily] {tk} failed: {type(e).__name__}: {sanitize_provider_error(e)}")
+        except Exception:
+            pass
         record_api_failure(endpoint, e)
         return None
 
@@ -119,11 +223,62 @@ def _raw_daily(tk, full=False):
 
 
 def get_regime_daily(tk, full=False):
-    """Regime symbols use Stooq first, then Finnhub."""
+    """
+    Return daily bars for regime/proxy symbols.
+
+    PythonAnywhere free skips Stooq entirely, uses Finnhub first, then optional
+    FMP daily fallback, then a visibly stale successful cache within 72 hours.
+    Local/off-PA may use Stooq first with Finnhub/FMP fallback.
+    """
+    def _ok(df):
+        return df is not None and isinstance(df, pd.DataFrame) and not df.empty
+
+    def _stale_cache():
+        for source, cache_key in (
+            ("finnhub_daily", f"fh_daily_full_{tk}" if full else f"fh_daily_{tk}"),
+            ("fmp_daily", f"fmp_daily_full_{tk}" if full else f"fmp_daily_{tk}"),
+        ):
+            cached, age_sec = cache_get_stale(
+                cache_key,
+                REGIME_STALE_CACHE_MAX_SEC,
+                default=CACHE_MISS,
+            )
+            if isinstance(cached, pd.DataFrame) and not cached.empty:
+                stale = cached.copy(deep=False)
+                stale.attrs.update({
+                    "source": f"stale_cache:{source}",
+                    "status": "stale_cache",
+                    "warnings": ["STALE_DAILY_CACHE_USED"],
+                    "stale_daily_cache_age_sec": int(age_sec or 0),
+                    "stale_daily_cache_age_hours": round(float(age_sec or 0) / 3600.0, 2),
+                })
+                return stale
+        return None
+
+    if PYTHONANYWHERE_MODE:
+        df = _finnhub_daily(tk, full=full)
+        if _ok(df):
+            return df
+
+        df = _fmp_daily(tk, full=full)
+        if _ok(df):
+            return df
+
+        return _stale_cache()
+
     df = _direct_stooq_daily(tk, full=full, cache_prefix="stooq_regime")
-    if df is not None and not df.empty:
+    if _ok(df):
         return df
-    return _finnhub_daily(tk, full=full)
+
+    df = _finnhub_daily(tk, full=full)
+    if _ok(df):
+        return df
+
+    df = _fmp_daily(tk, full=full)
+    if _ok(df):
+        return df
+
+    return None
 
 
 def _stooq_daily(tk, full=False):

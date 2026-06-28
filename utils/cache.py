@@ -53,6 +53,37 @@ def _looks_rate_limited(error):
     return "429" in text or "rate limit" in text or "too many requests" in text
 
 
+def sanitize_provider_error(error):
+    """Return a bounded provider error string with obvious secret material removed."""
+    if error is None:
+        return None
+    text = str(error)
+    text = re.sub(r"(?i)(apikey|api_key|token|key)=([^&\s]+)", r"\1=<redacted>", text)
+    text = re.sub(
+        r"(?i)\b(FINNHUB_KEY|FMP_KEY|FMP_API_KEY|ADMIN_TOKEN)\b\s*=?\s*[^&\s]+",
+        r"\1=<redacted>",
+        text,
+    )
+    return text[:300]
+
+
+def _classify_provider_status(error=None, status=None):
+    if status:
+        return str(status)
+    text = str(error or "").lower()
+    if _looks_rate_limited(error):
+        return "rate_limited"
+    if "403" in text or "forbidden" in text or "blocked" in text:
+        return "blocked_or_forbidden"
+    if "timeout" in text or "timed out" in text:
+        return "timeout"
+    if "empty" in text or "no data" in text:
+        return "empty_response"
+    if "parse" in text or "jsondecode" in text or "decode" in text:
+        return "parse_error"
+    return "provider_error"
+
+
 _api_failures.update(_load_provider_health())
 
 
@@ -110,6 +141,38 @@ def cache_get(k, max_age=None, default=None):
     return default
 
 
+def cache_get_stale(k, max_age, default=CACHE_MISS):
+    """Return a successful cached value and age even after its normal TTL expires."""
+    now = time.time()
+    with _cache_lock:
+        e = _cache.get(k)
+        if e and e[0] is not None:
+            age = now - float(e[1] or 0)
+            if PERSISTENT_CACHE:
+                try:
+                    age = max(age, now - os.path.getmtime(_cache_path(k)))
+                except Exception:
+                    pass
+            if age <= float(max_age or 0):
+                return e[0], age
+    if not PERSISTENT_CACHE:
+        return default, None
+    try:
+        path = _cache_path(k)
+        age = now - os.path.getmtime(path)
+        if age > float(max_age or 0):
+            return default, None
+        with open(path, "rb") as f:
+            value = pickle.load(f)
+        if value is None:
+            return default, None
+        with _cache_lock:
+            _cache[k] = (value, now - age)
+        return value, age
+    except Exception:
+        return default, None
+
+
 def cache_set(k, v):
     with _cache_lock:
         _cache[k] = (v, time.time())
@@ -157,6 +220,8 @@ def should_skip_api(endpoint, cooldown_sec=300, failure_threshold=3):
         rec = _api_failures.get(key)
         if not rec:
             return False
+        if rec.get("status") in {"ok", "healthy", "skipped_on_pythonanywhere", "skipped_missing_key"}:
+            return False
         now = time.time()
         recent = [
             float(ts) for ts in (rec.get("failures") or [])
@@ -171,8 +236,19 @@ def should_skip_api(endpoint, cooldown_sec=300, failure_threshold=3):
         return now - rec.get("ts", 0) < float(cooldown_sec or 0)
 
 
-def record_api_failure(endpoint, error=None):
+def record_api_failure(endpoint, error=None, status=None):
     key = str(endpoint or "")
+    resolved_status = _classify_provider_status(error, status)
+    if resolved_status in {"skipped_on_pythonanywhere", "skipped_missing_key"}:
+        return {
+            "count": 0,
+            "ts": time.time(),
+            "failures": [],
+            "status": resolved_status,
+            "rate_limited": False,
+            "last_error": sanitize_provider_error(error),
+            "persisted": True,
+        }
     with _cache_lock:
         now = time.time()
         rec = _api_failures.setdefault(key, {"count": 0, "ts": 0, "failures": []})
@@ -184,9 +260,9 @@ def record_api_failure(endpoint, error=None):
         rec["failures"] = failures[-20:]
         rec["count"] = len(rec["failures"])
         rec["ts"] = now
-        rec["last_error"] = str(error)[:160] if error is not None else rec.get("last_error")
-        rec["rate_limited"] = bool(_looks_rate_limited(error) or rec.get("rate_limited"))
-        rec["status"] = "degraded"
+        rec["last_error"] = sanitize_provider_error(error) if error is not None else rec.get("last_error")
+        rec["rate_limited"] = bool(resolved_status == "rate_limited" or rec.get("rate_limited"))
+        rec["status"] = resolved_status
         rec["persisted"] = _save_provider_health()
     return rec
 
@@ -199,7 +275,7 @@ def record_api_success(endpoint):
             "count": 0,
             "failures": [],
             "ts": time.time(),
-            "status": "healthy",
+            "status": "ok",
             "rate_limited": False,
             "last_error": None,
         })
@@ -219,7 +295,8 @@ def api_failure_snapshot():
                 "persisted": bool(rec.get("persisted", True)),
             }
             for key, rec in _api_failures.items()
-            if rec.get("status") != "healthy" or int(rec.get("count", 0) or 0) > 0
+            if rec.get("status") not in {"ok", "healthy", "skipped_on_pythonanywhere", "skipped_missing_key"}
+            or int(rec.get("count", 0) or 0) > 0
         }
         for rec in snapshot.values():
             rec["rate_limit_recent"] = bool(rec.get("rate_limited") and rec.get("age_sec", 0) <= 600)

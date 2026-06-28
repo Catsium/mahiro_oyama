@@ -19,7 +19,7 @@ from trading.risk import get_market_regime
 from trading.suggestion_store import record_suggestion_feedback
 from utils.auth import require_admin_token, require_machine_token
 from utils.config import BOT_ENABLED
-from utils.deploy_config import FINNHUB_KEY, PERSISTENT_CACHE, PYTHONANYWHERE_MODE
+from utils.deploy_config import FINNHUB_KEY, FMP_KEY, PERSISTENT_CACHE, PYTHONANYWHERE_MODE
 from utils.storage import (
     acquire_bot_file_lock, load_tickers, save_tickers, save_bot, load_bot,
     SUGGESTION_DB_FILE,
@@ -289,14 +289,22 @@ def bot_tick():
         "degraded_size_mult": diag.get("degraded_size_mult"),
         "degraded_min_confidence": diag.get("degraded_min_confidence"),
         "degraded_reject_counts": diag.get("degraded_reject_counts", {}),
+        "finnhub_key_configured": diag.get("finnhub_key_configured", bool(FINNHUB_KEY)),
+        "fmp_key_configured": diag.get("fmp_key_configured", bool(FMP_KEY)),
+        "stooq_status": diag.get("stooq_status"),
         "data_health_ok": diag.get("data_health_ok"),
         "data_health_blocks": diag.get("data_health_blocks", []),
+        "data_health_warnings": diag.get("data_health_warnings", []),
         "spy_data_ok": diag.get("spy_data_ok"),
         "spy_data_source": diag.get("spy_data_source"),
         "spy_data_error": diag.get("spy_data_error"),
+        "spy_rows": diag.get("spy_rows"),
+        "spy_last_date": diag.get("spy_last_date"),
         "regime_data_status": diag.get("regime_data_status"),
         "regime_data_source": diag.get("regime_data_source"),
         "regime_data_error": diag.get("regime_data_error"),
+        "regime_data_warnings": diag.get("regime_data_warnings", []),
+        "stale_daily_cache_age_hours": diag.get("stale_daily_cache_age_hours"),
         "vix_label": diag.get("vix_label"),
         "vix_value": diag.get("vix_value"),
         "vix_data_ok": diag.get("vix_data_ok"),
@@ -333,6 +341,7 @@ def bot_tick():
         "paper_trading_locked": diag.get("paper_trading_locked"),
         "paper_lock_reason": diag.get("paper_lock_reason"),
         "tick_runtime_seconds": diag.get("tick_runtime_seconds"),
+        "runtime_seconds": diag.get("tick_runtime_seconds"),
     }
     return jsonify({
         "status": diag.get("main_blocker") or last_action or "complete",
@@ -346,6 +355,7 @@ def bot_tick():
             "pythonanywhere_mode": bool(PYTHONANYWHERE_MODE),
             "persistent_cache": bool(PERSISTENT_CACHE),
             "finnhub_key_configured": bool(FINNHUB_KEY),
+            "fmp_key_configured": bool(FMP_KEY),
         },
         "last_no_buy_diagnostics": diagnostics,
     })
