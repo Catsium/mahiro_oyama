@@ -2376,6 +2376,93 @@ class PythonAnywhereHardeningTests(unittest.TestCase):
         self.assertNotIn("bot_file_path", str(out))
         self.assertNotIn("storage_base_dir", str(out))
 
+    def test_profit_calendar_aggregates_equity_and_trades_by_month(self):
+        import app as _app  # noqa: F401
+        import routes.api as api
+        from datetime import datetime
+
+        def ts(day, hour, minute=0):
+            return int(datetime(2026, 6, day, hour, minute, tzinfo=api.BOT_CALENDAR_TZ).timestamp())
+
+        payload = api.build_profit_calendar_payload({
+            "equity_history": [
+                [ts(3, 9, 30), 10000.00, 0.0, [["AAPL", 2, 101.0]], False],
+                [ts(3, 15, 59), 10075.00, 0.75, [["AAPL", 2, 102.5], ["MSFT", 1, 300.0]], False],
+                [ts(4, 9, 30), 10075.00, 0.75, [], False],
+                [ts(4, 15, 59), 10050.00, 0.5, [], False],
+            ],
+            "history": [
+                {"action": "BUY", "ticker": "AAPL", "shares": 2, "price": 101.0, "ts": ts(3, 10), "time_et": "Jun 03 10:00"},
+                {"action": "SELL", "ticker": "MSFT", "shares": 1, "price": 300.0, "pnl_usd": 5.0, "ts": ts(3, 14), "time_et": "Jun 03 14:00"},
+                {"action": "BUY", "ticker": "OLD", "shares": 1, "price": 1.0, "time": "06/01 09:30"},
+            ],
+            "holdings": {},
+        }, 2026, 6)
+
+        day3 = payload["days"][2]
+        self.assertEqual(day3["date"], "2026-06-03")
+        self.assertEqual(day3["status"], "profit")
+        self.assertEqual(day3["pnl_usd"], 75.0)
+        self.assertEqual(day3["pnl_pct"], 0.75)
+        self.assertEqual(day3["holdings"], ["AAPL", "MSFT"])
+        self.assertEqual(day3["trades_opened"], 1)
+        self.assertEqual(day3["trades_closed"], 1)
+
+        day4 = payload["days"][3]
+        self.assertEqual(day4["status"], "loss")
+        self.assertEqual(day4["pnl_usd"], -25.0)
+        self.assertIn("Holdings snapshot unavailable", day4["note"])
+
+        self.assertEqual(payload["summary"]["monthly_pnl_usd"], 50.0)
+        self.assertEqual(payload["summary"]["win_days"], 1)
+        self.assertEqual(payload["summary"]["loss_days"], 1)
+        self.assertEqual(payload["summary"]["active_days"], 2)
+        self.assertEqual(payload["data_quality"]["legacy_trade_rows_without_ts"], 1)
+
+    def test_profit_calendar_empty_state_is_safe(self):
+        import app as _app  # noqa: F401
+        import routes.api as api
+
+        payload = api.build_profit_calendar_payload({
+            "equity_history": [],
+            "history": [],
+            "holdings": {},
+        }, 2026, 2)
+
+        self.assertEqual(len(payload["days"]), 28)
+        self.assertIsNone(payload["summary"]["monthly_pnl_usd"])
+        self.assertEqual(payload["summary"]["active_days"], 0)
+        self.assertTrue(all(day["status"] == "neutral" for day in payload["days"]))
+        self.assertTrue(all(day["note"] == "No trading data for this day." for day in payload["days"]))
+
+    def test_profit_calendar_rejects_invalid_month(self):
+        import app as _app  # noqa: F401
+        import routes.api as api
+
+        old_request = api.request
+        old_jsonify = api.jsonify
+        try:
+            api.request = types.SimpleNamespace(args={"month": "2026-13"})
+            api.jsonify = lambda obj=None, **kwargs: obj if obj is not None else kwargs
+            body, status = api.api_bot_profit_calendar()
+            self.assertEqual(status, 400)
+            self.assertIn("Invalid month", body["error"])
+            api.request = types.SimpleNamespace(args={"month": "0000-01"})
+            body, status = api.api_bot_profit_calendar()
+            self.assertEqual(status, 400)
+        finally:
+            api.request = old_request
+            api.jsonify = old_jsonify
+
+    def test_profit_calendar_route_is_read_only(self):
+        source = Path("routes/api.py").read_text(encoding="utf-8")
+        body = source[
+            source.index("def _parse_profit_calendar_month"):
+            source.index('@app.route("/api/bot/status")')
+        ]
+        for forbidden in ("save_bot", "run_bot", "trigger_bot_if_due", "warm_scan", "get_quote", "_finnhub_daily", "_fmp_daily"):
+            self.assertNotIn(forbidden, body)
+
     def test_daily_bar_callers_use_data_manager_not_stooq_imports(self):
         files = [
             "market/history.py",
@@ -2976,6 +3063,14 @@ class TradingV1TemplateTests(unittest.TestCase):
         self.assertIn("title: (items)", template)
         self.assertIn("labels[items[0].dataIndex]", template)
         self.assertIn("label: (c) => '$' + c.parsed.y", template)
+
+    def test_bot_template_contains_profit_calendar_controls(self):
+        template = Path("templates/bot.html").read_text(encoding="utf-8")
+        self.assertIn('id="profitCalendarOpen"', template)
+        self.assertIn('id="profitCalendarBackdrop"', template)
+        self.assertIn('/api/bot/profit-calendar', template)
+        self.assertIn("pc-dot profit", template)
+        self.assertIn("No trading data for this day.", template)
 
     def test_market_dashboard_shows_regime_data_fallback(self):
         template = Path("templates/index.html").read_text(encoding="utf-8")
