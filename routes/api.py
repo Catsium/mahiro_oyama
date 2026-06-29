@@ -1,9 +1,11 @@
 """JSON API routes: /api/chart, /api/bot/equity, /api/attribution,
 /api/backtest, /api/signal_validation."""
+from calendar import monthrange
 import re
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
 from flask import jsonify, request
 
 from app import app
@@ -26,6 +28,7 @@ from utils.threading_utils import _BOT_STATUS
 PROVIDER_TEST_MAX_RUNTIME_SEC = 15
 PROVIDER_TEST_PER_PROVIDER_TIMEOUT_SEC = 3
 PROVIDER_TEST_CACHE_SEC = 60
+BOT_CALENDAR_TZ = ZoneInfo("America/New_York")
 _PROVIDER_TEST_CACHE_KEY = "provider_test:v1"
 
 
@@ -353,6 +356,208 @@ def api_bot_equity():
         "range": rng,
         "bucket_secs": bucket_secs,
     })
+
+
+def _parse_profit_calendar_month(raw):
+    if not raw:
+        now = datetime.now(BOT_CALENDAR_TZ)
+        return now.year, now.month
+    if not re.match(r"^\d{4}-\d{2}$", raw):
+        return None
+    year, month = raw.split("-")
+    year, month = int(year), int(month)
+    if not 1 <= year <= 9999 or not 1 <= month <= 12:
+        return None
+    return year, month
+
+
+def _calendar_date_from_ts(ts):
+    try:
+        return datetime.fromtimestamp(int(ts), BOT_CALENDAR_TZ).date()
+    except Exception:
+        return None
+
+
+def _money(value):
+    try:
+        return round(float(value), 2)
+    except Exception:
+        return None
+
+
+def _snapshot_holdings(point):
+    holdings = []
+    if isinstance(point, (list, tuple)) and len(point) >= 4 and isinstance(point[3], list):
+        for row in point[3]:
+            if isinstance(row, (list, tuple)) and row:
+                symbol = str(row[0] or "").upper().strip()
+                if symbol:
+                    holdings.append(symbol)
+    return sorted(set(holdings))
+
+
+def _current_holding_symbols(bot):
+    holdings = bot.get("holdings") or {}
+    if not isinstance(holdings, dict):
+        return []
+    symbols = []
+    for sym, row in holdings.items():
+        if not isinstance(row, dict):
+            continue
+        try:
+            if float(row.get("shares") or 0) > 0:
+                symbols.append(str(sym).upper())
+        except Exception:
+            continue
+    return sorted(symbols)
+
+
+def _trade_summary(row):
+    return {
+        "action": row.get("action"),
+        "ticker": row.get("ticker"),
+        "shares": row.get("shares"),
+        "price": row.get("price"),
+        "pnl_usd": row.get("pnl_usd"),
+        "time_et": row.get("time_et"),
+        "time_sgt": row.get("time_sgt"),
+        "ts": row.get("ts"),
+    }
+
+
+def build_profit_calendar_payload(bot, year, month):
+    """Read-only daily performance view from persisted bot snapshots/history."""
+    days_in_month = monthrange(year, month)[1]
+    month_key = f"{year:04d}-{month:02d}"
+    today = datetime.now(BOT_CALENDAR_TZ).date()
+    days = {}
+    for day in range(1, days_in_month + 1):
+        d = date(year, month, day)
+        days[d] = {
+            "date": d.isoformat(),
+            "day": day,
+            "status": "neutral",
+            "pnl_usd": None,
+            "pnl_pct": None,
+            "start_equity": None,
+            "end_equity": None,
+            "holdings": [],
+            "trades_opened": 0,
+            "trades_closed": 0,
+            "trades": [],
+            "has_data": False,
+            "has_activity": False,
+            "note": "No trading data for this day.",
+        }
+
+    snapshots_by_day = {}
+    snapshot_count = 0
+    for point in bot.get("equity_history") or []:
+        if not isinstance(point, (list, tuple)) or len(point) < 2:
+            continue
+        d = _calendar_date_from_ts(point[0])
+        if not d or d.year != year or d.month != month:
+            continue
+        equity = _money(point[1])
+        if equity is None:
+            continue
+        snapshots_by_day.setdefault(d, []).append(point)
+        snapshot_count += 1
+
+    holding_snapshot_days = 0
+    for d, points in snapshots_by_day.items():
+        points.sort(key=lambda p: p[0])
+        start_equity = _money(points[0][1])
+        end_equity = _money(points[-1][1])
+        if start_equity is None or end_equity is None:
+            continue
+        pnl = round(end_equity - start_equity, 2)
+        pnl_pct = round((pnl / start_equity * 100), 3) if start_equity else None
+        holdings = []
+        for point in reversed(points):
+            holdings = _snapshot_holdings(point)
+            if holdings:
+                break
+        if holdings:
+            holding_snapshot_days += 1
+        elif d == today:
+            holdings = _current_holding_symbols(bot)
+
+        days[d].update({
+            "status": "profit" if pnl > 0 else "loss" if pnl < 0 else "neutral",
+            "pnl_usd": pnl,
+            "pnl_pct": pnl_pct,
+            "start_equity": start_equity,
+            "end_equity": end_equity,
+            "holdings": holdings,
+            "has_data": True,
+            "has_activity": True,
+            "note": None if holdings else "Holdings snapshot unavailable for this day.",
+        })
+
+    legacy_trade_rows_without_ts = 0
+    trade_count = 0
+    for row in bot.get("history") or []:
+        if not isinstance(row, dict) or row.get("action") not in {"BUY", "SELL"}:
+            continue
+        d = _calendar_date_from_ts(row.get("ts"))
+        if not d:
+            legacy_trade_rows_without_ts += 1
+            continue
+        if d.year != year or d.month != month:
+            continue
+        day = days.get(d)
+        if not day:
+            continue
+        trade_count += 1
+        day["has_activity"] = True
+        day["trades"].append(_trade_summary(row))
+        if row.get("action") == "BUY":
+            day["trades_opened"] += 1
+        elif row.get("action") == "SELL":
+            day["trades_closed"] += 1
+        if not day["has_data"]:
+            day["note"] = "Trading activity found, but no equity snapshots for P/L."
+
+    day_list = [days[date(year, month, day)] for day in range(1, days_in_month + 1)]
+    data_days = [d for d in day_list if d["has_data"] and d["pnl_usd"] is not None]
+    win_days = [d for d in data_days if d["pnl_usd"] > 0]
+    loss_days = [d for d in data_days if d["pnl_usd"] < 0]
+    monthly_pnl = round(sum(d["pnl_usd"] for d in data_days), 2) if data_days else None
+    first_equity = next((d["start_equity"] for d in data_days if d["start_equity"]), None)
+    monthly_pct = round(monthly_pnl / first_equity * 100, 3) if first_equity and monthly_pnl is not None else None
+    best_day = max(data_days, key=lambda d: d["pnl_usd"], default=None)
+    worst_day = min(data_days, key=lambda d: d["pnl_usd"], default=None)
+
+    return {
+        "month": month_key,
+        "timezone": "America/New_York",
+        "summary": {
+            "monthly_pnl_usd": monthly_pnl,
+            "monthly_pnl_pct": monthly_pct,
+            "best_day": {"date": best_day["date"], "pnl_usd": best_day["pnl_usd"]} if best_day else None,
+            "worst_day": {"date": worst_day["date"], "pnl_usd": worst_day["pnl_usd"]} if worst_day else None,
+            "win_days": len(win_days),
+            "loss_days": len(loss_days),
+            "active_days": sum(1 for d in day_list if d["has_activity"]),
+        },
+        "days": day_list,
+        "data_quality": {
+            "snapshot_count": snapshot_count,
+            "trade_count": trade_count,
+            "legacy_trade_rows_without_ts": legacy_trade_rows_without_ts,
+            "holding_snapshot_days": holding_snapshot_days,
+        },
+    }
+
+
+@app.route("/api/bot/profit-calendar")
+def api_bot_profit_calendar():
+    parsed = _parse_profit_calendar_month(request.args.get("month"))
+    if not parsed:
+        return jsonify({"error": "Invalid month. Use YYYY-MM."}), 400
+    year, month = parsed
+    return jsonify(build_profit_calendar_payload(load_bot(), year, month))
 
 
 @app.route("/api/bot/status")
