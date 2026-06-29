@@ -33,6 +33,73 @@
     font-size:1.2rem;cursor:pointer;line-height:1;margin:-4px -6px 0 0;
   }
   .pt-modal .pm-close:hover{color:#fff}
+  .pc-backdrop{
+    display:none;position:fixed;inset:0;z-index:1100;
+    background:rgba(8,7,10,.68);backdrop-filter:blur(8px);
+    align-items:center;justify-content:center;padding:20px;
+  }
+  .pc-backdrop.show{display:flex}
+  .pc-modal{
+    width:min(960px,96vw);max-height:90vh;overflow:auto;
+    background:linear-gradient(180deg,rgba(37,32,43,.98),rgba(28,25,34,.98));
+    border:2px solid rgba(246,168,200,.62);border-radius:18px;
+    box-shadow:0 22px 70px rgba(0,0,0,.48), inset 0 1px 0 rgba(255,255,255,.03);
+    padding:22px;animation:pcModalIn .22s cubic-bezier(.2,.8,.2,1) both;
+  }
+  @keyframes pcModalIn{from{opacity:0;transform:translateY(10px) scale(.985)}to{opacity:1;transform:translateY(0) scale(1)}}
+  .pc-close{float:right;background:none;border:0;color:var(--muted);font-size:1.3rem;cursor:pointer;line-height:1}
+  .pc-close:hover{color:#fff}
+  .pc-top{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:16px}
+  .pc-title h3{margin:0;color:#fff;font-size:1.08rem}
+  .pc-title p{margin:5px 0 0;color:var(--muted);font-size:.78rem;line-height:1.45}
+  .pc-nav{display:flex;align-items:center;gap:8px;flex-wrap:wrap;justify-content:flex-end}
+  .pc-month{min-width:140px;text-align:center;color:var(--pink);font-weight:700;font-size:.88rem}
+  .pc-summary{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin-bottom:14px}
+  .pc-stat{border:1px solid var(--border);border-radius:12px;background:rgba(255,255,255,.03);padding:11px 12px}
+  .pc-stat .label{color:var(--muted);font-size:.7rem;text-transform:uppercase;letter-spacing:.5px}
+  .pc-stat .value{margin-top:5px;font-size:1rem;font-weight:700;color:#fff}
+  .pc-stat.pos .value{color:var(--green)}
+  .pc-stat.neg .value{color:var(--red)}
+  .pc-legend{display:flex;align-items:center;gap:12px;flex-wrap:wrap;color:var(--muted);font-size:.74rem;margin:4px 0 12px}
+  .pc-dot{width:10px;height:10px;border-radius:3px;display:inline-block;margin-right:5px;border:1px solid var(--border);vertical-align:-1px}
+  .pc-dot.profit{background:var(--green-zone);border-color:var(--green)}
+  .pc-dot.loss{background:var(--red-zone);border-color:var(--red)}
+  .pc-dot.neutral{background:rgba(255,255,255,.06)}
+  .pc-body{display:grid;grid-template-columns:minmax(0,1fr) 280px;gap:16px;align-items:start}
+  .pc-weekdays,.pc-grid{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:7px}
+  .pc-weekdays{margin-bottom:7px;color:var(--muted);font-size:.7rem;text-align:center}
+  .pc-day,.pc-blank{
+    min-height:82px;border-radius:12px;border:1px solid var(--border);
+    background:rgba(255,255,255,.035);
+  }
+  .pc-day{
+    color:var(--text);cursor:pointer;padding:8px;text-align:left;
+    display:flex;flex-direction:column;justify-content:space-between;gap:6px;
+    transition:transform var(--t-fast),border-color var(--t-fast),background var(--t-fast),box-shadow var(--t-fast);
+  }
+  .pc-day:hover,.pc-day.active{transform:translateY(-1px);border-color:var(--pink);box-shadow:0 0 0 1px rgba(246,168,200,.14)}
+  .pc-day.profit{background:linear-gradient(180deg,rgba(126,228,155,.18),rgba(126,228,155,.06));border-color:rgba(126,228,155,.56)}
+  .pc-day.loss{background:linear-gradient(180deg,rgba(255,138,160,.18),rgba(255,138,160,.06));border-color:rgba(255,138,160,.56)}
+  .pc-day .num{font-weight:700;font-size:.82rem}
+  .pc-day .pl{font-size:.74rem;font-weight:700}
+  .pc-day.profit .pl{color:var(--green)}
+  .pc-day.loss .pl{color:var(--red)}
+  .pc-day .meta{color:var(--muted);font-size:.66rem;line-height:1.3}
+  .pc-detail{border:1px solid var(--border);border-radius:14px;background:rgba(255,255,255,.035);padding:14px;min-height:250px}
+  .pc-detail h4{margin:0 0 8px;font-size:.95rem}
+  .pc-detail-row{display:flex;justify-content:space-between;gap:12px;padding:5px 0;border-bottom:1px dashed rgba(255,255,255,.08);font-size:.78rem}
+  .pc-detail-row span:first-child{color:var(--muted)}
+  .pc-tags{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
+  .pc-tag{border:1px solid var(--border);border-radius:999px;padding:3px 8px;font-size:.7rem;color:#fff;background:rgba(255,255,255,.04)}
+  .pc-note{margin-top:10px;color:var(--muted);font-size:.76rem;line-height:1.45}
+  .pc-error{color:var(--red);font-size:.82rem;margin:10px 0}
+  @media (max-width:760px){
+    .pc-modal{padding:16px}
+    .pc-summary{grid-template-columns:repeat(2,minmax(0,1fr))}
+    .pc-body{grid-template-columns:1fr}
+    .pc-day,.pc-blank{min-height:70px}
+    .pc-day .meta{display:none}
+  }
   .total-row{
     display:flex;align-items:baseline;justify-content:center;flex-wrap:wrap;
     gap:14px;margin-top:18px;padding:14px 0 4px;
@@ -74,6 +141,12 @@
         </svg>
       </span>
       <h2>//Mahiro Oyama's portfolio performance</h2>
+      <div class="head-meta">
+        <button class="ghost-btn" type="button" id="profitCalendarOpen">
+          <i class="fa-regular fa-calendar-days" aria-hidden="true"></i>
+          Profit Calendar
+        </button>
+      </div>
     </div>
 
     <div class="range-row">
@@ -105,6 +178,42 @@
         <div class="pm-eq" id="pmEq"></div>
         <div id="pmPct"></div>
         <div class="pm-pos" id="pmPos"></div>
+      </div>
+    </div>
+
+    <div class="pc-backdrop" id="profitCalendarBackdrop" aria-hidden="true">
+      <div class="pc-modal" id="profitCalendarModal" role="dialog" aria-modal="true" aria-labelledby="profitCalendarTitle" tabindex="-1">
+        <button class="pc-close" id="profitCalendarClose" aria-label="close profit calendar">&times;</button>
+        <div class="pc-top">
+          <div class="pc-title">
+            <h3 id="profitCalendarTitle">//profit calendar</h3>
+            <p>Daily paper-bot performance from stored equity snapshots and trade history.</p>
+          </div>
+          <div class="pc-nav" aria-label="calendar month navigation">
+            <button class="ghost-btn" type="button" id="profitCalendarPrev">prev</button>
+            <div class="pc-month" id="profitCalendarMonth">Loading</div>
+            <button class="ghost-btn" type="button" id="profitCalendarNext">next</button>
+          </div>
+        </div>
+        <div class="pc-summary" id="profitCalendarSummary" aria-live="polite"></div>
+        <div class="pc-legend" aria-label="profit calendar legend">
+          <span><span class="pc-dot neutral"></span> no data / flat</span>
+          <span><span class="pc-dot profit"></span> profitable</span>
+          <span><span class="pc-dot loss"></span> losing</span>
+        </div>
+        <div class="pc-error" id="profitCalendarError" hidden></div>
+        <div class="pc-body">
+          <div>
+            <div class="pc-weekdays" aria-hidden="true">
+              <span>Sun</span><span>Mon</span><span>Tue</span><span>Wed</span><span>Thu</span><span>Fri</span><span>Sat</span>
+            </div>
+            <div class="pc-grid" id="profitCalendarGrid"></div>
+          </div>
+          <aside class="pc-detail" id="profitCalendarDetail" aria-live="polite">
+            <h4>Pick a day</h4>
+            <div class="pc-note">No trading data for this day.</div>
+          </aside>
+        </div>
       </div>
     </div>
 
@@ -687,6 +796,263 @@ if (resetZoomBtn) {
 
 requestAnimationFrame(() => positionSlider(group.querySelector('.range-btn.active')));
 loadEquity('1d');
+
+let profitCalendarMonthKey = null;
+let profitCalendarLoaded = false;
+let profitCalendarLastTrigger = null;
+
+function pcMonthDate(monthKey) {
+  const parts = (monthKey || '').split('-').map(Number);
+  return new Date(parts[0], (parts[1] || 1) - 1, 1);
+}
+
+function pcMonthKey(dateObj) {
+  return dateObj.getFullYear() + '-' + String(dateObj.getMonth() + 1).padStart(2, '0');
+}
+
+function pcMonthLabel(monthKey) {
+  return pcMonthDate(monthKey).toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
+}
+
+function pcSignedMoney(value) {
+  if (value == null || Number.isNaN(Number(value))) return '--';
+  const n = Number(value);
+  const sign = n >= 0 ? '+' : '-';
+  return sign + '$' + Math.abs(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
+function pcMoney(value) {
+  if (value == null || Number.isNaN(Number(value))) return '--';
+  return '$' + Number(value).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
+function pcPct(value) {
+  if (value == null || Number.isNaN(Number(value))) return '--';
+  const n = Number(value);
+  return (n >= 0 ? '+' : '') + n.toFixed(3) + '%';
+}
+
+function pcSetError(message) {
+  const err = document.getElementById('profitCalendarError');
+  if (!err) return;
+  err.hidden = !message;
+  err.textContent = message || '';
+}
+
+function pcStat(label, value, cls) {
+  const node = document.createElement('div');
+  node.className = 'pc-stat ' + (cls || '');
+  const labelNode = document.createElement('div');
+  labelNode.className = 'label';
+  labelNode.textContent = label;
+  const valueNode = document.createElement('div');
+  valueNode.className = 'value';
+  valueNode.textContent = value;
+  node.append(labelNode, valueNode);
+  return node;
+}
+
+function pcRenderSummary(payload) {
+  const summary = document.getElementById('profitCalendarSummary');
+  if (!summary) return;
+  summary.replaceChildren();
+  const s = payload.summary || {};
+  const monthly = s.monthly_pnl_usd;
+  summary.append(
+    pcStat('monthly P/L', pcSignedMoney(monthly), monthly > 0 ? 'pos' : monthly < 0 ? 'neg' : ''),
+    pcStat('best day', s.best_day ? pcSignedMoney(s.best_day.pnl_usd) : '--', 'pos'),
+    pcStat('worst day', s.worst_day ? pcSignedMoney(s.worst_day.pnl_usd) : '--', 'neg'),
+    pcStat('win / loss days', (s.win_days || 0) + ' / ' + (s.loss_days || 0), '')
+  );
+}
+
+function pcDetailRow(label, value, cls) {
+  const row = document.createElement('div');
+  row.className = 'pc-detail-row';
+  const l = document.createElement('span');
+  l.textContent = label;
+  const v = document.createElement('span');
+  v.textContent = value;
+  if (cls) v.style.color = 'var(--' + cls + ')';
+  row.append(l, v);
+  return row;
+}
+
+function pcRenderDetail(day) {
+  const detail = document.getElementById('profitCalendarDetail');
+  if (!detail) return;
+  detail.replaceChildren();
+  const title = document.createElement('h4');
+  title.textContent = new Date(day.date + 'T12:00:00').toLocaleDateString('en-US', {
+    weekday: 'long', month: 'short', day: 'numeric'
+  });
+  detail.appendChild(title);
+  detail.append(
+    pcDetailRow('status', day.status),
+    pcDetailRow('P/L', pcSignedMoney(day.pnl_usd), day.pnl_usd > 0 ? 'green' : day.pnl_usd < 0 ? 'red' : ''),
+    pcDetailRow('change', pcPct(day.pnl_pct), day.pnl_pct > 0 ? 'green' : day.pnl_pct < 0 ? 'red' : ''),
+    pcDetailRow('start equity', pcMoney(day.start_equity)),
+    pcDetailRow('end equity', pcMoney(day.end_equity)),
+    pcDetailRow('opened / closed', day.trades_opened + ' / ' + day.trades_closed)
+  );
+
+  const holdingsLabel = document.createElement('div');
+  holdingsLabel.className = 'pc-note';
+  holdingsLabel.textContent = 'Stocks held';
+  detail.appendChild(holdingsLabel);
+  const tags = document.createElement('div');
+  tags.className = 'pc-tags';
+  (day.holdings || []).forEach(sym => {
+    const tag = document.createElement('span');
+    tag.className = 'pc-tag';
+    tag.textContent = sym;
+    tags.appendChild(tag);
+  });
+  if (!tags.children.length) {
+    const empty = document.createElement('span');
+    empty.className = 'pc-note';
+    empty.textContent = 'No holdings snapshot for this day.';
+    tags.appendChild(empty);
+  }
+  detail.appendChild(tags);
+
+  if (day.trades && day.trades.length) {
+    const trades = document.createElement('div');
+    trades.className = 'pc-note';
+    trades.textContent = 'Trades: ' + day.trades.map(t => (t.action || '?') + ' ' + (t.ticker || '')).join(', ');
+    detail.appendChild(trades);
+  }
+  if (day.note) {
+    const note = document.createElement('div');
+    note.className = 'pc-note';
+    note.textContent = day.note;
+    detail.appendChild(note);
+  }
+}
+
+function pcSelectDay(day, button) {
+  document.querySelectorAll('.pc-day.active').forEach(el => el.classList.remove('active'));
+  if (button) button.classList.add('active');
+  pcRenderDetail(day);
+}
+
+function pcRenderCalendar(payload) {
+  profitCalendarMonthKey = payload.month;
+  document.getElementById('profitCalendarMonth').textContent = pcMonthLabel(payload.month);
+  pcRenderSummary(payload);
+  const grid = document.getElementById('profitCalendarGrid');
+  if (!grid) return;
+  grid.replaceChildren();
+
+  const monthDate = pcMonthDate(payload.month);
+  for (let i = 0; i < monthDate.getDay(); i++) {
+    const blank = document.createElement('div');
+    blank.className = 'pc-blank';
+    blank.setAttribute('aria-hidden', 'true');
+    grid.appendChild(blank);
+  }
+
+  let firstActive = null;
+  let firstActiveButton = null;
+  (payload.days || []).forEach(day => {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'pc-day ' + day.status;
+    btn.dataset.date = day.date;
+    btn.title = day.date + ': ' + (day.note || pcSignedMoney(day.pnl_usd));
+    btn.setAttribute('aria-label', day.date + ' ' + day.status + ' ' + pcSignedMoney(day.pnl_usd));
+
+    const num = document.createElement('div');
+    num.className = 'num';
+    num.textContent = day.day;
+    const pl = document.createElement('div');
+    pl.className = 'pl';
+    pl.textContent = day.has_data ? pcSignedMoney(day.pnl_usd) : '--';
+    const meta = document.createElement('div');
+    meta.className = 'meta';
+    const tradeText = (day.trades_opened || day.trades_closed)
+      ? (day.trades_opened + ' opened / ' + day.trades_closed + ' closed')
+      : (day.holdings && day.holdings.length ? day.holdings.join(', ') : 'no data');
+    meta.textContent = tradeText;
+    btn.append(num, pl, meta);
+    btn.addEventListener('click', () => pcSelectDay(day, btn));
+    btn.addEventListener('mouseenter', () => pcRenderDetail(day));
+    grid.appendChild(btn);
+    if (!firstActive && day.has_activity) {
+      firstActive = day;
+      firstActiveButton = btn;
+    }
+  });
+  if (!firstActive && payload.days && payload.days.length) {
+    firstActive = payload.days[0];
+    firstActiveButton = grid.querySelector('.pc-day');
+  }
+  if (firstActive) pcSelectDay(firstActive, firstActiveButton);
+}
+
+async function loadProfitCalendar(monthKey) {
+  const grid = document.getElementById('profitCalendarGrid');
+  if (grid) grid.innerHTML = '<div class="pc-note" style="grid-column:1/-1">Loading profit calendar...</div>';
+  pcSetError('');
+  try {
+    const url = '/api/bot/profit-calendar' + (monthKey ? '?month=' + encodeURIComponent(monthKey) : '');
+    const res = await fetch(url);
+    const payload = await res.json();
+    if (!res.ok) throw new Error(payload.error || 'Profit calendar failed.');
+    profitCalendarLoaded = true;
+    pcRenderCalendar(payload);
+  } catch (err) {
+    pcSetError(err.message || 'Profit calendar failed.');
+  }
+}
+
+function pcShiftMonth(delta) {
+  if (!profitCalendarMonthKey) {
+    loadProfitCalendar();
+    return;
+  }
+  const d = pcMonthDate(profitCalendarMonthKey);
+  d.setMonth(d.getMonth() + delta);
+  loadProfitCalendar(pcMonthKey(d));
+}
+
+(function(){
+  const openBtn = document.getElementById('profitCalendarOpen');
+  const backdrop = document.getElementById('profitCalendarBackdrop');
+  const modal = document.getElementById('profitCalendarModal');
+  const closeBtn = document.getElementById('profitCalendarClose');
+  const prevBtn = document.getElementById('profitCalendarPrev');
+  const nextBtn = document.getElementById('profitCalendarNext');
+  if (!openBtn || !backdrop || !modal) return;
+
+  function closeCalendar() {
+    backdrop.classList.remove('show');
+    backdrop.setAttribute('aria-hidden', 'true');
+    if (profitCalendarLastTrigger) profitCalendarLastTrigger.focus();
+  }
+  openBtn.addEventListener('click', () => {
+    profitCalendarLastTrigger = openBtn;
+    backdrop.classList.add('show');
+    backdrop.setAttribute('aria-hidden', 'false');
+    modal.focus();
+    if (!profitCalendarLoaded) loadProfitCalendar();
+  });
+  if (closeBtn) closeBtn.addEventListener('click', closeCalendar);
+  if (prevBtn) prevBtn.addEventListener('click', () => pcShiftMonth(-1));
+  if (nextBtn) nextBtn.addEventListener('click', () => pcShiftMonth(1));
+  backdrop.addEventListener('click', (e) => { if (e.target === backdrop) closeCalendar(); });
+  document.addEventListener('keydown', (e) => {
+    if (!backdrop.classList.contains('show')) return;
+    if (e.key === 'Escape') closeCalendar();
+    if (e.key !== 'Tab') return;
+    const focusable = modal.querySelectorAll('button,[href],input,select,textarea,[tabindex]:not([tabindex="-1"])');
+    if (!focusable.length) return;
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+    else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+  });
+})();
 
 // run button feedback (market open only)
 const runForm = document.getElementById('runForm');
