@@ -102,12 +102,24 @@ def entry_cluster(rec, ctx=None):
 
 
 def confidence_scale(confidence):
-    """Map buy confidence into a risk modifier. 55% is starter size."""
+    """Map buy confidence into paper-trade risk buckets."""
     try:
         c = float(confidence or 0)
     except Exception:
         c = 0.0
-    return round(_clamp(0.50 + (c - 55.0) / 40.0 * 0.75, 0.0, 1.25), 4)
+    if c < 40:
+        return 0.0
+    if c < 45:
+        return 0.35
+    if c < 50:
+        return 0.50
+    if c < 55:
+        return 0.65
+    if c < 65:
+        return 0.85
+    if c < 70:
+        return 1.00
+    return 1.10
 
 
 def stop_distance_pct(ctx, regime_stop_pct):
@@ -261,7 +273,7 @@ def estimate_gross_edge_pct(edge_stats, regime_kind, cluster, confidence, score=
 
 def evaluate_candidate(candidate, total_equity, regime_stop_pct, regime_kind,
                        vix_mult, streak_mult, kelly_mult, edge_stats,
-                       min_position_usd=400.0,
+                       min_position_usd=100.0,
                        commission=COMMISSION_PER_TRADE, config=None,
                        mode_size_mult=1.0, mode_size_reason=None):
     cfg = config or DEFAULT_CONFIG
@@ -337,7 +349,7 @@ def evaluate_candidate(candidate, total_equity, regime_stop_pct, regime_kind,
         source == "watchlist"
         and edge.get("edge_source") == "confidence_prior"
         and rec.get("cls") in ("buy", "strong-buy")
-        and rec.get("confidence", 0) >= float(signal_cfg.get("min_buy_confidence", 55))
+        and rec.get("confidence", 0) >= float(signal_cfg.get("min_buy_confidence", 40))
         and net >= 0
     )
     tradable = risk_sized and (ev_pass or warmup_watchlist)
@@ -381,7 +393,7 @@ def evaluate_candidate(candidate, total_equity, regime_stop_pct, regime_kind,
 
 def rank_candidates(candidates, total_equity, regime_stop_pct, regime_kind,
                     vix_mult, streak_mult, kelly_mult, edge_stats,
-                    min_position_usd=400.0,
+                    min_position_usd=100.0,
                     commission=COMMISSION_PER_TRADE, config=None,
                     mode_size_mult=1.0, mode_size_reason=None):
     ranked = [
