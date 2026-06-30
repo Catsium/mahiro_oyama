@@ -15,7 +15,7 @@ What lives here:
 def round_trip_cost_pct(pos_val, commission):
     """Round-trip commission (one buy + one sell) as a percent of position value.
 
-    A $400 position at $0.99/trade → 2*0.99/400*100 = 0.495%. This is the floor a
+    A $100 position at $0.99/trade -> 2*0.99/100*100 = 1.98%. This is the floor a
     winning exit must clear to be net-positive — the basis for the cost-aware ratchet
     and the minimum-position-size rule.
     """

@@ -99,10 +99,10 @@ KNIFE_CATALYST_TYPES = {
 }
 
 # A2 (cost-aware sizing): minimum dollars for ANY position open or add. At $0.99/trade
-# the round-trip commission is ≤0.5% of a $400 trade (recoverable); below this, a few
-# tenths of a percent of price movement is eaten entirely by commission. Pyramid adds
-# were already gated at $400 (Round-6) — new + outside positions now match.
-MIN_POSITION_USD   = 400
+# the round-trip commission is roughly 2% of a $100 trade, so this remains a floor,
+# not a target. Sizing and EV gates still decide whether a candidate is worth taking.
+# Pyramid adds, new positions, and outside positions use the same minimum.
+MIN_POSITION_USD   = 100
 BOT_TICK_MAX_RUNTIME_SEC = 25
 USE_CONFIDENCE_WEIGHTING = True
 REQUIRED_TICK_LOG_FIELDS = (
@@ -210,19 +210,14 @@ def is_execution_candidate(rec, cfg, *, degraded_mode_active=False):
         conf = float(rec.get("confidence", 0) or 0)
     except Exception:
         conf = 0.0
-    min_buy_confidence = float(signal_cfg.get("min_buy_confidence", 55))
-    degraded_min_confidence = float(
-        mode_cfg.get("degraded_min_confidence", min_buy_confidence)
-    )
+    normal_min = float(signal_cfg.get("min_buy_confidence", 40))
+    degraded_min = float(mode_cfg.get("degraded_min_confidence", normal_min))
+    min_conf = degraded_min if degraded_mode_active else normal_min
     if raw_cls not in ("buy", "strong-buy"):
         return False
     if display not in ("BUY_CANDIDATE", "STRONG_BUY_CANDIDATE"):
         return False
-    if conf < min_buy_confidence:
-        return False
-    if degraded_mode_active and conf < degraded_min_confidence:
-        return False
-    return True
+    return conf >= min_conf
 
 
 def _new_no_buy_diag(now, b, force=False, user_forced=False):
@@ -244,6 +239,7 @@ def _new_no_buy_diag(now, b, force=False, user_forced=False):
         "degraded_mode_reason": None,
         "degraded_size_mult": None,
         "degraded_min_confidence": None,
+        "min_trade_size_effective": None,
         "degraded_reject_counts": {},
         "degraded_buys_today": 0,
         "degraded_max_buys_today": None,
@@ -323,6 +319,7 @@ def _new_no_buy_diag(now, b, force=False, user_forced=False):
 def _set_main_blocker(diag):
     if not diag:
         return None
+    min_position_usd = float(diag.get("min_trade_size_effective") or MIN_POSITION_USD)
     if not diag.get("market_open"):
         blocker = "market_closed"
     elif diag.get("tod_ok") is False:
@@ -336,7 +333,7 @@ def _set_main_blocker(diag):
     elif diag.get("regime_allow_buys") is False:
         blocker = "regime_or_vix_blocks_buys"
     elif (diag.get("cash_available_after_floor") is not None
-          and diag.get("cash_available_after_floor", 0) < MIN_POSITION_USD):
+          and diag.get("cash_available_after_floor", 0) < min_position_usd):
         blocker = "cash_below_min_position"
     elif diag.get("candidate_pool_count", 0) <= 0:
         if int(diag.get("raw_buy_count", 0) or 0) > 0:
@@ -386,7 +383,7 @@ def _market_data_mode(regime, vix_data, cfg):
         reason = None
     elif blocks and mode_cfg.get("allow_degraded_paper_trading", True):
         mode = "DEGRADED_MODE"
-        size_mult = float(mode_cfg.get("degraded_size_mult", 0.70))
+        size_mult = float(mode_cfg.get("degraded_size_mult", 0.90))
         reason = ",".join(blocks)
     else:
         mode = "DEGRADED_MODE_DISABLED" if blocks else "DATA_HEALTH_BLOCKED"
@@ -1009,7 +1006,9 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
     cfg = active_config()
     signal_cfg = (cfg or {}).get("signal", {})
     mode_cfg = (cfg or {}).get("market_data_modes", {})
-    min_buy_confidence = float(signal_cfg.get("min_buy_confidence", 55))
+    risk_cfg = (cfg or {}).get("risk", {}) if isinstance(cfg, dict) else {}
+    min_position_usd = float(risk_cfg.get("min_trade_size", MIN_POSITION_USD))
+    min_buy_confidence = float(signal_cfg.get("min_buy_confidence", 40))
     degraded_min_confidence = float(
         mode_cfg.get("degraded_min_confidence", min_buy_confidence)
     )
@@ -1017,6 +1016,7 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
     no_buy_diag = _new_no_buy_diag(now, b, force=force, user_forced=user_forced)
     no_buy_diag["min_buy_confidence"] = min_buy_confidence
     no_buy_diag["degraded_min_confidence"] = degraded_min_confidence
+    no_buy_diag["min_trade_size_effective"] = min_position_usd
     deadline_ts = (now + float(max_runtime_sec)) if max_runtime_sec else None
     collapse_diag = []
     stale_scan_skipped = False
@@ -1258,7 +1258,10 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
     no_buy_diag["vix_value"] = vix_data.get("vix")
     no_buy_diag["vix_data_ok"] = vix_data.get("data_ok")
     no_buy_diag["vix_data_status"] = vix_data.get("data_status")
-    no_buy_diag["vix_display"] = vix_data.get("vix_display") or ("proxy" if vix_data.get("data_ok") else "unknown")
+    no_buy_diag["vix_display"] = (
+        vix_data.get("vix_display")
+        or ("SPY_REALIZED_VOL_PROXY" if vix_data.get("data_ok") else "unknown")
+    )
     no_buy_diag["volatility_data_ok"] = vix_data.get("data_ok")
     no_buy_diag["volatility_source"] = vix_data.get("volatility_source") or vix_data.get("source")
     no_buy_diag["volatility_value"] = vix_data.get("volatility_value", vix_data.get("vix"))
@@ -1324,7 +1327,6 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
     elif mode_info["trading_mode"] == "DEGRADED_MODE_DISABLED":
         _log_bot_event("DEGRADED_MODE_DISABLED", blocks=data_health_blocks)
 
-    risk_cfg = cfg.get("risk", {}) if isinstance(cfg, dict) else {}
     max_positions = int(risk_cfg.get("max_positions", MAX_POSITIONS))
     MAX_POS_PCT        = float(risk_cfg.get("max_position_pct", 0.08))
     MAX_SECTOR_PCT     = float(risk_cfg.get("max_sector_pct", 0.25))
@@ -1690,7 +1692,7 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
     no_buy_diag["max_buys_today"] = max_buys_today
     no_buy_diag["degraded_buys_today"] = int(degraded_buys_today)
     no_buy_diag["degraded_max_buys_today"] = degraded_max_buys_today
-    no_buy_diag["degraded_size_mult"] = mode_cfg.get("degraded_size_mult", 0.70)
+    no_buy_diag["degraded_size_mult"] = mode_cfg.get("degraded_size_mult", 0.90)
     no_buy_diag["degraded_gross_exposure_pct"] = no_buy_diag.get("gross_exposure_pct")
     no_buy_diag["degraded_max_gross_exposure_pct"] = degraded_max_gross_exposure_pct
 
@@ -1872,7 +1874,7 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
                     and buyable(t, s)):
                 candidate_pool.append(_candidate(t, s, "watchlist"))
 
-        if scan_fresh and b["cash"] - cash_floor > MIN_POSITION_USD:
+        if scan_fresh and b["cash"] - cash_floor > min_position_usd:
             bullish = [r for r in fresh_scan_rows if r["direction"] > 0 and r["price"] > 0]
             by_conf = sorted(bullish, key=lambda r: (-r["confidence"], -r["score"]))[:10]
             by_gain = sorted(bullish, key=lambda r: -r["pct"])[:10]
@@ -1919,7 +1921,7 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
                 sigs[tk] = payload
                 if buyable(tk, payload):
                     candidate_pool.append(_candidate(tk, payload, "scan"))
-        elif b["cash"] - cash_floor > MIN_POSITION_USD and not scan_fresh:
+        elif b["cash"] - cash_floor > min_position_usd and not scan_fresh:
             stale_scan_skipped = True
     no_buy_diag["candidate_pool_count"] = len(candidate_pool)
 
@@ -1928,7 +1930,7 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
     ranked_candidates = rank_candidates(
         candidate_pool, pt_for_rank, STOP_LOSS_PCT, regime_kind,
         sizing_vix_mult, streak_mult, kelly_mult, b,
-        min_position_usd=MIN_POSITION_USD, commission=COMMISSION_PER_TRADE,
+        min_position_usd=min_position_usd, commission=COMMISSION_PER_TRADE,
         config=cfg, mode_size_mult=mode_info["mode_size_mult"],
         mode_size_reason=mode_info["mode_size_reason"],
     ) if candidate_pool else []
@@ -2028,9 +2030,8 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
             gross_exposure_after_trade=gross_after,
         )
 
-    def _degraded_reject_reason(cand, s, existing, taken_this_tick):
+    def _degraded_reject_reason(cand, s, taken_this_tick):
         rec = cand.get("rec") or {}
-        risk = cand.get("risk") or {}
         display = rec.get("display_signal_label")
         if s.get("stale"):
             return "DEGRADED_STALE_QUOTE_BLOCKED"
@@ -2038,15 +2039,6 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
             return "DEGRADED_NOT_BUY_CANDIDATE"
         if float(rec.get("confidence", 0) or 0) < degraded_min_confidence:
             return "DEGRADED_CONFIDENCE_BELOW_MIN"
-        if cand.get("trade_bucket") == "experimental":
-            return "DEGRADED_EXPERIMENTAL_BLOCKED"
-        if cand.get("edge_source") == "confidence_prior":
-            return "DEGRADED_CONFIDENCE_PRIOR_BLOCKED"
-        penalties = set(cand.get("warnings") or []) | set(risk.get("size_penalties") or [])
-        if "LOW_VOLUME_PENALTY_ONLY" in penalties:
-            return "DEGRADED_LOW_VOLUME_BLOCKED"
-        if existing:
-            return "DEGRADED_PYRAMIDING_BLOCKED"
         if taken_this_tick >= degraded_max_buys_per_tick:
             return "DEGRADED_MAX_BUYS_PER_TICK"
         if degraded_buys_today + taken_this_tick >= degraded_max_buys_today:
@@ -2089,11 +2081,11 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
                                           now, regime_kind)
             _collapse_skip(cand, reason, "rank", original_reason=original_reason)
             continue
-        if b["cash"] - cash_floor < MIN_POSITION_USD:
+        if b["cash"] - cash_floor < min_position_usd:
             break
         existing = b["holdings"].get(t)
         if mode_info["degraded_mode_active"]:
-            reject = _degraded_reject_reason(cand, s, existing, total_taken)
+            reject = _degraded_reject_reason(cand, s, total_taken)
             if reject:
                 _bump(no_buy_diag["degraded_reject_counts"], reject)
                 _bump(no_buy_diag["skip_reason_counts"], reject)
@@ -2136,7 +2128,7 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
             spend = min(spend, max(0, pt * MAX_CORR_GROUP_PCT - grp_current))
         if mode_info["degraded_mode_active"]:
             degraded_pos_room = max(0, pt * degraded_max_position_pct - existing_val)
-            if degraded_pos_room < MIN_POSITION_USD:
+            if degraded_pos_room < min_position_usd:
                 reason = "DEGRADED_MAX_POSITION_CAP"
                 _bump(no_buy_diag["degraded_reject_counts"], reason)
                 _bump(no_buy_diag["skip_reason_counts"], reason)
@@ -2147,7 +2139,7 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
                 continue
             spend = min(spend, degraded_pos_room)
             degraded_gross_room = max(0, pt * degraded_max_gross_exposure_pct - exposure_value)
-            if degraded_gross_room < MIN_POSITION_USD:
+            if degraded_gross_room < min_position_usd:
                 reason = "DEGRADED_GROSS_EXPOSURE_CAP"
                 _bump(no_buy_diag["degraded_reject_counts"], reason)
                 _bump(no_buy_diag["skip_reason_counts"], reason)
@@ -2177,8 +2169,8 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
             continue
         if variance_diag.get("size_mult", 1.0) < 1.0:
             spend *= variance_diag.get("size_mult", 1.0)
-        if spend < MIN_POSITION_USD:
-            original_reason = (f"Risk/cap spend ${spend:.0f} below ${MIN_POSITION_USD:.0f} floor "
+        if spend < min_position_usd:
+            original_reason = (f"Risk/cap spend ${spend:.0f} below ${min_position_usd:.0f} floor "
                                f"(target ${cand['risk']['target_notional']:.0f})")
             reason = original_reason
             if mode_info["degraded_mode_active"]:
@@ -2434,8 +2426,8 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
                 reasons.append(f"gross exposure cap reached ({no_buy_diag.get('gross_exposure_pct'):.0%})")
         elif not has_buys:
             reasons.append("no BUY signals across watchlist")
-        elif b["cash"] - cash_floor < MIN_POSITION_USD:
-            reasons.append(f"cash too low for a ${MIN_POSITION_USD} min position "
+        elif b["cash"] - cash_floor < min_position_usd:
+            reasons.append(f"cash too low for a ${min_position_usd:.0f} min position "
                            f"(${b['cash']:.0f}, reserve floor ${cash_floor:.0f})")
         if stale_scan_skipped:
             reasons.append(f"scan data stale ({int(scan_age/60)} min old) — skipped outside-watchlist")
@@ -2627,6 +2619,8 @@ def _render_bot_page(read_only):
         "proxy_mode_active": no_buy.get("proxy_mode_active"),
         "degraded_mode_active": no_buy.get("degraded_mode_active"),
         "degraded_mode_reason": no_buy.get("degraded_mode_reason"),
+        "min_buy_confidence": no_buy.get("min_buy_confidence"),
+        "min_trade_size_effective": no_buy.get("min_trade_size_effective"),
         "degraded_size_mult": no_buy.get("degraded_size_mult"),
         "degraded_min_confidence": no_buy.get("degraded_min_confidence"),
         "degraded_reject_counts": no_buy.get("degraded_reject_counts", {}),

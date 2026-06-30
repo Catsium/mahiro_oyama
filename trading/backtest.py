@@ -7,7 +7,7 @@ commission as the live bot — over multiple years of Stooq daily bars — then 
 buy-and-hold SPY over the identical test window.
 
 Two rule-sets, so one run quantifies what the fixes changed:
-  - mode="fixed"  : post-fix (cost-aware ratchet, $400 floor, daily-ATR trail, NET P&L)
+  - mode="fixed"  : post-fix (cost-aware ratchet, $100 floor, daily-ATR trail, NET P&L)
   - mode="legacy" : pre-fix  (+1.5%→+0.1% breakeven, $50 floor, regime-static trail, GROSS P&L)
 
 Walk-forward: V2 attribution buckets are learned on the train window from 5-day

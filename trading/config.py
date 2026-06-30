@@ -17,7 +17,7 @@ RISK_CONFIG = {
         "neutral": 0.70,
         "bear": 0.40,
     },
-    "min_trade_size": 400.0,
+    "min_trade_size": 100.0,
     "max_position_pct": 0.08,
     "max_sector_pct": 0.25,
     "max_corr_group_pct": 0.25,
@@ -33,8 +33,8 @@ RISK_CONFIG = {
 }
 
 SIGNAL_CONFIG = {
-    "min_buy_confidence": 55,
-    "min_strong_buy_confidence": 65,
+    "min_buy_confidence": 40,
+    "min_strong_buy_confidence": 70,
     "min_expected_edge_pct": 0.40,
     "min_net_edge_pct": 0.20,
     "strong_edge_pct": 2.00,
@@ -198,16 +198,16 @@ MARKET_DATA_MODES_CONFIG = {
     "proxy_size_mult": 0.85,
     "proxy_vol_window_days": 20,
     "proxy_min_spy_bars": 60,
-    "degraded_size_mult": 0.70,
-    "degraded_min_confidence": 55,
+    "degraded_size_mult": 0.90,
+    "degraded_min_confidence": 40,
     "degraded_max_new_buys_per_tick": 1,
     "degraded_max_new_buys_per_day": 1,
     "degraded_max_position_pct": 0.05,
     "degraded_max_gross_exposure_pct": 0.35,
-    "degraded_block_pyramiding": True,
-    "degraded_block_experimental": True,
-    "degraded_block_confidence_prior": True,
-    "degraded_block_low_volume_penalty": True,
+    "degraded_block_pyramiding": False,
+    "degraded_block_experimental": False,
+    "degraded_block_confidence_prior": False,
+    "degraded_block_low_volume_penalty": False,
     "degraded_require_buy_candidate": True,
     "degraded_require_fresh_quote": True,
     "degraded_require_normal_ev_gates": True,
@@ -215,7 +215,7 @@ MARKET_DATA_MODES_CONFIG = {
 }
 
 SWEEP_PARAMS = {
-    "signal.min_buy_confidence": [50, 55, 60],
+    "signal.min_buy_confidence": [40, 50, 60],
     "signal.min_expected_edge_pct": [0.25, 0.40, 0.60],
     "risk.base_risk_pct_by_regime.neutral": [0.60, 0.70, 0.85],
     "correlation.soft_var_cap": [0.03, 0.05, 0.08],
@@ -234,13 +234,13 @@ PRESET_SWEEPS = {
         "correlation.hard_var_cap": 0.10,
     },
     "balanced": {
-        "signal.min_buy_confidence": 55,
+        "signal.min_buy_confidence": 40,
         "signal.min_expected_edge_pct": 0.40,
         "correlation.soft_var_cap": 0.05,
         "correlation.hard_var_cap": 0.15,
     },
     "aggressive": {
-        "signal.min_buy_confidence": 50,
+        "signal.min_buy_confidence": 40,
         "signal.min_expected_edge_pct": 0.25,
         "risk.base_risk_pct_by_regime.neutral": 0.85,
         "correlation.soft_var_cap": 0.08,

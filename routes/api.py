@@ -597,6 +597,7 @@ def api_bot_status():
             "degraded_mode_active": diag.get("degraded_mode_active"),
             "degraded_mode_reason": diag.get("degraded_mode_reason"),
             "min_buy_confidence": diag.get("min_buy_confidence"),
+            "min_trade_size_effective": diag.get("min_trade_size_effective"),
             "degraded_size_mult": diag.get("degraded_size_mult"),
             "degraded_min_confidence": diag.get("degraded_min_confidence"),
             "degraded_reject_counts": diag.get("degraded_reject_counts", {}),
@@ -756,7 +757,7 @@ def api_attribution():
     # confidence, report win-rate + avg pnl. Makes the confidence score
     # meaningful (and is the data groundwork for future EV-based ranking).
     outcomes = b.get("trade_outcomes", [])
-    cal_defs = [("<40", 0, 40), ("40-55", 40, 55), ("55-70", 55, 70),
+    cal_defs = [("<40", 0, 40), ("40-50", 40, 50), ("50-70", 50, 70),
                 ("70-85", 70, 85), ("85+", 85, 1e9)]
     calibration = []
     for label, lo, hi in cal_defs:
