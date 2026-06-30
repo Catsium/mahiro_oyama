@@ -1,9 +1,9 @@
 """Daily history + intraday context fetchers.
 
 `get_history` builds the technical-indicator ctx dict (used by signals/risk/bot).
-Order: yfinance → Stooq (with live-bar) → recorded snapshots. Output ctx also
-gets enriched with weekly_posture (Round 1 #1.4) and sector_relative_strength
-(Round 1 #1.3).
+Order: managed daily bars (provider chain with live-bar) then recorded
+snapshots. Output ctx also gets enriched with weekly_posture (Round 1 #1.4)
+and sector_relative_strength (Round 1 #1.3).
 
 `get_intraday_context` returns 15-min ATR/RSI/VWMA-distance. Zero-filled when
 yfinance is blocked (i.e. on PythonAnywhere) so consumers gracefully fall back
@@ -21,6 +21,28 @@ from utils.deploy_config import PYTHONANYWHERE_MODE
 from utils.time_utils import is_market_open
 
 
+def _history_meta_from_df(df):
+    attrs = getattr(df, "attrs", {}) or {}
+    out = {
+        "history_source": attrs.get("source") or "daily",
+        "history_status": attrs.get("status") or "ok",
+        "history_provider": attrs.get("provider"),
+        "history_rows": int(len(df)) if df is not None else 0,
+        "history_warnings": list(attrs.get("warnings") or []),
+        "live_bar_applied": bool(attrs.get("live_bar_applied", False)),
+        "live_bar_reason": attrs.get("live_bar_reason"),
+        "quote_fresh": attrs.get("quote_fresh"),
+    }
+    try:
+        out["history_last_date"] = str(df.index[-1].date())
+    except Exception:
+        out["history_last_date"] = None
+    if attrs.get("stale_daily_cache_age_hours") is not None:
+        out["stale_daily_cache_age_hours"] = attrs.get("stale_daily_cache_age_hours")
+        out["stale_daily_cache_age_sec"] = attrs.get("stale_daily_cache_age_sec")
+    return out
+
+
 def get_history(tk):
     """Daily history + weekly posture. Cached 5 min."""
     c = cache_get(f"h_{tk}", max_age=300)
@@ -28,17 +50,7 @@ def get_history(tk):
         return c
     r = {}
     used_df = None
-    # 1) yfinance — period="1y" gives weekly_posture enough bars for weekly MACD
-    if not PYTHONANYWHERE_MODE:
-        try:
-            import yfinance as yf
-            h = yf.Ticker(tk).history(period="1y")
-            if not h.empty:
-                r = _ctx_from_series(h["Close"].round(2), df=h)
-                used_df = h
-        except Exception:
-            pass
-    # 2) Stooq daily CSV (copy so we don't mutate the cached frame)
+    # Managed daily bars (copy so live-bar does not mutate cached frames).
     if not r:
         try:
             df = _daily_bars(tk)
@@ -46,12 +58,19 @@ def get_history(tk):
                 df = df.copy()
                 df = _append_live_bar(df, tk)
                 r = _ctx_from_series(df["Close"].round(2), df=df)
+                if r:
+                    r.update(_history_meta_from_df(df))
                 used_df = df
         except Exception:
             pass
-    # 3) Locally recorded snapshots (last resort — no weekly possible)
+    # Locally recorded snapshots (last resort; no weekly possible).
     if not r:
         r = _ctx_from_recorded(tk)
+        if r:
+            r.setdefault("history_source", "recorded")
+            r.setdefault("history_status", "recorded_fallback")
+            r.setdefault("history_rows", 0)
+            r.setdefault("history_last_date", None)
     # #1.4: weekly posture
     if r and used_df is not None:
         wk = weekly_posture(used_df)

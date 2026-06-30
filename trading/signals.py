@@ -371,17 +371,23 @@ def get_recommendation(sent, ctx, regime=None, earnings=None, analyst=None, insi
     # votes). Was 4 when MA-cross and week-change also always voted; both are now
     # conditional / reason-only (de-dup #1, #2), so the denominator drops to match.
     baseline_tech = 0
+    data_quality_missing_fields = []
     if ctx:
         baseline_tech += 2
-        if "adx" in ctx:             baseline_tech += 1
-        if "macd_hist" in ctx:       baseline_tech += 1
-        if "bb_pos" in ctx:          baseline_tech += 1
-        if "stoch_k" in ctx:         baseline_tech += 1
-        if "vol_ratio" in ctx:       baseline_tech += 1
+        if "adx" in ctx and "mom_30d_pct" in ctx:
+            baseline_tech += 1
+        else:
+            data_quality_missing_fields.append("adx_or_mom_30d_pct")
+        if "vol_ratio" in ctx and "mom_30d_pct" in ctx:
+            baseline_tech += 1
+        else:
+            data_quality_missing_fields.append("vol_ratio_or_mom_30d_pct")
         if "mfi" in ctx:             baseline_tech += 1
         # Round-7: vwap daily vote dropped (de-dup #3) — no longer in denominator.
         if "weekly_trend_up" in ctx: baseline_tech += 1
         if "rel_str_pct" in ctx:     baseline_tech += 1
+    else:
+        data_quality_missing_fields.append("daily_history")
     expected_n = max(1, baseline_tech)
     if has_news:                                          expected_n += 1
     if analyst and analyst.get("total", 0) > 0:           expected_n += 1
@@ -475,6 +481,9 @@ def get_recommendation(sent, ctx, regime=None, earnings=None, analyst=None, insi
         "data_quality": data_quality, "is_dip": is_dip_flag,
         "categories": cat_votes, "cats_pos": cats_pos, "cats_neg": cats_neg,
         "expected_n": expected_n, "n_raw": n_raw,
+        "data_quality_actual_n": n_raw,
+        "data_quality_expected_n": expected_n,
+        "data_quality_missing_fields": data_quality_missing_fields,
         "penalty": penalty, "penalty_notes": penalty_notes,
         "thresholds": {"regime": rk, "strong_buy_tot": sb_t, "buy_tot": b_t,
                        "strong_sell_tot": ss_t, "sell_tot": s_t},

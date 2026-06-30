@@ -21,6 +21,57 @@ REGIME_STALE_CACHE_MAX_HOURS = 72
 REGIME_STALE_CACHE_MAX_SEC = REGIME_STALE_CACHE_MAX_HOURS * 3600
 
 
+def _valid_daily_df(df):
+    return (
+        df is not None
+        and isinstance(df, pd.DataFrame)
+        and not df.empty
+        and "Close" in df.columns
+    )
+
+
+def _blocked_or_forbidden_payload(raw):
+    text = str(raw or "").lower()
+    return (
+        "403" in text
+        or "forbidden" in text
+        or "blocked" in text
+        or "don't have access" in text
+        or "do not have access" in text
+        or "access to this resource" in text
+    )
+
+
+def _stale_daily_cache(tk, full=False, include_stooq=False, stooq_prefix="stooq"):
+    keys = []
+    if include_stooq:
+        keys.append((
+            f"{stooq_prefix}_daily",
+            f"{stooq_prefix}_full_{tk}" if full else f"{stooq_prefix}_{tk}",
+        ))
+    keys.extend((
+        ("finnhub_daily", f"fh_daily_full_{tk}" if full else f"fh_daily_{tk}"),
+        ("fmp_daily", f"fmp_daily_full_{tk}" if full else f"fmp_daily_{tk}"),
+    ))
+    for source, cache_key in keys:
+        cached, age_sec = cache_get_stale(
+            cache_key,
+            REGIME_STALE_CACHE_MAX_SEC,
+            default=CACHE_MISS,
+        )
+        if _valid_daily_df(cached):
+            stale = cached.copy(deep=False)
+            stale.attrs.update({
+                "source": f"stale_cache:{source}",
+                "status": "stale_cache",
+                "warnings": ["STALE_DAILY_CACHE_USED"],
+                "stale_daily_cache_age_sec": int(age_sec or 0),
+                "stale_daily_cache_age_hours": round(float(age_sec or 0) / 3600.0, 2),
+            })
+            return stale
+    return None
+
+
 def record_price(tk, price):
     append_price_snapshot(tk, price, min_interval=60, limit=6000)
 
@@ -35,6 +86,7 @@ def _direct_stooq_daily(tk, full=False, cache_prefix="stooq"):
     if c is not CACHE_MISS:
         if isinstance(c, pd.DataFrame) and not c.empty:
             c.attrs.setdefault("source", f"{cache_prefix}_daily")
+            c.attrs.setdefault("provider", "stooq")
             c.attrs.setdefault("status", "ok")
             return c
         return None
@@ -65,6 +117,7 @@ def _direct_stooq_daily(tk, full=False, cache_prefix="stooq"):
         if not full:
             df = df.tail(400)
         df.attrs["source"] = f"{cache_prefix}_daily"
+        df.attrs["provider"] = "stooq"
         df.attrs["status"] = "ok"
         cache_set(cache_key, df)
         record_api_success(endpoint)
@@ -90,6 +143,7 @@ def _finnhub_daily(tk, full=False, use_cache=True):
         if c is not CACHE_MISS:
             if isinstance(c, pd.DataFrame) and not c.empty:
                 c.attrs.setdefault("source", "finnhub_daily")
+                c.attrs.setdefault("provider", "finnhub")
                 c.attrs.setdefault("status", "ok")
                 return c
             return None
@@ -99,7 +153,8 @@ def _finnhub_daily(tk, full=False, use_cache=True):
         start = int((datetime.utcnow() - timedelta(days=days)).timestamp())
         raw = fh.stock_candles(tk, "D", start, end) or {}
         if raw.get("s") != "ok" or not raw.get("c"):
-            record_api_failure(endpoint, "empty Finnhub daily candles", status="empty_response")
+            status = "blocked_or_forbidden" if _blocked_or_forbidden_payload(raw) else "empty_response"
+            record_api_failure(endpoint, raw or "empty Finnhub daily candles", status=status)
             return None
         df = pd.DataFrame({
             "Open": raw.get("o", []),
@@ -116,6 +171,7 @@ def _finnhub_daily(tk, full=False, use_cache=True):
         if not full:
             df = df.tail(400)
         df.attrs["source"] = "finnhub_daily"
+        df.attrs["provider"] = "finnhub"
         df.attrs["status"] = "ok"
         if use_cache:
             cache_set(cache_key, df)
@@ -137,9 +193,10 @@ def _fmp_daily(tk, full=False, use_cache=True):
     This is a daily/history fallback only; it is not a quote, news, or intraday
     provider for live trading ticks.
     """
-    if not FMP_KEY:
-        return None
     endpoint = f"fmp_daily:{tk}:{int(bool(full))}"
+    if not FMP_KEY:
+        record_api_failure(endpoint, "FMP_KEY/FMP_API_KEY is not configured", status="skipped_missing_key")
+        return None
     if should_skip_api(endpoint):
         return None
     cache_key = f"fmp_daily_full_{tk}" if full else f"fmp_daily_{tk}"
@@ -148,6 +205,7 @@ def _fmp_daily(tk, full=False, use_cache=True):
         if c is not CACHE_MISS:
             if isinstance(c, pd.DataFrame) and not c.empty:
                 c.attrs.setdefault("source", "fmp_daily")
+                c.attrs.setdefault("provider", "fmp")
                 c.attrs.setdefault("status", "ok")
                 return c
             return None
@@ -194,12 +252,14 @@ def _fmp_daily(tk, full=False, use_cache=True):
         for col in ("Open", "High", "Low", "Close", "Volume"):
             df[col] = pd.to_numeric(df[col], errors="coerce")
         df = df.dropna(subset=["Date", "Close"]).set_index("Date").sort_index()
+        df = df[~df.index.duplicated(keep="last")]
         if df.empty:
             record_api_failure(endpoint, "empty FMP daily normalized frame", status="empty_response")
             return None
         if not full:
             df = df.tail(400)
         df.attrs["source"] = "fmp_daily"
+        df.attrs["provider"] = "fmp"
         df.attrs["status"] = "ok"
         if use_cache:
             cache_set(cache_key, df)
@@ -215,11 +275,26 @@ def _fmp_daily(tk, full=False, use_cache=True):
 
 
 def _raw_daily(tk, full=False):
-    """Daily bars. In PA mode this uses Finnhub; off-PA it uses Stooq CSV."""
+    """Daily bars for normal ticker signal history."""
     if PYTHONANYWHERE_MODE:
-        return _finnhub_daily(tk, full=full)
+        df = _finnhub_daily(tk, full=full)
+        if _valid_daily_df(df):
+            return df
+        df = _fmp_daily(tk, full=full)
+        if _valid_daily_df(df):
+            return df
+        return _stale_daily_cache(tk, full=full)
 
-    return _direct_stooq_daily(tk, full=full)
+    df = _direct_stooq_daily(tk, full=full)
+    if _valid_daily_df(df):
+        return df
+    df = _finnhub_daily(tk, full=full)
+    if _valid_daily_df(df):
+        return df
+    df = _fmp_daily(tk, full=full)
+    if _valid_daily_df(df):
+        return df
+    return _stale_daily_cache(tk, full=full, include_stooq=True)
 
 
 def get_regime_daily(tk, full=False):
@@ -230,55 +305,30 @@ def get_regime_daily(tk, full=False):
     FMP daily fallback, then a visibly stale successful cache within 72 hours.
     Local/off-PA may use Stooq first with Finnhub/FMP fallback.
     """
-    def _ok(df):
-        return df is not None and isinstance(df, pd.DataFrame) and not df.empty
-
-    def _stale_cache():
-        for source, cache_key in (
-            ("finnhub_daily", f"fh_daily_full_{tk}" if full else f"fh_daily_{tk}"),
-            ("fmp_daily", f"fmp_daily_full_{tk}" if full else f"fmp_daily_{tk}"),
-        ):
-            cached, age_sec = cache_get_stale(
-                cache_key,
-                REGIME_STALE_CACHE_MAX_SEC,
-                default=CACHE_MISS,
-            )
-            if isinstance(cached, pd.DataFrame) and not cached.empty:
-                stale = cached.copy(deep=False)
-                stale.attrs.update({
-                    "source": f"stale_cache:{source}",
-                    "status": "stale_cache",
-                    "warnings": ["STALE_DAILY_CACHE_USED"],
-                    "stale_daily_cache_age_sec": int(age_sec or 0),
-                    "stale_daily_cache_age_hours": round(float(age_sec or 0) / 3600.0, 2),
-                })
-                return stale
-        return None
-
     if PYTHONANYWHERE_MODE:
         df = _finnhub_daily(tk, full=full)
-        if _ok(df):
+        if _valid_daily_df(df):
             return df
 
         df = _fmp_daily(tk, full=full)
-        if _ok(df):
+        if _valid_daily_df(df):
             return df
 
-        return _stale_cache()
+        return _stale_daily_cache(tk, full=full)
 
     df = _direct_stooq_daily(tk, full=full, cache_prefix="stooq_regime")
-    if _ok(df):
+    if _valid_daily_df(df):
         return df
 
     df = _finnhub_daily(tk, full=full)
-    if _ok(df):
+    if _valid_daily_df(df):
         return df
 
     df = _fmp_daily(tk, full=full)
-    if _ok(df):
+    if _valid_daily_df(df):
         return df
 
-    return None
+    return _stale_daily_cache(tk, full=full, include_stooq=True, stooq_prefix="stooq_regime")
 
 
 def _stooq_daily(tk, full=False):
@@ -286,25 +336,51 @@ def _stooq_daily(tk, full=False):
 
 
 def _append_live_bar(df, tk):
-    """Append today's live Finnhub quote as a synthetic daily row when absent."""
+    """Apply today's fresh quote to daily bars without inventing volume."""
     if df is None or df.empty:
         return df
     try:
-        last_dt = df.index[-1]
-        today = pd.Timestamp(datetime.now().date())
-        if pd.Timestamp(last_dt).normalize() >= today:
+        from utils.time_utils import is_market_open
+
+        df.attrs["live_bar_applied"] = False
+        df.attrs["live_bar_reason"] = "market_closed"
+        df.attrs["quote_fresh"] = None
+        if not is_market_open():
             return df
+        today = pd.Timestamp(datetime.now().date())
         q = get_quote(tk) or {}
         live = q.get("price") or 0
-        if live <= 0:
+        quote_fresh = bool(live > 0 and not q.get("stale"))
+        df.attrs["quote_fresh"] = quote_fresh
+        if not quote_fresh:
+            df.attrs["live_bar_reason"] = "quote_stale_or_missing"
             return df
-        o_hi = q.get("high") or live
-        o_lo = q.get("low") or live
-        o_op = q.get("open") or live
+        live = float(live)
+
+        idx_norm = pd.to_datetime(df.index, errors="coerce").normalize()
+        today_positions = [i for i, dt in enumerate(idx_norm) if dt == today]
+        if today_positions:
+            row_idx = df.index[today_positions[-1]]
+            if "Close" in df.columns:
+                df.loc[row_idx, "Close"] = live
+            if "High" in df.columns:
+                cur_high = pd.to_numeric(pd.Series([df.loc[row_idx, "High"]]), errors="coerce").iloc[0]
+                df.loc[row_idx, "High"] = max(float(cur_high), live) if pd.notna(cur_high) and cur_high > 0 else live
+            if "Low" in df.columns:
+                cur_low = pd.to_numeric(pd.Series([df.loc[row_idx, "Low"]]), errors="coerce").iloc[0]
+                df.loc[row_idx, "Low"] = min(float(cur_low), live) if pd.notna(cur_low) and cur_low > 0 else live
+            df.attrs["live_bar_applied"] = True
+            df.attrs["live_bar_reason"] = "updated_today_row"
+            return df
+
+        o_hi = q.get("high") if q.get("high") and q.get("high") > 0 else live
+        o_lo = q.get("low") if q.get("low") and q.get("low") > 0 else live
+        o_op = q.get("open") if q.get("open") and q.get("open") > 0 else live
+        o_vol = q.get("volume") if q.get("volume") and q.get("volume") > 0 else float("nan")
         row = {}
         for col in df.columns:
             if col == "Volume":
-                row[col] = 0.0
+                row[col] = o_vol
             elif col == "High":
                 row[col] = float(o_hi)
             elif col == "Low":
@@ -314,7 +390,11 @@ def _append_live_bar(df, tk):
             else:
                 row[col] = float(live)
         df.loc[today] = row
+        df.attrs["live_bar_applied"] = True
+        df.attrs["live_bar_reason"] = "appended_today_row"
     except Exception as e:
+        df.attrs["live_bar_applied"] = False
+        df.attrs["live_bar_reason"] = f"error:{type(e).__name__}"
         try:
             print(f"[live-bar] {tk}: {type(e).__name__}: {e}")
         except Exception:
@@ -327,12 +407,12 @@ def _fetch_quote_once(tk):
     endpoint = f"quote:{tk}"
     if should_skip_api(endpoint, cooldown_sec=120):
         return {"price": 0, "change": 0, "pct": 0, "high": 0, "low": 0,
-                "open": 0, "prev": 0}
+                "open": 0, "prev": 0, "source": "finnhub_quote"}
     try:
         q = fh.quote(tk)
         r = {"price": q.get("c", 0), "change": q.get("d", 0), "pct": q.get("dp", 0),
              "high": q.get("h", 0), "low": q.get("l", 0), "open": q.get("o", 0),
-             "prev": q.get("pc", 0)}
+             "prev": q.get("pc", 0), "source": "finnhub_quote"}
         if r["price"] == 0 and not PYTHONANYWHERE_MODE:
             import yfinance as yf
             h = yf.Ticker(tk).history(period="2d")
@@ -343,13 +423,14 @@ def _fetch_quote_once(tk):
                 r["prev"] = prev
                 r["change"] = round(cur - prev, 2)
                 r["pct"] = round((cur - prev) / prev * 100, 2) if prev else 0
+                r["source"] = "yfinance_quote"
         if r["price"] > 0:
             record_api_success(endpoint)
         return r
     except Exception as e:
         record_api_failure(endpoint, e)
         return {"price": 0, "change": 0, "pct": 0, "high": 0, "low": 0,
-                "open": 0, "prev": 0}
+                "open": 0, "prev": 0, "source": "finnhub_quote"}
 
 
 def get_quote(tk):
@@ -369,6 +450,7 @@ def get_quote(tk):
             last_ts, last_price = pts[-1][0], pts[-1][1]
             r["price"] = last_price
             r["prev"] = last_price
+            r["source"] = "recorded_price"
             r["stale"] = True
             r["stale_age_sec"] = int(time.time()) - int(last_ts)
             try:
@@ -378,6 +460,7 @@ def get_quote(tk):
         else:
             r["stale"] = True
             r["stale_age_sec"] = -1
+            r["source"] = "missing"
             try:
                 print(f"[get_quote] {tk}: total failure, no recorded history")
             except Exception:

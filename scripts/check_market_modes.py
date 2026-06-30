@@ -72,7 +72,7 @@ def main():
         "cls": "buy",
         "signal": "BUY",
         "ticker": "SAMPLE",
-        "confidence": 55,
+        "confidence": 40,
         "display_signal_label": "BUY_CANDIDATE",
     }
     sample_degraded["eligible"] = is_execution_candidate(
