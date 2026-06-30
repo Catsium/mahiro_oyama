@@ -50,8 +50,6 @@ def classify_display_signal(raw_cls, confidence):
     if cls in ("buy", "strong-buy"):
         if conf < 40:
             return "BULLISH_LEAN"
-        if conf < 55:
-            return "WATCH_OR_LEAN"
         if conf < 70:
             return "BUY_CANDIDATE"
         return "STRONG_BUY_CANDIDATE"
@@ -463,10 +461,10 @@ def get_recommendation(sent, ctx, regime=None, earnings=None, analyst=None, insi
         conf = max(15, conf - penalty)
         reasons.append(f"⚠️ Confidence penalties: {' · '.join(penalty_notes)} → final {conf}%")
 
-    # #7: sizing_confidence — floor strong signals to 55 for the SIZING path only,
+    # #7: sizing_confidence - floor strong signals to 70 for the sizing path only,
     # V1: post-penalty labels must match usable confidence.
     if cls in ("strong-buy", "strong-sell"):
-        sizing_confidence = max(conf, 55)
+        sizing_confidence = max(conf, 70)
     else:
         sizing_confidence = conf
 

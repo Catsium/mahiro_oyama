@@ -286,6 +286,7 @@ def bot_tick():
         "degraded_mode_active": diag.get("degraded_mode_active"),
         "degraded_mode_reason": diag.get("degraded_mode_reason"),
         "min_buy_confidence": diag.get("min_buy_confidence"),
+        "min_trade_size_effective": diag.get("min_trade_size_effective"),
         "degraded_size_mult": diag.get("degraded_size_mult"),
         "degraded_min_confidence": diag.get("degraded_min_confidence"),
         "degraded_reject_counts": diag.get("degraded_reject_counts", {}),

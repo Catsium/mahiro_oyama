@@ -109,7 +109,7 @@ def get_vix():
     volatility %, not the VIX index.
     """
     c = cache_get("vix", max_age=3600)
-    if c is not None and "data_ok" in c and "volatility_window_days" in c:
+    if c is not None and c.get("data_ok") is True and "volatility_window_days" in c:
         return c
     mode_cfg = DEFAULT_CONFIG.get("market_data_modes", {})
     window = int(mode_cfg.get("proxy_vol_window_days", 20))
@@ -133,7 +133,12 @@ def get_vix():
             attrs = getattr(df, "attrs", {}) or {}
             warnings = list(attrs.get("warnings") or [])
             df = _append_live_bar(df.copy(), "SPY")
-            rets = df["Close"].pct_change().dropna().tail(window)
+            close_col = "Close" if "Close" in df.columns else "close" if "close" in df.columns else None
+            if close_col is None:
+                r["data_status"] = "missing_spy_close_column"
+                cache_set("vix", r)
+                return r
+            rets = df[close_col].pct_change().dropna().tail(window)
             if len(rets) >= window:
                 rv = float(rets.std() * (252 ** 0.5) * 100)
                 r["vix"] = round(rv, 2)
@@ -145,7 +150,7 @@ def get_vix():
                 r["spy_data_source"] = attrs.get("source")
                 if warnings:
                     r["data_health_warnings"] = warnings
-                r["vix_display"] = "proxy"
+                r["vix_display"] = "SPY_REALIZED_VOL_PROXY"
                 if   rv > 28: r["regime"] = "PANIC";     r["mult"] = 0.0
                 elif rv > 18: r["regime"] = "HIGH_RISK"; r["mult"] = 0.5
                 else:         r["regime"] = "NORMAL";    r["mult"] = 1.0
