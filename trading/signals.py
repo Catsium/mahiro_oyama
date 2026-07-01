@@ -60,6 +60,23 @@ def classify_display_signal(raw_cls, confidence):
     return "HOLD"
 
 
+def _with_confidence_metadata(rec):
+    conf = rec.get("confidence", 0)
+    cls = str(rec.get("cls") or "hold").lower()
+    reason = f"raw_class_{cls}"
+    rec.setdefault("score_total", rec.get("score", 0))
+    rec.setdefault("confidence_before_penalties", conf)
+    rec.setdefault("confidence_after_penalties", conf)
+    rec.setdefault("confidence_before_floor", conf)
+    rec.setdefault("confidence_final", conf)
+    rec.setdefault("confidence_floor_candidate", False)
+    rec.setdefault("confidence_floor_applied", False)
+    rec.setdefault("confidence_floor_reason", reason)
+    rec.setdefault("confidence_floor_blockers", [reason])
+    rec.setdefault("confidence_penalties", [])
+    return rec
+
+
 def _decay_multiplier(age_hours, half_life_hours):
     """Exponential decay: signal value is multiplied by 0.5 every half_life_hours."""
     if age_hours <= 0:
@@ -89,11 +106,14 @@ def get_recommendation(sent, ctx, regime=None, earnings=None, analyst=None, insi
     signal_cfg = cfg.get("signal", {})
     # Earnings hold — binary risk, override everything
     if earnings and earnings.get("soon"):
-        return {"signal": "HOLD", "cls": "hold", "confidence": 55,
+        return _with_confidence_metadata({"signal": "HOLD", "cls": "hold", "confidence": 55,
                 "score": 0, "max_score": 1, "categories": {},
                 "cats_pos": 0, "cats_neg": 0,
                 "reasons": [f"⚠️ Earnings within 5 days ({earnings.get('date', 'soon')}) — binary event risk, holding"],
-                "data_quality": 1.0, "force_hold": True, "is_dip": False}
+                "data_quality": 1.0, "force_hold": True, "is_dip": False,
+                "data_quality_actual_n": 0, "data_quality_expected_n": 0,
+                "data_quality_missing_fields": [], "penalty": 0,
+                "penalty_notes": [], "thresholds": {}})
 
     # `weights` lets the backtest pass frozen/trained weights (or {} for defaults)
     # without touching the live bot_state.json; live callers leave it None.
@@ -414,6 +434,7 @@ def get_recommendation(sent, ctx, regime=None, earnings=None, analyst=None, insi
         conf = round((35 + strength * 45 + cat_bonus * 10) * data_quality * uncertainty_penalty
                      + 12 * (1 - data_quality))
         conf = max(15, min(95, conf))
+    confidence_before_penalties = conf
 
     if not ctx:
         reasons.insert(0, "Limited data — only news sentiment available. Collecting price snapshots locally as fallback.")
@@ -424,6 +445,7 @@ def get_recommendation(sent, ctx, regime=None, earnings=None, analyst=None, insi
     # non-HOLD signals (HOLD already has its own neutrality calc).
     penalty = 0
     penalty_notes = []
+    confidence_penalties = []
     if cls != "hold":
         # Market-volatility gate: high realized vol = unstable price action. get_vix()
         # now returns SPY 20d annualized realized-vol % (yfinance ^VIX is dead on PA).
@@ -434,8 +456,14 @@ def get_recommendation(sent, ctx, regime=None, earnings=None, analyst=None, insi
                 from trading.risk import get_vix
                 vix = get_vix() or {}
                 v = vix.get("vix", 0) or 0
-                if   v > 28: penalty += 25; penalty_notes.append(f"realized-vol {v:.0f}% PANIC −25")
-                elif v > 18: penalty += 12; penalty_notes.append(f"realized-vol {v:.0f}% elevated −12")
+                if v > 28:
+                    penalty += 25
+                    penalty_notes.append(f"realized-vol {v:.0f}% PANIC −25")
+                    confidence_penalties.append("volatility_panic")
+                elif v > 18:
+                    penalty += 12
+                    penalty_notes.append(f"realized-vol {v:.0f}% elevated −12")
+                    confidence_penalties.append("volatility_elevated")
             except Exception:
                 pass
         if ctx:
@@ -444,28 +472,52 @@ def get_recommendation(sent, ctx, regime=None, earnings=None, analyst=None, insi
             if 0 < adv < 5_000_000:
                 penalty += 10
                 penalty_notes.append(f"low liquidity ADV ${adv/1e6:.1f}M −10")
+                confidence_penalties.append("low_liquidity")
             # ATR penalty absorbs the old `vol_adj` size multiplier (removed from the
             # sizing stack): high-ATR names now lose confidence → lose size via weight,
             # instead of being cut by a separate independent multiplier.
             if atr > 6:
                 penalty += 12
                 penalty_notes.append(f"high ATR {atr:.1f}% −12")
+                confidence_penalties.append("high_atr")
             elif atr > 3.5:
                 penalty += 6
                 penalty_notes.append(f"elevated ATR {atr:.1f}% −6")
+                confidence_penalties.append("elevated_atr")
             # Higher-timeframe conflict: daily bullish but weekly bearish
             if tot > 0 and ctx.get("weekly_trend_up") is False:
                 penalty += 15
                 penalty_notes.append("daily↑ vs weekly↓ −15")
+                confidence_penalties.append("weekly_trend_conflict")
             # Gap-up extension: consecutive up days × MA30 gap proxy
             consec = ctx.get("consec_up_days", 0)
             gap = (ctx.get("current", 0) - ctx.get("ma30", 0)) / ctx.get("ma30", 1) * 100 if ctx.get("ma30") else 0
             if consec >= 5 and gap > 5 and tot > 0:
                 penalty += 15
                 penalty_notes.append(f"gap-up extended ({consec} green, {gap:+.0f}% vs MA30) −15")
+                confidence_penalties.append("gap_extension")
     if penalty:
         conf = max(15, conf - penalty)
         reasons.append(f"⚠️ Confidence penalties: {' · '.join(penalty_notes)} → final {conf}%")
+    confidence_after_penalties = conf
+
+    floor_blockers = []
+    if cls in ("buy", "strong-buy"):
+        if tot < b_t:
+            floor_blockers.append("score_below_buy_threshold")
+        if cats_pos < b_c:
+            floor_blockers.append("insufficient_positive_categories")
+        if not ctx:
+            floor_blockers.append("missing_history")
+        if data_quality < 0.60:
+            floor_blockers.append("low_data_quality")
+        if cats_neg > 1:
+            floor_blockers.append("high_negative_category_count")
+        for code in ("volatility_panic", "low_liquidity", "high_atr"):
+            if code in confidence_penalties:
+                floor_blockers.append(code)
+    confidence_before_floor = conf
+    confidence_floor_candidate = cls in ("buy", "strong-buy") and not floor_blockers
 
     # #7: sizing_confidence - floor strong signals to 70 for the sizing path only,
     # V1: post-penalty labels must match usable confidence.
@@ -485,8 +537,23 @@ def get_recommendation(sent, ctx, regime=None, earnings=None, analyst=None, insi
         "data_quality_expected_n": expected_n,
         "data_quality_missing_fields": data_quality_missing_fields,
         "penalty": penalty, "penalty_notes": penalty_notes,
+        "score_total": tot,
+        "confidence_before_penalties": confidence_before_penalties,
+        "confidence_after_penalties": confidence_after_penalties,
+        "confidence_before_floor": confidence_before_floor,
+        "confidence_final": conf,
+        "confidence_floor_candidate": confidence_floor_candidate,
+        "confidence_floor_applied": False,
+        "confidence_floor_reason": (
+            "signal_floor_candidate" if confidence_floor_candidate
+            else (floor_blockers[0] if floor_blockers else None)
+        ),
+        "confidence_floor_blockers": floor_blockers,
+        "confidence_penalties": confidence_penalties,
         "thresholds": {"regime": rk, "strong_buy_tot": sb_t, "buy_tot": b_t,
-                       "strong_sell_tot": ss_t, "sell_tot": s_t},
+                       "strong_buy_cats": sb_c, "buy_cats": b_c,
+                       "strong_sell_tot": ss_t, "sell_tot": s_t,
+                       "strong_sell_cats": ss_c, "sell_cats": s_c},
     }
 
 

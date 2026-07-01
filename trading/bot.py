@@ -104,6 +104,7 @@ KNIFE_CATALYST_TYPES = {
 # Pyramid adds, new positions, and outside positions use the same minimum.
 MIN_POSITION_USD   = 100
 BOT_TICK_MAX_RUNTIME_SEC = 25
+MIN_SIGNAL_HISTORY_ROWS = 60
 USE_CONFIDENCE_WEIGHTING = True
 REQUIRED_TICK_LOG_FIELDS = (
     "timestamp",
@@ -204,6 +205,68 @@ def _annotate_signal(rec):
     return rec
 
 
+def _finalize_signal_confidence(payload, cfg):
+    payload = payload or {}
+    rec = payload.get("rec") or {}
+    if not isinstance(rec, dict):
+        return rec
+
+    ctx = payload.get("ctx") or {}
+    quote = payload.get("quote") or {}
+    price = quote.get("price", payload.get("price", 0))
+    quote_fresh = bool(price and price > 0 and not payload.get("stale") and not quote.get("stale"))
+    blockers = list(rec.get("confidence_floor_blockers") or [])
+    if not quote_fresh:
+        blockers.append("stale_quote" if price and price > 0 else "invalid_price")
+    try:
+        history_rows = int(ctx.get("history_rows") or 0)
+    except Exception:
+        history_rows = 0
+    if history_rows <= 0:
+        blockers.append("missing_history")
+    elif history_rows < MIN_SIGNAL_HISTORY_ROWS:
+        blockers.append("insufficient_history")
+    history_source = str(ctx.get("history_source") or "")
+    history_status = str(ctx.get("history_status") or "")
+    if history_source.startswith("stale_cache") or history_status == "stale_cache":
+        blockers.append("stale_history")
+
+    blockers = list(dict.fromkeys(blockers))
+    rec["confidence_floor_blockers"] = blockers
+    try:
+        conf = float(
+            rec.get("confidence_before_floor",
+                    rec.get("confidence_after_penalties",
+                            rec.get("confidence", 0))) or 0
+        )
+    except Exception:
+        conf = 0.0
+    rec.setdefault("confidence_before_floor", conf)
+    rec["confidence"] = int(conf) if float(conf).is_integer() else conf
+    if rec.get("cls") not in ("strong-buy", "strong-sell"):
+        rec["sizing_confidence"] = rec["confidence"]
+    min_conf = float(((cfg or {}).get("signal") or {}).get("min_buy_confidence", 40))
+    should_floor = bool(rec.get("confidence_floor_candidate")) and not blockers and conf < min_conf
+    if should_floor:
+        floored = int(min_conf) if float(min_conf).is_integer() else min_conf
+        rec["confidence"] = floored
+        rec["confidence_final"] = floored
+        rec["confidence_floor_applied"] = True
+        rec["confidence_floor_reason"] = "valid_raw_buy_floor"
+        if rec.get("cls") not in ("strong-buy", "strong-sell"):
+            rec["sizing_confidence"] = floored
+        reasons = rec.setdefault("reasons", [])
+        floor_note = f"Confidence floor: valid raw BUY -> {floored}%"
+        if floor_note not in reasons:
+            reasons.append(floor_note)
+    else:
+        rec["confidence_final"] = rec.get("confidence")
+        rec["confidence_floor_applied"] = False
+        if rec.get("confidence_floor_candidate") and blockers:
+            rec["confidence_floor_reason"] = blockers[0]
+    return _annotate_signal(rec)
+
+
 def _history_source_bucket(source):
     source = str(source or "missing")
     if source.startswith("stale_cache"):
@@ -248,7 +311,7 @@ def _ticker_debug_row(t, payload, cfg, degraded_mode_active=False):
     )
     why_not_buy = None
     if not execution_eligible:
-        why_not_buy = "score_below_buy_threshold_or_not_enough_positive_categories"
+        why_not_buy = why_not_execution or "score_below_buy_threshold_or_not_enough_positive_categories"
     if payload.get("stale"):
         why_not_buy = "stale_quote"
     elif not price or price <= 0:
@@ -265,10 +328,19 @@ def _ticker_debug_row(t, payload, cfg, degraded_mode_active=False):
         "raw_class": rec.get("cls") or "hold",
         "display_signal_label": rec.get("display_signal_label"),
         "confidence": rec.get("confidence"),
-        "score_total": rec.get("score"),
+        "confidence_before_floor": rec.get("confidence_before_floor"),
+        "confidence_before_penalties": rec.get("confidence_before_penalties"),
+        "confidence_after_penalties": rec.get("confidence_after_penalties"),
+        "confidence_final": rec.get("confidence_final", rec.get("confidence")),
+        "confidence_floor_applied": bool(rec.get("confidence_floor_applied", False)),
+        "confidence_floor_reason": rec.get("confidence_floor_reason"),
+        "confidence_penalties": rec.get("confidence_penalties", []),
+        "score_total": rec.get("score_total", rec.get("score")),
         "buy_score_threshold": (rec.get("thresholds") or {}).get("buy_tot"),
+        "sell_score_threshold": (rec.get("thresholds") or {}).get("sell_tot"),
         "cats_pos": rec.get("cats_pos"),
         "cats_neg": rec.get("cats_neg"),
+        "cats_required_for_buy": (rec.get("thresholds") or {}).get("buy_cats"),
         "data_quality": rec.get("data_quality"),
         "data_quality_actual_n": rec.get("data_quality_actual_n", rec.get("n_raw")),
         "data_quality_expected_n": rec.get("data_quality_expected_n", rec.get("expected_n")),
@@ -1231,13 +1303,13 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
                                          config=cfg)
             rec = dict(rec)
             rec["catalyst"] = catalyst
-            _annotate_signal(rec)
             # Round-4 Bug Fix #1: capture stale flag so SELL/BUY halt on API failure.
             q = get_quote(t) or {}
-            return t, {"rec": rec, "price": q.get("price", 0), "stale": bool(q.get("stale")),
-                       "quote": q,
-                       "arts": arts, "ctx": ctx, "intra": intra, "earn": earn,
-                       "analyst": analyst, "insider": insider}
+            payload = {"rec": rec, "price": q.get("price", 0), "stale": bool(q.get("stale")),
+                       "quote": q, "arts": arts, "ctx": ctx, "intra": intra,
+                       "earn": earn, "analyst": analyst, "insider": insider}
+            _finalize_signal_confidence(payload, cfg)
+            return t, payload
         except Exception as e:
             try: print(f"[_fetch_one] {t}: {type(e).__name__}: {e}")
             except Exception: pass
@@ -2025,7 +2097,10 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
                     "earn": cached.get("earn") or {},
                     "analyst": cached.get("analyst") or {},
                     "insider": cached.get("insider") or {},
+                    "quote": q_o,
                 }
+                _finalize_signal_confidence(payload, cfg)
+                rec = payload["rec"]
                 if pr <= 0 or payload["stale"]:
                     continue
                 if not is_execution_candidate(
@@ -2907,7 +2982,7 @@ def run_scan():
                                          config=cfg)
             rec = dict(rec)
             rec["catalyst"] = catalyst
-            cache_set(f"scan_payload_{t}", {
+            payload = {
                 "arts": arts,
                 "sent": sent,
                 "ctx": ctx,
@@ -2918,7 +2993,10 @@ def run_scan():
                 "quote": q,
                 "price": q.get("price", 0),
                 "stale": bool(q.get("stale")),
-            })
+            }
+            _finalize_signal_confidence(payload, cfg)
+            rec = payload["rec"]
+            cache_set(f"scan_payload_{t}", payload)
             direction = 1 if rec["score"] > 0 else (-1 if rec["score"] < 0 else 0)
             return {
                 "ticker": t, "price": q["price"], "change": q["change"], "pct": q["pct"],
