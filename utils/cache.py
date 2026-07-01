@@ -73,7 +73,9 @@ def _classify_provider_status(error=None, status=None):
     text = str(error or "").lower()
     if _looks_rate_limited(error):
         return "rate_limited"
-    if "403" in text or "forbidden" in text or "blocked" in text:
+    if ("403" in text or "forbidden" in text or "blocked" in text
+            or "don't have access" in text or "do not have access" in text
+            or "access to this resource" in text):
         return "blocked_or_forbidden"
     if "timeout" in text or "timed out" in text:
         return "timeout"

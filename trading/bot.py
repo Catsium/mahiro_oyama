@@ -104,6 +104,7 @@ KNIFE_CATALYST_TYPES = {
 # Pyramid adds, new positions, and outside positions use the same minimum.
 MIN_POSITION_USD   = 100
 BOT_TICK_MAX_RUNTIME_SEC = 25
+MIN_SIGNAL_HISTORY_ROWS = 60
 USE_CONFIDENCE_WEIGHTING = True
 REQUIRED_TICK_LOG_FIELDS = (
     "timestamp",
@@ -122,6 +123,11 @@ REQUIRED_TICK_LOG_FIELDS = (
     "data_health_warnings",
     "raw_buy_count",
     "display_buy_candidate_count",
+    "history_source_counts",
+    "history_missing_count",
+    "history_fmp_fallback_count",
+    "history_finnhub_daily_blocked_count",
+    "history_stale_cache_count",
     "candidate_pool_count",
     "ranked_count",
     "tradable_count",
@@ -197,6 +203,155 @@ def _annotate_signal(rec):
         rec.get("confidence", 0),
     )
     return rec
+
+
+def _finalize_signal_confidence(payload, cfg):
+    payload = payload or {}
+    rec = payload.get("rec") or {}
+    if not isinstance(rec, dict):
+        return rec
+
+    ctx = payload.get("ctx") or {}
+    quote = payload.get("quote") or {}
+    price = quote.get("price", payload.get("price", 0))
+    quote_fresh = bool(price and price > 0 and not payload.get("stale") and not quote.get("stale"))
+    blockers = list(rec.get("confidence_floor_blockers") or [])
+    if not quote_fresh:
+        blockers.append("stale_quote" if price and price > 0 else "invalid_price")
+    try:
+        history_rows = int(ctx.get("history_rows") or 0)
+    except Exception:
+        history_rows = 0
+    if history_rows <= 0:
+        blockers.append("missing_history")
+    elif history_rows < MIN_SIGNAL_HISTORY_ROWS:
+        blockers.append("insufficient_history")
+    history_source = str(ctx.get("history_source") or "")
+    history_status = str(ctx.get("history_status") or "")
+    if history_source.startswith("stale_cache") or history_status == "stale_cache":
+        blockers.append("stale_history")
+
+    blockers = list(dict.fromkeys(blockers))
+    rec["confidence_floor_blockers"] = blockers
+    try:
+        conf = float(
+            rec.get("confidence_before_floor",
+                    rec.get("confidence_after_penalties",
+                            rec.get("confidence", 0))) or 0
+        )
+    except Exception:
+        conf = 0.0
+    rec.setdefault("confidence_before_floor", conf)
+    rec["confidence"] = int(conf) if float(conf).is_integer() else conf
+    if rec.get("cls") not in ("strong-buy", "strong-sell"):
+        rec["sizing_confidence"] = rec["confidence"]
+    min_conf = float(((cfg or {}).get("signal") or {}).get("min_buy_confidence", 40))
+    should_floor = bool(rec.get("confidence_floor_candidate")) and not blockers and conf < min_conf
+    if should_floor:
+        floored = int(min_conf) if float(min_conf).is_integer() else min_conf
+        rec["confidence"] = floored
+        rec["confidence_final"] = floored
+        rec["confidence_floor_applied"] = True
+        rec["confidence_floor_reason"] = "valid_raw_buy_floor"
+        if rec.get("cls") not in ("strong-buy", "strong-sell"):
+            rec["sizing_confidence"] = floored
+        reasons = rec.setdefault("reasons", [])
+        floor_note = f"Confidence floor: valid raw BUY -> {floored}%"
+        if floor_note not in reasons:
+            reasons.append(floor_note)
+    else:
+        rec["confidence_final"] = rec.get("confidence")
+        rec["confidence_floor_applied"] = False
+        if rec.get("confidence_floor_candidate") and blockers:
+            rec["confidence_floor_reason"] = blockers[0]
+    return _annotate_signal(rec)
+
+
+def _history_source_bucket(source):
+    source = str(source or "missing")
+    if source.startswith("stale_cache"):
+        return "stale_cache"
+    return source or "missing"
+
+
+def _why_not_execution_eligible(rec, cfg, degraded_mode_active=False):
+    rec = rec or {}
+    raw_cls = str(rec.get("cls") or "hold").lower()
+    display = rec.get("display_signal_label")
+    signal_cfg = (cfg or {}).get("signal", {})
+    mode_cfg = (cfg or {}).get("market_data_modes", {})
+    normal_min = float(signal_cfg.get("min_buy_confidence", 40))
+    degraded_min = float(mode_cfg.get("degraded_min_confidence", normal_min))
+    min_conf = degraded_min if degraded_mode_active else normal_min
+    if raw_cls not in ("buy", "strong-buy"):
+        return f"raw_class_{raw_cls}"
+    if display not in ("BUY_CANDIDATE", "STRONG_BUY_CANDIDATE"):
+        return f"display_signal_{display or 'missing'}"
+    if float(rec.get("confidence", 0) or 0) < min_conf:
+        return "confidence_below_min"
+    return None
+
+
+def _ticker_debug_row(t, payload, cfg, degraded_mode_active=False):
+    payload = payload or {}
+    rec = _annotate_signal(payload.get("rec") or {})
+    ctx = payload.get("ctx") or {}
+    quote = payload.get("quote") or {}
+    price = quote.get("price", payload.get("price", 0))
+    quote_fresh = bool(price and price > 0 and not payload.get("stale") and not quote.get("stale"))
+    execution_eligible = is_execution_candidate(
+        rec,
+        cfg,
+        degraded_mode_active=degraded_mode_active,
+    )
+    why_not_execution = None if execution_eligible else _why_not_execution_eligible(
+        rec,
+        cfg,
+        degraded_mode_active=degraded_mode_active,
+    )
+    why_not_buy = None
+    if not execution_eligible:
+        why_not_buy = why_not_execution or "score_below_buy_threshold_or_not_enough_positive_categories"
+    if payload.get("stale"):
+        why_not_buy = "stale_quote"
+    elif not price or price <= 0:
+        why_not_buy = "invalid_price"
+    ctx_quote_fresh = ctx.get("quote_fresh")
+    return {
+        "ticker": t,
+        "history_source": ctx.get("history_source") or ("recorded" if ctx.get("source") == "recorded" else "missing"),
+        "history_rows": ctx.get("history_rows", 0),
+        "history_last_date": ctx.get("history_last_date"),
+        "quote_source": quote.get("source"),
+        "quote_price": price,
+        "quote_pct": quote.get("pct"),
+        "raw_class": rec.get("cls") or "hold",
+        "display_signal_label": rec.get("display_signal_label"),
+        "confidence": rec.get("confidence"),
+        "confidence_before_floor": rec.get("confidence_before_floor"),
+        "confidence_before_penalties": rec.get("confidence_before_penalties"),
+        "confidence_after_penalties": rec.get("confidence_after_penalties"),
+        "confidence_final": rec.get("confidence_final", rec.get("confidence")),
+        "confidence_floor_applied": bool(rec.get("confidence_floor_applied", False)),
+        "confidence_floor_reason": rec.get("confidence_floor_reason"),
+        "confidence_penalties": rec.get("confidence_penalties", []),
+        "score_total": rec.get("score_total", rec.get("score")),
+        "buy_score_threshold": (rec.get("thresholds") or {}).get("buy_tot"),
+        "sell_score_threshold": (rec.get("thresholds") or {}).get("sell_tot"),
+        "cats_pos": rec.get("cats_pos"),
+        "cats_neg": rec.get("cats_neg"),
+        "cats_required_for_buy": (rec.get("thresholds") or {}).get("buy_cats"),
+        "data_quality": rec.get("data_quality"),
+        "data_quality_actual_n": rec.get("data_quality_actual_n", rec.get("n_raw")),
+        "data_quality_expected_n": rec.get("data_quality_expected_n", rec.get("expected_n")),
+        "data_quality_missing_fields": rec.get("data_quality_missing_fields", []),
+        "execution_eligible": bool(execution_eligible),
+        "why_not_buy": why_not_buy,
+        "why_not_execution_eligible": why_not_execution,
+        "live_bar_applied": bool(ctx.get("live_bar_applied", False)),
+        "live_bar_reason": ctx.get("live_bar_reason"),
+        "quote_fresh": bool(quote_fresh if ctx_quote_fresh is None else ctx_quote_fresh),
+    }
 
 
 def is_execution_candidate(rec, cfg, *, degraded_mode_active=False):
@@ -297,6 +452,12 @@ def _new_no_buy_diag(now, b, force=False, user_forced=False):
         "display_signal_counts": {},
         "raw_buy_count": 0,
         "display_buy_candidate_count": 0,
+        "history_source_counts": {},
+        "history_missing_count": 0,
+        "history_fmp_fallback_count": 0,
+        "history_finnhub_daily_blocked_count": 0,
+        "history_stale_cache_count": 0,
+        "ticker_signal_debug": [],
         "buyable_reject_counts": {},
         "top_buyable_rejects": [],
         "top_ranked_rejections": [],
@@ -1142,19 +1303,22 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
                                          config=cfg)
             rec = dict(rec)
             rec["catalyst"] = catalyst
-            _annotate_signal(rec)
             # Round-4 Bug Fix #1: capture stale flag so SELL/BUY halt on API failure.
             q = get_quote(t) or {}
-            return t, {"rec": rec, "price": q.get("price", 0), "stale": bool(q.get("stale")),
-                       "arts": arts, "ctx": ctx, "intra": intra, "earn": earn,
-                       "analyst": analyst, "insider": insider}
+            payload = {"rec": rec, "price": q.get("price", 0), "stale": bool(q.get("stale")),
+                       "quote": q, "arts": arts, "ctx": ctx, "intra": intra,
+                       "earn": earn, "analyst": analyst, "insider": insider}
+            _finalize_signal_confidence(payload, cfg)
+            return t, payload
         except Exception as e:
             try: print(f"[_fetch_one] {t}: {type(e).__name__}: {e}")
             except Exception: pass
             fallback_rec = dict(get_recommendation(0.0, {}, regime=regime, config=cfg))
             _annotate_signal(fallback_rec)
             return t, {"rec": fallback_rec,
-                       "price": 0, "stale": True, "arts": [], "ctx": {},
+                       "price": 0, "stale": True,
+                       "quote": {"price": 0, "stale": True, "source": "missing"},
+                       "arts": [], "ctx": {},
                        "intra": {}, "earn": {}, "analyst": {}, "insider": {}}
 
     fetch_workers = 2 if PYTHONANYWHERE_MODE else 8
@@ -1197,6 +1361,7 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
                         "rec": fallback_rec,
                         "price": 0,
                         "stale": True,
+                        "quote": {"price": 0, "stale": True, "source": "missing"},
                         "arts": [],
                         "ctx": {},
                         "intra": {},
@@ -1219,10 +1384,29 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
             no_buy_diag["raw_buy_count"] += 1
         if rec.get("display_signal_label") in ("BUY_CANDIDATE", "STRONG_BUY_CANDIDATE"):
             no_buy_diag["display_buy_candidate_count"] += 1
+    for t in fetch_list:
+        payload = sigs.get(t) or {}
+        ctx = payload.get("ctx") or {}
+        source = ctx.get("history_source") or ("recorded" if ctx.get("source") == "recorded" else "missing")
+        bucket = _history_source_bucket(source if ctx else "missing")
+        _bump(no_buy_diag["history_source_counts"], bucket)
+        if bucket == "missing":
+            no_buy_diag["history_missing_count"] += 1
+        elif bucket == "fmp_daily":
+            no_buy_diag["history_fmp_fallback_count"] += 1
+        elif bucket == "stale_cache":
+            no_buy_diag["history_stale_cache_count"] += 1
     stale_tickers = [tk for tk, payload in sigs.items() if payload.get("stale")]
     no_buy_diag["stale_ticker_count"] = len(stale_tickers)
     no_buy_diag["stale_tickers"] = stale_tickers[:10]
     no_buy_diag["api_circuit_breakers"] = api_failure_snapshot()
+    no_buy_diag["history_finnhub_daily_blocked_count"] = sum(
+        1 for t in fetch_list
+        if (
+            no_buy_diag["api_circuit_breakers"].get(f"finnhub_daily:{t}:0", {})
+            .get("status")
+        ) == "blocked_or_forbidden"
+    )
     no_buy_diag["provider_health_status"] = _provider_health_summary(no_buy_diag["api_circuit_breakers"])
     no_buy_diag["rate_limit_recent"] = any(
         (snap or {}).get("rate_limit_recent")
@@ -1281,6 +1465,15 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
         "degraded_mode_active": mode_info["degraded_mode_active"],
         "degraded_mode_reason": mode_info["degraded_mode_reason"],
     })
+    no_buy_diag["ticker_signal_debug"] = [
+        _ticker_debug_row(
+            t,
+            sigs.get(t) or {},
+            cfg,
+            degraded_mode_active=mode_info["degraded_mode_active"],
+        )
+        for t in fetch_list[:10]
+    ]
 
     # Regime-conditional risk params
     if mode_info["degraded_mode_active"]:
@@ -1904,7 +2097,10 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
                     "earn": cached.get("earn") or {},
                     "analyst": cached.get("analyst") or {},
                     "insider": cached.get("insider") or {},
+                    "quote": q_o,
                 }
+                _finalize_signal_confidence(payload, cfg)
+                rec = payload["rec"]
                 if pr <= 0 or payload["stale"]:
                     continue
                 if not is_execution_candidate(
@@ -2635,6 +2831,12 @@ def _render_bot_page(read_only):
         "display_signal_counts": no_buy.get("display_signal_counts", {}),
         "raw_buy_count": no_buy.get("raw_buy_count", 0),
         "display_buy_candidate_count": no_buy.get("display_buy_candidate_count", 0),
+        "history_source_counts": no_buy.get("history_source_counts", {}),
+        "history_missing_count": no_buy.get("history_missing_count", 0),
+        "history_fmp_fallback_count": no_buy.get("history_fmp_fallback_count", 0),
+        "history_finnhub_daily_blocked_count": no_buy.get("history_finnhub_daily_blocked_count", 0),
+        "history_stale_cache_count": no_buy.get("history_stale_cache_count", 0),
+        "ticker_signal_debug": (no_buy.get("ticker_signal_debug") or [])[:10],
         "stale_ticker_count": no_buy.get("stale_ticker_count", 0),
         "stale_tickers": no_buy.get("stale_tickers", []),
         "stale_positions": no_buy.get("stale_positions", []),
@@ -2780,7 +2982,7 @@ def run_scan():
                                          config=cfg)
             rec = dict(rec)
             rec["catalyst"] = catalyst
-            cache_set(f"scan_payload_{t}", {
+            payload = {
                 "arts": arts,
                 "sent": sent,
                 "ctx": ctx,
@@ -2791,7 +2993,10 @@ def run_scan():
                 "quote": q,
                 "price": q.get("price", 0),
                 "stale": bool(q.get("stale")),
-            })
+            }
+            _finalize_signal_confidence(payload, cfg)
+            rec = payload["rec"]
+            cache_set(f"scan_payload_{t}", payload)
             direction = 1 if rec["score"] > 0 else (-1 if rec["score"] < 0 else 0)
             return {
                 "ticker": t, "price": q["price"], "change": q["change"], "pct": q["pct"],
