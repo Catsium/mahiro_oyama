@@ -12,7 +12,9 @@ from app import app
 from market import fh
 from market.charts import get_chart, PERIOD_MAP
 from market.quotes import _direct_stooq_daily as _provider_stq_daily
-from market.quotes import _finnhub_daily, _fmp_daily
+from market.quotes import (
+    FMP_DAILY_GLOBAL_ENDPOINT, _finnhub_daily, _fmp_daily, fmp_daily_global_circuit_state,
+)
 from trading.bot import BOT_MAX_BUYS
 from trading.attribution import summarize_attribution
 from trading.config import active_config, config_hash
@@ -21,7 +23,10 @@ from trading.signals import get_recommendation
 from trading.sizing import slippage_bps, SLIPPAGE_BPS
 from utils.auth import require_admin_token, require_machine_token
 from utils.cache import api_failure_snapshot, cache_get, cache_set, sanitize_provider_error
-from utils.deploy_config import FINNHUB_KEY, FMP_KEY, PERSISTENT_CACHE, PYTHONANYWHERE_MODE
+from utils.deploy_config import (
+    FINNHUB_KEY, FMP_KEY, PERSISTENT_CACHE, PYTHONANYWHERE_MODE,
+    PA_TICKERS_PER_BOT_RUN,
+)
 from utils.storage import load_bot, load_tickers
 from utils.threading_utils import _BOT_STATUS
 
@@ -70,14 +75,37 @@ def _provider_df_result(source, start, df):
         latest_date = str(df.index[-1].date())
     except Exception:
         latest_date = None
-    return {
+    attrs = getattr(df, "attrs", {}) or {}
+    cache_used = bool(attrs.get("cache_used", False))
+    out = {
         "ok": True,
         "status": "ok",
         "runtime_seconds": _provider_elapsed(start),
-        "source": getattr(df, "attrs", {}).get("source") or source,
+        "source": attrs.get("source") or source,
         "rows": int(len(df)),
         "latest_date": latest_date,
+        "cache_used": cache_used,
     }
+    if cache_used:
+        out["cache_max_age_sec"] = attrs.get("cache_max_age_sec")
+        out["provider_test_note"] = "daily history came from local cache; live provider was not called"
+    return out
+
+
+def _provider_failure_result(source, start, endpoint, default_status="empty_response"):
+    snap = api_failure_snapshot().get(endpoint or "", {}) or {}
+    status = snap.get("status") or default_status
+    out = {
+        "ok": False,
+        "status": status,
+        "runtime_seconds": _provider_elapsed(start),
+        "source": source,
+        "rows": 0,
+    }
+    for key in ("rate_limited", "rate_limit_recent", "last_error"):
+        if key in snap:
+            out[key] = snap.get(key)
+    return out
 
 
 def _run_provider_check(source, fn, deadline_ts):
@@ -158,7 +186,10 @@ def _check_finnhub_quote_spy(start):
 def _check_finnhub_daily_spy(start):
     if not FINNHUB_KEY:
         return _provider_skipped("finnhub", "skipped_missing_key", "FINNHUB_KEY is not configured")
-    return _provider_df_result("finnhub", start, _finnhub_daily("SPY", use_cache=False))
+    df = _finnhub_daily("SPY", use_cache=True)
+    if df is not None and not getattr(df, "empty", True):
+        return _provider_df_result("finnhub", start, df)
+    return _provider_failure_result("finnhub", start, "finnhub_daily:SPY:0")
 
 
 def _check_finnhub_news_aapl(start):
@@ -249,7 +280,26 @@ def _check_stooq_direct_spy(start):
 def _check_fmp_daily_spy(start):
     if not FMP_KEY:
         return _provider_skipped("fmp", "skipped_missing_key", "FMP_KEY/FMP_API_KEY is not configured")
-    return _provider_df_result("fmp", start, _fmp_daily("SPY", use_cache=False))
+    df = _fmp_daily("SPY", use_cache=True)
+    if df is not None and not getattr(df, "empty", True):
+        return _provider_df_result("fmp", start, df)
+    state = fmp_daily_global_circuit_state()
+    if state.get("active"):
+        out = _provider_failure_result(
+            "fmp",
+            start,
+            "fmp_daily:SPY:0",
+            default_status="skipped_by_global_rate_limit",
+        )
+        out.update({
+            "status": "skipped_by_global_rate_limit",
+            "rate_limited": True,
+            "cooldown_remaining_sec": state.get("cooldown_remaining_sec", 0),
+            "last_429_age_sec": state.get("last_429_age_sec"),
+            "last_error": state.get("last_error"),
+        })
+        return out
+    return _provider_failure_result("fmp", start, "fmp_daily:SPY:0")
 
 
 def _provider_test_definitions():
@@ -271,6 +321,12 @@ def _build_provider_test_payload():
     providers = {}
     for name, source, fn in _provider_test_definitions():
         providers[name] = _run_provider_check(source, fn, deadline_ts)
+    fmp_state = fmp_daily_global_circuit_state()
+    provider_circuit_state = api_failure_snapshot()
+    if not fmp_state.get("active"):
+        global_snap = provider_circuit_state.get(FMP_DAILY_GLOBAL_ENDPOINT, {})
+        if (global_snap or {}).get("status") == "rate_limited":
+            provider_circuit_state.pop(FMP_DAILY_GLOBAL_ENDPOINT, None)
     return {
         "environment": {
             "pythonanywhere_mode": bool(PYTHONANYWHERE_MODE),
@@ -279,7 +335,8 @@ def _build_provider_test_payload():
             "fmp_key_configured": bool(FMP_KEY),
         },
         "providers": providers,
-        "provider_circuit_state": api_failure_snapshot(),
+        "provider_circuit_state": provider_circuit_state,
+        "fmp_daily_global_circuit": fmp_state,
         "runtime_seconds": round(time.time() - start_ts, 3),
         "max_runtime_seconds": PROVIDER_TEST_MAX_RUNTIME_SEC,
         "per_provider_timeout_seconds": PROVIDER_TEST_PER_PROVIDER_TIMEOUT_SEC,
@@ -564,17 +621,31 @@ def api_bot_profit_calendar():
 def api_bot_status():
     b = load_bot()
     diag = b.get("last_no_buy_diagnostics") or {}
-    api_breakers = diag.get("api_circuit_breakers", {}) or {}
+    api_breakers = dict(diag.get("api_circuit_breakers", {}) or {})
+    fmp_daily_rate_limited = bool(diag.get("fmp_daily_rate_limited", False))
+    if not fmp_daily_rate_limited:
+        global_snap = api_breakers.get(FMP_DAILY_GLOBAL_ENDPOINT, {})
+        if (global_snap or {}).get("status") == "rate_limited":
+            api_breakers.pop(FMP_DAILY_GLOBAL_ENDPOINT, None)
     rate_limit_recent = bool(
         diag.get("rate_limit_recent")
+        or fmp_daily_rate_limited
         or any((snap or {}).get("rate_limit_recent") for snap in api_breakers.values() if isinstance(snap, dict))
     )
+    healthy_statuses = {
+        "ok",
+        "healthy",
+        "skipped_on_pythonanywhere",
+        "skipped_missing_key",
+        "skipped_by_global_rate_limit",
+        "skipped_by_circuit",
+    }
     provider_health_status = diag.get("provider_health_status")
     if not provider_health_status:
-        if rate_limit_recent or any((snap or {}).get("rate_limited") for snap in api_breakers.values() if isinstance(snap, dict)):
+        if rate_limit_recent:
             provider_health_status = "rate_limited"
         elif any(
-            (snap or {}).get("status") not in {"ok", "healthy", "skipped_on_pythonanywhere", "skipped_missing_key"}
+            (snap or {}).get("status") not in healthy_statuses
             for snap in api_breakers.values()
             if isinstance(snap, dict)
         ):
@@ -599,6 +670,14 @@ def api_bot_status():
             "min_buy_confidence": diag.get("min_buy_confidence"),
             "min_trade_size_effective": diag.get("min_trade_size_effective"),
             "degraded_size_mult": diag.get("degraded_size_mult"),
+            "degraded_use_standard_gates_for_testing": diag.get("degraded_use_standard_gates_for_testing"),
+            "degraded_standard_gates_active": diag.get("degraded_standard_gates_active"),
+            "degraded_gate_policy": diag.get("degraded_gate_policy"),
+            "effective_size_mult": diag.get("effective_size_mult"),
+            "effective_min_buy_confidence": diag.get("effective_min_buy_confidence"),
+            "normal_ev_gates_required": diag.get("normal_ev_gates_required"),
+            "normal_risk_caps_required": diag.get("normal_risk_caps_required"),
+            "fresh_quote_required": diag.get("fresh_quote_required"),
             "degraded_min_confidence": diag.get("degraded_min_confidence"),
             "degraded_reject_counts": diag.get("degraded_reject_counts", {}),
             "finnhub_key_configured": diag.get("finnhub_key_configured", bool(FINNHUB_KEY)),
@@ -615,9 +694,17 @@ def api_bot_status():
             "history_source_counts": diag.get("history_source_counts", {}),
             "history_missing_count": diag.get("history_missing_count", 0),
             "history_fmp_fallback_count": diag.get("history_fmp_fallback_count", 0),
+            "history_fmp_attempted_count": diag.get("history_fmp_attempted_count", 0),
+            "history_fmp_skipped_count": diag.get("history_fmp_skipped_count", 0),
+            "history_fmp_rate_limited_count": diag.get("history_fmp_rate_limited_count", 0),
+            "history_fmp_global_circuit_skipped_count": diag.get("history_fmp_global_circuit_skipped_count", 0),
             "history_finnhub_daily_blocked_count": diag.get("history_finnhub_daily_blocked_count", 0),
             "history_stale_cache_count": diag.get("history_stale_cache_count", 0),
-            "ticker_signal_debug": (diag.get("ticker_signal_debug") or [])[:10],
+            "fmp_daily_global_circuit_status": diag.get("fmp_daily_global_circuit_status"),
+            "fmp_daily_rate_limited": fmp_daily_rate_limited,
+            "fmp_daily_cooldown_remaining_sec": diag.get("fmp_daily_cooldown_remaining_sec", 0),
+            "fmp_daily_last_429_age_sec": diag.get("fmp_daily_last_429_age_sec"),
+            "ticker_signal_debug": (diag.get("ticker_signal_debug") or [])[:PA_TICKERS_PER_BOT_RUN],
             "stale_ticker_count": diag.get("stale_ticker_count", 0),
             "stale_tickers": diag.get("stale_tickers", []),
             "stale_positions": diag.get("stale_positions", []),
@@ -676,6 +763,10 @@ def api_bot_status():
             "paper_lock_reason": diag.get("paper_lock_reason"),
             "tick_runtime_seconds": diag.get("tick_runtime_seconds"),
             "runtime_seconds": diag.get("tick_runtime_seconds"),
+            "partial_result": diag.get("partial_result", False),
+            "timeout_reason": diag.get("timeout_reason"),
+            "timeout_stage": diag.get("timeout_stage"),
+            "fetch_timeout_tickers": diag.get("fetch_timeout_tickers", []),
             "checked_tickers": diag.get("checked_tickers", []),
             "traded": diag.get("traded", False),
             "ts": diag.get("ts"),

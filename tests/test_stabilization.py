@@ -417,17 +417,17 @@ class TriggerRouteTests(unittest.TestCase):
             self.assertEqual(response.status_code, 200)
         trigger.assert_not_called()
 
-    def test_health_is_the_public_trigger_route(self):
-        with patch("routes.portfolio.start_scheduler_once") as scheduler:
+    def test_health_is_passive_keepalive_only(self):
+        with patch("routes.portfolio.start_scheduler_once", create=True) as scheduler:
             with patch("routes.portfolio.trigger_bot_if_due") as trigger:
                 with patch("routes.portfolio.warm_scan_if_due") as scan:
                     response = self.client.get("/health")
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.get_data(as_text=True), "ok")
-        scheduler.assert_called_once_with()
-        trigger.assert_called_once_with(force=False)
-        scan.assert_called_once_with()
+        scheduler.assert_not_called()
+        trigger.assert_not_called()
+        scan.assert_not_called()
 
     def test_bot_reset_refuses_corrupt_loaded_state(self):
         patches = [

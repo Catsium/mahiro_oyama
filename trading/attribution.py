@@ -372,6 +372,8 @@ def update_entry_buckets(state, event, horizon=MAIN_HORIZON):
 
 def record_entry_event(state, candidate, decision, reason, ts=None, regime=None):
     ensure_attribution_state(state)
+    if decision != "executed":
+        return None
     rec = candidate.get("rec") or {}
     ctx = candidate.get("ctx") or {}
     risk = candidate.get("risk") or {}
@@ -395,6 +397,14 @@ def record_entry_event(state, candidate, decision, reason, ts=None, regime=None)
         "expected_edge_pct": candidate.get("gross_edge_pct"),
         "net_edge_pct": candidate.get("net_edge_pct"),
         "friction_pct": friction.get("total_pct") if friction else candidate.get("friction_pct"),
+        "rank_reason_code": candidate.get("rank_reason_code"),
+        "required_edge_pct": candidate.get("required_edge_pct"),
+        "edge_source": candidate.get("edge_source"),
+        "edge_samples": candidate.get("edge_samples"),
+        "edge_horizon": candidate.get("edge_horizon"),
+        "friction_diagnostics": candidate.get("friction_diagnostics"),
+        "edge_diagnostics": candidate.get("edge_diagnostics"),
+        "ev_diagnostics": candidate.get("ev_diagnostics"),
         "atr_pct": ctx.get("atr_pct"),
         "risk_pct": risk.get("risk_pct"),
         "target_notional": risk.get("target_notional"),

@@ -578,6 +578,22 @@
               <div class="text-muted" style="font-size:.78rem;margin-top:6px">Signals across watchlist: {{ tx.signals }}</div>
               {% elif not is_hold %}
               <div class="text-muted" style="font-size:.78rem;margin-top:6px">Buy attempt blocked — position not opened</div>
+              {% if tx.rank_reason_code is defined or tx.gross_edge_pct is defined or tx.friction_pct is defined %}
+              <div class="text-muted" style="font-size:.78rem;margin-top:6px">
+                {% if tx.rank_reason_code is defined and tx.rank_reason_code %}Code: {{ tx.rank_reason_code }}{% endif %}
+                {% if tx.gross_edge_pct is defined and tx.gross_edge_pct is not none %}
+                  <br>EV: gross {{ '%.2f'|format(tx.gross_edge_pct) }}%
+                  {% if tx.required_edge_pct is defined and tx.required_edge_pct is not none %} | required {{ '%.2f'|format(tx.required_edge_pct) }}%{% endif %}
+                  {% if tx.net_edge_pct is defined and tx.net_edge_pct is not none %} | net {{ '%.2f'|format(tx.net_edge_pct) }}%{% endif %}
+                {% endif %}
+                {% if tx.friction_pct is defined and tx.friction_pct is not none %}
+                  <br>Friction: {{ '%.2f'|format(tx.friction_pct) }}%
+                {% endif %}
+                {% if tx.target_notional is defined and tx.target_notional is not none %}
+                  <br>Target notional: ${{ '%.0f'|format(tx.target_notional) }}
+                {% endif %}
+              </div>
+              {% endif %}
               {% endif %}
             </td>
           </tr>

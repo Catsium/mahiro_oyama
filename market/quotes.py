@@ -1,6 +1,7 @@
 """Quote fetching, ticker validation, and daily-bar helpers."""
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from io import StringIO
 import json
 import urllib.parse
@@ -12,13 +13,20 @@ from market import fh
 from market.data_manager import get_daily as _managed_daily
 from utils.cache import (
     CACHE_MISS, cache_get, cache_get_stale, cache_set, record_api_failure, record_api_success,
-    sanitize_provider_error, should_skip_api,
+    sanitize_provider_error, should_skip_api, api_cooldown_state, api_failure_snapshot,
 )
 from utils.deploy_config import FMP_KEY, PYTHONANYWHERE_MODE
 from utils.storage import load_price_hist, append_price_snapshot
+from utils.time_utils import is_market_open
 
+FMP_DAILY_GLOBAL_ENDPOINT = "fmp_daily:global"
+FMP_DAILY_RATE_LIMIT_COOLDOWN_SEC = 30 * 60
+FMP_DAILY_CACHE_MARKET_SEC = 60 * 60
+FMP_DAILY_CACHE_CLOSED_SEC = 24 * 3600
+STALE_DAILY_CACHE_MARKET_SEC = 24 * 3600
+STALE_DAILY_CACHE_CLOSED_SEC = 72 * 3600
 REGIME_STALE_CACHE_MAX_HOURS = 72
-REGIME_STALE_CACHE_MAX_SEC = REGIME_STALE_CACHE_MAX_HOURS * 3600
+REGIME_STALE_CACHE_MAX_SEC = STALE_DAILY_CACHE_CLOSED_SEC
 
 
 def _valid_daily_df(df):
@@ -42,32 +50,153 @@ def _blocked_or_forbidden_payload(raw):
     )
 
 
-def _stale_daily_cache(tk, full=False, include_stooq=False, stooq_prefix="stooq"):
-    keys = []
-    if include_stooq:
-        keys.append((
-            f"{stooq_prefix}_daily",
-            f"{stooq_prefix}_full_{tk}" if full else f"{stooq_prefix}_{tk}",
+def _market_open_now():
+    try:
+        return bool(is_market_open())
+    except Exception:
+        return False
+
+
+def _fmp_daily_cache_max_age():
+    return FMP_DAILY_CACHE_MARKET_SEC if _market_open_now() else FMP_DAILY_CACHE_CLOSED_SEC
+
+
+def _stale_daily_cache_max_age():
+    return STALE_DAILY_CACHE_MARKET_SEC if _market_open_now() else STALE_DAILY_CACHE_CLOSED_SEC
+
+
+def fmp_daily_global_circuit_state():
+    state = api_cooldown_state(FMP_DAILY_GLOBAL_ENDPOINT, FMP_DAILY_RATE_LIMIT_COOLDOWN_SEC)
+    active = bool(state.get("active"))
+    return {
+        "status": "rate_limited" if active else "ok",
+        "active": active,
+        "rate_limited": active,
+        "cooldown_remaining_sec": int(state.get("cooldown_remaining_sec") or 0),
+        "last_429_age_sec": state.get("last_429_age_sec"),
+        "last_error": state.get("last_error"),
+    }
+
+
+def _retry_after_cooldown_sec(error):
+    fallback = FMP_DAILY_RATE_LIMIT_COOLDOWN_SEC
+    raw = None
+    try:
+        headers = getattr(error, "headers", None)
+        if headers:
+            raw = headers.get("Retry-After")
+    except Exception:
+        raw = None
+    if raw is None:
+        return fallback
+    raw = str(raw).strip()
+    if not raw:
+        return fallback
+    try:
+        return max(1, int(float(raw)))
+    except Exception:
+        pass
+    try:
+        retry_at = parsedate_to_datetime(raw)
+        if retry_at.tzinfo is None:
+            retry_at = retry_at.replace(tzinfo=timezone.utc)
+        return max(1, int((retry_at - datetime.now(timezone.utc)).total_seconds()))
+    except Exception:
+        return fallback
+
+
+def _daily_chain_entry(provider, endpoint=None, df=None, status=None, reason=None):
+    attrs = getattr(df, "attrs", {}) or {}
+    snap = api_failure_snapshot().get(endpoint or "", {}) if endpoint else {}
+    out = {
+        "provider": provider,
+        "source": attrs.get("source") or provider,
+        "status": status or attrs.get("status") or snap.get("status") or "ok",
+    }
+    if endpoint:
+        out["endpoint"] = endpoint
+    if reason:
+        out["reason"] = reason
+    if _valid_daily_df(df):
+        out["rows"] = int(len(df))
+    if attrs.get("warnings"):
+        out["warnings"] = list(attrs.get("warnings") or [])
+    if attrs.get("stale_daily_cache_age_hours") is not None:
+        out["stale_daily_cache_age_hours"] = attrs.get("stale_daily_cache_age_hours")
+    if snap.get("rate_limited"):
+        out["rate_limited"] = True
+    if provider == "fmp_daily":
+        state = fmp_daily_global_circuit_state()
+        if state.get("active"):
+            out["cooldown_remaining_sec"] = state.get("cooldown_remaining_sec")
+            out["last_429_age_sec"] = state.get("last_429_age_sec")
+    return out
+
+
+def _daily_failure_entry(provider, endpoint, default_status="empty_response"):
+    snap = api_failure_snapshot().get(endpoint or "", {})
+    status = snap.get("status") or default_status
+    if provider == "fmp_daily" and fmp_daily_global_circuit_state().get("active"):
+        status = "skipped_by_global_rate_limit"
+    elif provider == "fmp_daily" and should_skip_api(endpoint):
+        status = "skipped_by_circuit"
+    return _daily_chain_entry(provider, endpoint=endpoint, status=status)
+
+
+def _attach_provider_chain(df, chain):
+    if _valid_daily_df(df):
+        df.attrs["provider_chain_debug"] = list(chain or [])
+    return df
+
+
+def _stale_daily_cache(tk, full=False, include_stooq=False, stooq_prefix="stooq", provider_chain=None):
+    fmp_state = fmp_daily_global_circuit_state()
+    fmp_key = ("fmp_daily", f"fmp_daily_full_{tk}" if full else f"fmp_daily_{tk}")
+    finnhub_key = ("finnhub_daily", f"fh_daily_full_{tk}" if full else f"fh_daily_{tk}")
+    stooq_key = (
+        f"{stooq_prefix}_daily",
+        f"{stooq_prefix}_full_{tk}" if full else f"{stooq_prefix}_{tk}",
+    )
+    if fmp_state.get("active"):
+        keys = [fmp_key]
+        if include_stooq:
+            keys.append(stooq_key)
+        keys.append(finnhub_key)
+    else:
+        keys = []
+        if include_stooq:
+            keys.append(stooq_key)
+        keys.extend((
+            finnhub_key,
+            fmp_key,
         ))
-    keys.extend((
-        ("finnhub_daily", f"fh_daily_full_{tk}" if full else f"fh_daily_{tk}"),
-        ("fmp_daily", f"fmp_daily_full_{tk}" if full else f"fmp_daily_{tk}"),
-    ))
+    max_age = _stale_daily_cache_max_age()
     for source, cache_key in keys:
         cached, age_sec = cache_get_stale(
             cache_key,
-            REGIME_STALE_CACHE_MAX_SEC,
+            max_age,
             default=CACHE_MISS,
         )
         if _valid_daily_df(cached):
             stale = cached.copy(deep=False)
+            warnings = ["STALE_DAILY_CACHE_USED"]
+            if fmp_state.get("active"):
+                warnings.extend(["FMP_DAILY_RATE_LIMITED", "FMP_DAILY_GLOBAL_COOLDOWN"])
             stale.attrs.update({
                 "source": f"stale_cache:{source}",
                 "status": "stale_cache",
-                "warnings": ["STALE_DAILY_CACHE_USED"],
+                "warnings": list(dict.fromkeys(warnings)),
                 "stale_daily_cache_age_sec": int(age_sec or 0),
                 "stale_daily_cache_age_hours": round(float(age_sec or 0) / 3600.0, 2),
             })
+            chain = list(provider_chain or [])
+            chain.append(_daily_chain_entry(
+                "stale_cache",
+                df=stale,
+                status="stale_cache",
+                reason=f"using_stale_{source}",
+            ))
+            stale.attrs["provider_chain_debug"] = chain
             return stale
     return None
 
@@ -88,6 +217,7 @@ def _direct_stooq_daily(tk, full=False, cache_prefix="stooq"):
             c.attrs.setdefault("source", f"{cache_prefix}_daily")
             c.attrs.setdefault("provider", "stooq")
             c.attrs.setdefault("status", "ok")
+            c.attrs["cache_used"] = True
             return c
         return None
     try:
@@ -119,6 +249,7 @@ def _direct_stooq_daily(tk, full=False, cache_prefix="stooq"):
         df.attrs["source"] = f"{cache_prefix}_daily"
         df.attrs["provider"] = "stooq"
         df.attrs["status"] = "ok"
+        df.attrs["cache_used"] = False
         cache_set(cache_key, df)
         record_api_success(endpoint)
         return df
@@ -145,12 +276,14 @@ def _finnhub_daily(tk, full=False, use_cache=True):
                 c.attrs.setdefault("source", "finnhub_daily")
                 c.attrs.setdefault("provider", "finnhub")
                 c.attrs.setdefault("status", "ok")
+                c.attrs["cache_used"] = True
+                c.attrs["cache_max_age_sec"] = 6 * 3600
                 return c
             return None
     try:
         end = int(time.time())
         days = 3650 if full else 600
-        start = int((datetime.utcnow() - timedelta(days=days)).timestamp())
+        start = int((datetime.now(timezone.utc) - timedelta(days=days)).timestamp())
         raw = fh.stock_candles(tk, "D", start, end) or {}
         if raw.get("s") != "ok" or not raw.get("c"):
             status = "blocked_or_forbidden" if _blocked_or_forbidden_payload(raw) else "empty_response"
@@ -173,6 +306,7 @@ def _finnhub_daily(tk, full=False, use_cache=True):
         df.attrs["source"] = "finnhub_daily"
         df.attrs["provider"] = "finnhub"
         df.attrs["status"] = "ok"
+        df.attrs["cache_used"] = False
         if use_cache:
             cache_set(cache_key, df)
         record_api_success(endpoint)
@@ -197,18 +331,23 @@ def _fmp_daily(tk, full=False, use_cache=True):
     if not FMP_KEY:
         record_api_failure(endpoint, "FMP_KEY/FMP_API_KEY is not configured", status="skipped_missing_key")
         return None
-    if should_skip_api(endpoint):
-        return None
     cache_key = f"fmp_daily_full_{tk}" if full else f"fmp_daily_{tk}"
     if use_cache:
-        c = cache_get(cache_key, max_age=6 * 3600, default=CACHE_MISS)
+        c = cache_get(cache_key, max_age=_fmp_daily_cache_max_age(), default=CACHE_MISS)
         if c is not CACHE_MISS:
             if isinstance(c, pd.DataFrame) and not c.empty:
                 c.attrs.setdefault("source", "fmp_daily")
                 c.attrs.setdefault("provider", "fmp")
                 c.attrs.setdefault("status", "ok")
+                c.attrs["cache_used"] = True
+                c.attrs["cache_max_age_sec"] = _fmp_daily_cache_max_age()
                 return c
             return None
+    if fmp_daily_global_circuit_state().get("active"):
+        record_api_failure(endpoint, "FMP daily global rate-limit cooldown", status="skipped_by_global_rate_limit")
+        return None
+    if should_skip_api(endpoint):
+        return None
     try:
         params = urllib.parse.urlencode({"symbol": str(tk).upper(), "apikey": FMP_KEY})
         url = f"https://financialmodelingprep.com/stable/historical-price-eod/full?{params}"
@@ -261,40 +400,70 @@ def _fmp_daily(tk, full=False, use_cache=True):
         df.attrs["source"] = "fmp_daily"
         df.attrs["provider"] = "fmp"
         df.attrs["status"] = "ok"
+        df.attrs["cache_used"] = False
         if use_cache:
             cache_set(cache_key, df)
         record_api_success(endpoint)
+        record_api_success(FMP_DAILY_GLOBAL_ENDPOINT)
         return df
     except Exception as e:
         try:
             print(f"[fmp-daily] {tk} failed: {type(e).__name__}: {sanitize_provider_error(e)}")
         except Exception:
             pass
-        record_api_failure(endpoint, e)
+        cooldown_sec = None
+        try:
+            status_code = getattr(e, "code", None) or getattr(e, "status", None)
+        except Exception:
+            status_code = None
+        if str(status_code) == "429":
+            cooldown_sec = _retry_after_cooldown_sec(e)
+        rec = record_api_failure(endpoint, e, cooldown_sec=cooldown_sec)
+        if (rec or {}).get("status") == "rate_limited":
+            record_api_failure(
+                FMP_DAILY_GLOBAL_ENDPOINT,
+                e,
+                status="rate_limited",
+                cooldown_sec=cooldown_sec or FMP_DAILY_RATE_LIMIT_COOLDOWN_SEC,
+            )
         return None
 
 
 def _raw_daily(tk, full=False):
     """Daily bars for normal ticker signal history."""
+    finnhub_endpoint = f"finnhub_daily:{tk}:{int(bool(full))}"
+    fmp_endpoint = f"fmp_daily:{tk}:{int(bool(full))}"
+    chain = []
     if PYTHONANYWHERE_MODE:
         df = _finnhub_daily(tk, full=full)
         if _valid_daily_df(df):
-            return df
+            chain.append(_daily_chain_entry("finnhub_daily", endpoint=finnhub_endpoint, df=df))
+            return _attach_provider_chain(df, chain)
+        chain.append(_daily_failure_entry("finnhub_daily", finnhub_endpoint))
         df = _fmp_daily(tk, full=full)
         if _valid_daily_df(df):
-            return df
-        return _stale_daily_cache(tk, full=full)
+            chain.append(_daily_chain_entry("fmp_daily", endpoint=fmp_endpoint, df=df))
+            return _attach_provider_chain(df, chain)
+        chain.append(_daily_failure_entry("fmp_daily", fmp_endpoint))
+        return _stale_daily_cache(tk, full=full, provider_chain=chain)
 
+    stooq_endpoint = f"stooq_daily:{tk}:{int(bool(full))}"
     df = _direct_stooq_daily(tk, full=full)
     if _valid_daily_df(df):
-        return df
+        chain.append(_daily_chain_entry("stooq_daily", endpoint=stooq_endpoint, df=df))
+        return _attach_provider_chain(df, chain)
+    chain.append(_daily_failure_entry("stooq_daily", stooq_endpoint))
     df = _finnhub_daily(tk, full=full)
     if _valid_daily_df(df):
-        return df
+        chain.append(_daily_chain_entry("finnhub_daily", endpoint=finnhub_endpoint, df=df))
+        return _attach_provider_chain(df, chain)
+    chain.append(_daily_failure_entry("finnhub_daily", finnhub_endpoint))
     df = _fmp_daily(tk, full=full)
     if _valid_daily_df(df):
-        return df
-    return _stale_daily_cache(tk, full=full, include_stooq=True)
+        chain.append(_daily_chain_entry("fmp_daily", endpoint=fmp_endpoint, df=df))
+        return _attach_provider_chain(df, chain)
+    chain.append(_daily_failure_entry("fmp_daily", fmp_endpoint))
+    return _stale_daily_cache(tk, full=full, include_stooq=True, provider_chain=chain)
 
 
 def get_regime_daily(tk, full=False):
@@ -306,29 +475,52 @@ def get_regime_daily(tk, full=False):
     Local/off-PA may use Stooq first with Finnhub/FMP fallback.
     """
     if PYTHONANYWHERE_MODE:
+        finnhub_endpoint = f"finnhub_daily:{tk}:{int(bool(full))}"
+        fmp_endpoint = f"fmp_daily:{tk}:{int(bool(full))}"
+        chain = []
         df = _finnhub_daily(tk, full=full)
         if _valid_daily_df(df):
-            return df
+            chain.append(_daily_chain_entry("finnhub_daily", endpoint=finnhub_endpoint, df=df))
+            return _attach_provider_chain(df, chain)
+        chain.append(_daily_failure_entry("finnhub_daily", finnhub_endpoint))
 
         df = _fmp_daily(tk, full=full)
         if _valid_daily_df(df):
-            return df
+            chain.append(_daily_chain_entry("fmp_daily", endpoint=fmp_endpoint, df=df))
+            return _attach_provider_chain(df, chain)
+        chain.append(_daily_failure_entry("fmp_daily", fmp_endpoint))
 
-        return _stale_daily_cache(tk, full=full)
+        return _stale_daily_cache(tk, full=full, provider_chain=chain)
 
+    stooq_endpoint = f"stooq_regime_daily:{tk}:{int(bool(full))}"
+    finnhub_endpoint = f"finnhub_daily:{tk}:{int(bool(full))}"
+    fmp_endpoint = f"fmp_daily:{tk}:{int(bool(full))}"
+    chain = []
     df = _direct_stooq_daily(tk, full=full, cache_prefix="stooq_regime")
     if _valid_daily_df(df):
-        return df
+        chain.append(_daily_chain_entry("stooq_regime_daily", endpoint=stooq_endpoint, df=df))
+        return _attach_provider_chain(df, chain)
+    chain.append(_daily_failure_entry("stooq_regime_daily", stooq_endpoint))
 
     df = _finnhub_daily(tk, full=full)
     if _valid_daily_df(df):
-        return df
+        chain.append(_daily_chain_entry("finnhub_daily", endpoint=finnhub_endpoint, df=df))
+        return _attach_provider_chain(df, chain)
+    chain.append(_daily_failure_entry("finnhub_daily", finnhub_endpoint))
 
     df = _fmp_daily(tk, full=full)
     if _valid_daily_df(df):
-        return df
+        chain.append(_daily_chain_entry("fmp_daily", endpoint=fmp_endpoint, df=df))
+        return _attach_provider_chain(df, chain)
+    chain.append(_daily_failure_entry("fmp_daily", fmp_endpoint))
 
-    return _stale_daily_cache(tk, full=full, include_stooq=True, stooq_prefix="stooq_regime")
+    return _stale_daily_cache(
+        tk,
+        full=full,
+        include_stooq=True,
+        stooq_prefix="stooq_regime",
+        provider_chain=chain,
+    )
 
 
 def _stooq_daily(tk, full=False):

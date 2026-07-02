@@ -28,6 +28,11 @@ class DataManager:
         except Exception:
             return value
 
+    def _is_stale_cache(self, value):
+        attrs = getattr(value, "attrs", {}) or {}
+        source = str(attrs.get("source") or "")
+        return attrs.get("status") == "stale_cache" or source.startswith("stale_cache:")
+
     def _source(self, ticker, full=False):
         from market import quotes
         return quotes._raw_daily(ticker, full=full)
@@ -39,21 +44,29 @@ class DataManager:
             rec = self._daily.get(key)
             if rec:
                 value, ts = rec
-                if now - ts < self.disk_ttl_sec:
+                if self._is_stale_cache(value):
+                    self._daily.pop(key, None)
+                elif now - ts < self.disk_ttl_sec:
                     self._daily.move_to_end(key)
                     return self._copy(value)
-                self._daily.pop(key, None)
+                else:
+                    self._daily.pop(key, None)
 
         disk_key = f"dm_daily_{key[0]}_{'full' if key[1] else 'tail'}"
         value = cache_get(disk_key, max_age=self.disk_ttl_sec)
+        if self._is_stale_cache(value):
+            value = None
         if value is None:
             src = source_func or self._source
             value = src(key[0], full=key[1])
-            if value is not None:
+            if value is not None and not self._is_stale_cache(value):
                 cache_set(disk_key, value)
 
         if value is None:
             return None
+
+        if self._is_stale_cache(value):
+            return self._copy(value)
 
         with self._lock:
             self._daily[key] = (value, now)

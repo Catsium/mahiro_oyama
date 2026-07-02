@@ -5,8 +5,9 @@ At $10k paper scale it was invisible noise AND it made the equity chart drop
 more than the stated commission on every buy (markup baked into effective price).
 Now: flat $0.99 commission per trade, no price markup. So a buy nets exactly
 −$0.99 in equity and the chart reflects it. `slippage_bps` stays defined because
-the backtest endpoint (routes/api.py) still references it, but the live bot no
-longer calls it.
+the backtest endpoint (routes/api.py) still references it. The live fill path
+does not mark up prices, but EV ranking still includes model slippage in
+friction so tiny-edge trades stay blocked.
 """
 import time
 
@@ -202,34 +203,79 @@ def exit_quality_size_mult(edge_stats, regime_kind, cluster):
     return 1.0
 
 
-def spread_proxy_pct(ctx, source="watchlist"):
+def _spread_proxy_details(ctx, source="watchlist"):
     """Round-trip spread proxy from liquidity when bid/ask is unavailable."""
     adv = (ctx or {}).get("avg_dollar_vol_20d", 0) or 0
     if adv >= 50_000_000:
         pct = 0.03
+        bucket = "adv_ge_50m"
     elif adv >= 5_000_000:
         pct = 0.06
+        bucket = "adv_ge_5m"
     elif adv > 0:
         pct = 0.15
+        bucket = "adv_lt_5m"
     else:
         pct = 0.10
+        bucket = "missing_adv"
+    base_pct = pct
     if source == "scan":
         pct += 0.02
-    return round(pct, 4)
+    return {
+        "pct": round(pct, 4),
+        "base_pct": round(base_pct, 4),
+        "source_addon_pct": round(pct - base_pct, 4),
+        "bucket": bucket,
+        "source": "proxy_adv_bucket",
+        "avg_dollar_vol_20d": adv,
+    }
+
+
+def spread_proxy_pct(ctx, source="watchlist"):
+    return _spread_proxy_details(ctx, source)["pct"]
+
+
+def build_friction_diagnostics(notional_usd, ctx, commission=COMMISSION_PER_TRADE,
+                               source="watchlist"):
+    notional = max(float(notional_usd or 0.0), 1.0)
+    commission_usd = float(commission or 0.0)
+    round_trip_commission = 2.0 * commission_usd
+    commission_pct = round_trip_commission / notional * 100.0
+    model_slippage_pct = 2.0 * slippage_bps(notional, ctx) / 100.0
+    spread = _spread_proxy_details(ctx, source)
+    total = commission_pct + model_slippage_pct + spread["pct"]
+    return {
+        "notional_usd": round(notional, 2),
+        "commission_per_trade_usd": round(commission_usd, 4),
+        "round_trip_commission_usd": round(round_trip_commission, 4),
+        "commission_pct": round(commission_pct, 4),
+        "model_slippage_pct": round(model_slippage_pct, 4),
+        "slippage_pct": round(model_slippage_pct, 4),
+        "spread_proxy_pct": spread["pct"],
+        "spread_pct": spread["pct"],
+        "total_pct": round(total, 4),
+        "avg_dollar_vol_20d": spread["avg_dollar_vol_20d"],
+        "spread_source": spread["source"],
+        "spread_liquidity_bucket": spread["bucket"],
+        "source": source,
+        "source_spread_addon_pct": spread["source_addon_pct"],
+        "components_sum_check_pct": round(
+            round(commission_pct, 4)
+            + round(model_slippage_pct, 4)
+            + spread["pct"],
+            4,
+        ),
+    }
 
 
 def estimate_friction_pct(notional_usd, ctx, commission=COMMISSION_PER_TRADE,
                           source="watchlist"):
-    notional = max(float(notional_usd or 0.0), 1.0)
-    commission_pct = 2.0 * float(commission or 0.0) / notional * 100.0
-    slip_pct = 2.0 * slippage_bps(notional, ctx) / 100.0
-    spread_pct = spread_proxy_pct(ctx, source)
-    total = commission_pct + slip_pct + spread_pct
+    diag = build_friction_diagnostics(notional_usd, ctx, commission, source)
     return {
-        "total_pct": round(total, 4),
-        "commission_pct": round(commission_pct, 4),
-        "slippage_pct": round(slip_pct, 4),
-        "spread_pct": round(spread_pct, 4),
+        "total_pct": diag["total_pct"],
+        "commission_pct": diag["commission_pct"],
+        "slippage_pct": diag["slippage_pct"],
+        "spread_pct": diag["spread_pct"],
     }
 
 
@@ -249,6 +295,65 @@ def confidence_prior_edge_pct(confidence, score=0):
         sc = 0.0
     edge = max(0.0, (conf - 50.0) * 0.08) + max(0.0, sc) * 0.04
     return round(_clamp(edge, 0.0, 4.0), 4)
+
+
+def build_edge_diagnostics(edge, rec, friction, attr_edge=None):
+    rec = rec or {}
+    friction = friction or {}
+    if attr_edge:
+        sources = list(attr_edge.get("sources") or [])
+        samples = sum(float(s.get("n_effective", 0) or 0) for s in sources)
+        return {
+            "edge_source": "attribution_v2",
+            "edge_horizon": EDGE_HORIZON,
+            "edge_samples": round(samples, 2),
+            "gross_edge_pct": round(float(edge.get("gross_edge_pct", 0.0) or 0.0), 4),
+            "net_edge_pct": round(float(attr_edge.get("net_edge_pct", 0.0) or 0.0), 4),
+            "required_edge_pct": round(float(attr_edge.get("required_edge_pct", 0.0) or 0.0), 4),
+            "friction_safety_mult": 1.5,
+            "success_threshold_pct": 0.5,
+            "sources": sources,
+        }
+    try:
+        conf = float(rec.get("confidence", 0) or 0)
+    except Exception:
+        conf = 0.0
+    try:
+        score = float(rec.get("score", 0) or 0)
+    except Exception:
+        score = 0.0
+    confidence_component = max(0.0, (conf - 50.0) * 0.08)
+    score_component = max(0.0, score) * 0.04
+    return {
+        "edge_source": "confidence_prior",
+        "edge_horizon": EDGE_HORIZON,
+        "edge_samples": int(edge.get("edge_samples", 0) or 0),
+        "gross_edge_pct": round(float(edge.get("gross_edge_pct", 0.0) or 0.0), 4),
+        "confidence": rec.get("confidence"),
+        "score": rec.get("score"),
+        "confidence_component_pct": round(confidence_component, 4),
+        "score_component_pct": round(score_component, 4),
+        "formula": "max(0,(confidence-50)*0.08)+max(0,score)*0.04",
+        "clamp_min_pct": 0.0,
+        "clamp_max_pct": 4.0,
+        "why_prior_used": "no_live_attribution_bucket",
+        "friction_total_pct": friction.get("total_pct"),
+    }
+
+
+def rank_reason_code_for(*, risk_sized, gross, required_edge, net,
+                         min_net_edge, warmup_watchlist, ev_pass):
+    if not risk_sized:
+        return "FINAL_SIZE_TOO_SMALL"
+    if gross <= required_edge:
+        return "EDGE_TOO_LOW"
+    if net < min_net_edge:
+        return "NET_EDGE_TOO_LOW_AFTER_COSTS"
+    if warmup_watchlist:
+        return "WARMUP_CONFIDENCE_PRIOR_ALLOWED"
+    if ev_pass:
+        return "EV_RISK_PASS"
+    return "EV_RISK_PASS"
 
 
 def estimate_gross_edge_pct(edge_stats, regime_kind, cluster, confidence, score=0,
@@ -323,8 +428,10 @@ def evaluate_candidate(candidate, total_equity, regime_stop_pct, regime_kind,
         edge = {
             "gross_edge_pct": attr_edge["gross_edge_pct"],
             "edge_source": attr_edge["edge_source"],
-            "edge_samples": attr_edge.get("sources", [{}])[0].get("n_effective", 0)
-                            if attr_edge.get("sources") else 0,
+            "edge_samples": sum(
+                float(s.get("n_effective", 0) or 0)
+                for s in (attr_edge.get("sources") or [])
+            ),
             "edge_horizon": EDGE_HORIZON,
             "required_edge_pct": attr_edge.get("required_edge_pct"),
         }
@@ -353,6 +460,15 @@ def evaluate_candidate(candidate, total_equity, regime_stop_pct, regime_kind,
         and net >= 0
     )
     tradable = risk_sized and (ev_pass or warmup_watchlist)
+    rank_reason_code = rank_reason_code_for(
+        risk_sized=risk_sized,
+        gross=gross,
+        required_edge=required_edge,
+        net=net,
+        min_net_edge=min_net_edge,
+        warmup_watchlist=warmup_watchlist,
+        ev_pass=ev_pass,
+    )
     if not risk_sized:
         reason = (f"Risk budget target ${risk['target_notional']:.0f} below "
                   f"${float(min_position_usd):.0f} floor")
@@ -368,16 +484,45 @@ def evaluate_candidate(candidate, total_equity, regime_stop_pct, regime_kind,
         reason = f"EV gate: net edge {net:.2f}% < min {min_net_edge:.2f}%"
     else:
         reason = "EV/risk pass"
+    friction_diag = build_friction_diagnostics(
+        max(risk["target_notional"], 1.0),
+        ctx,
+        commission=commission,
+        source=source,
+    )
+    edge_diag = build_edge_diagnostics(edge, rec, friction, attr_edge=attr_edge)
+    ev_diag = {
+        "gross_edge_pct": round(gross, 4),
+        "friction_total_pct": friction["total_pct"],
+        "required_edge_pct": round(required_edge, 4),
+        "net_edge_pct": round(net, 4),
+        "min_expected_edge_pct": float(signal_cfg.get("min_expected_edge_pct", 0.40)),
+        "min_net_edge_pct": min_net_edge,
+        "edge_gap_to_required_pct": round(gross - required_edge, 4),
+        "net_gap_to_min_pct": round(net - min_net_edge, 4),
+        "ev_score": round(ev_score, 6),
+        "stop_distance_pct": stop_pct,
+        "risk_sized": bool(risk_sized),
+        "ev_pass": bool(ev_pass),
+        "warmup_watchlist": bool(warmup_watchlist),
+        "tradable": bool(tradable),
+        "rank_reason": reason,
+        "rank_reason_code": rank_reason_code,
+    }
     out = dict(candidate)
     out.update({
         "cluster": cluster,
         "risk": risk,
         "friction": friction,
+        "friction_diagnostics": friction_diag,
+        "edge_diagnostics": edge_diag,
+        "ev_diagnostics": ev_diag,
         "gross_edge_pct": round(gross, 4),
         "net_edge_pct": round(net, 4),
         "ev_score": round(ev_score, 6),
         "tradable": bool(tradable),
         "rank_reason": reason,
+        "rank_reason_code": rank_reason_code,
         "edge_source": edge["edge_source"],
         "trade_bucket": candidate.get("trade_bucket") or (
             "confidence_prior" if edge["edge_source"] == "confidence_prior" else "validated"

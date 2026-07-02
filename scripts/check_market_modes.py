@@ -22,8 +22,22 @@ REQUIRED_STATUS_FIELDS = (
     "degraded_mode_reason",
     "min_buy_confidence",
     "degraded_size_mult",
+    "degraded_use_standard_gates_for_testing",
+    "degraded_standard_gates_active",
+    "degraded_gate_policy",
+    "effective_size_mult",
+    "effective_min_buy_confidence",
+    "normal_ev_gates_required",
+    "normal_risk_caps_required",
+    "fresh_quote_required",
     "degraded_min_confidence",
+    "degraded_reject_counts",
+    "degraded_buys_today",
+    "degraded_max_buys_today",
+    "degraded_gross_exposure_pct",
+    "degraded_max_gross_exposure_pct",
     "data_health_blocks",
+    "data_health_warnings",
     "spy_data_ok",
     "spy_data_source",
     "spy_data_error",
@@ -32,6 +46,11 @@ REQUIRED_STATUS_FIELDS = (
     "regime_kind",
     "regime_source",
     "regime_fallback_active",
+    "regime_data_status",
+    "regime_data_warnings",
+    "finnhub_key_configured",
+    "fmp_key_configured",
+    "stooq_status",
     "volatility_data_ok",
     "volatility_source",
     "volatility_value",
@@ -59,13 +78,28 @@ REQUIRED_STATUS_FIELDS = (
 )
 
 
+def _load_status_diagnostics():
+    try:
+        from app import app as flask_app
+
+        with flask_app.test_client() as client:
+            response = client.get("/api/bot/status")
+        if response.status_code == 200:
+            payload = response.get_json(silent=True) or {}
+            diag = payload.get("last_no_buy_diagnostics") or {}
+            if isinstance(diag, dict):
+                return diag, "api_bot_status"
+    except Exception as exc:
+        return load_bot().get("last_no_buy_diagnostics") or {}, f"bot_state_fallback:{type(exc).__name__}"
+    return load_bot().get("last_no_buy_diagnostics") or {}, "bot_state_fallback"
+
+
 def main():
     cfg = active_config()
     regime = get_market_regime(cfg)
     volatility = get_vix()
     mode = _market_data_mode(regime, volatility, cfg)
-    state = load_bot()
-    diag = state.get("last_no_buy_diagnostics") or {}
+    diag, status_source = _load_status_diagnostics()
     missing = [field for field in REQUIRED_STATUS_FIELDS if field not in diag]
 
     sample_degraded = {
@@ -95,7 +129,15 @@ def main():
         "data_health_blocks": mode.get("data_health_blocks", []),
         "selected_trading_mode": mode.get("trading_mode"),
         "degraded_enabled": bool((cfg.get("market_data_modes") or {}).get("allow_degraded_paper_trading")),
+        "degraded_use_standard_gates_for_testing": mode.get("degraded_use_standard_gates_for_testing"),
+        "degraded_gate_policy": mode.get("degraded_gate_policy"),
+        "effective_size_mult": mode.get("effective_size_mult"),
+        "effective_min_buy_confidence": mode.get("effective_min_buy_confidence"),
+        "normal_ev_gates_required": mode.get("normal_ev_gates_required"),
+        "normal_risk_caps_required": mode.get("normal_risk_caps_required"),
+        "fresh_quote_required": mode.get("fresh_quote_required"),
         "sample_degraded_eligibility_decision": sample_degraded,
+        "status_source": status_source,
         "status_fields_missing": missing,
     }
     print(json.dumps(out, indent=2, sort_keys=True, default=str))
