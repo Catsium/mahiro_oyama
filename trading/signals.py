@@ -84,6 +84,18 @@ def _decay_multiplier(age_hours, half_life_hours):
     return 0.5 ** (age_hours / max(half_life_hours, 0.1))
 
 
+def _present(ctx, key):
+    if not ctx or key not in ctx:
+        return False
+    value = ctx.get(key)
+    if value is None:
+        return False
+    try:
+        return not bool(value != value)
+    except Exception:
+        return True
+
+
 def get_recommendation(sent, ctx, regime=None, earnings=None, analyst=None, insider=None,
                        news_age_hours=None, news_articles=None, pure_technical=False,
                        weights=None, allow_live_risk=True, config=None):
@@ -391,31 +403,56 @@ def get_recommendation(sent, ctx, regime=None, earnings=None, analyst=None, insi
     # votes). Was 4 when MA-cross and week-change also always voted; both are now
     # conditional / reason-only (de-dup #1, #2), so the denominator drops to match.
     baseline_tech = 0
+    data_quality_present_n = 0
+    data_quality_expected_n = 0
     data_quality_missing_fields = []
     if ctx:
+        data_groups = [
+            ("daily_history", ("current", "ma7", "ma30", "rsi", "week_chg_pct")),
+            ("adx_or_mom_30d_pct", ("adx", "mom_30d_pct")),
+            ("vol_ratio_or_mom_30d_pct", ("vol_ratio", "mom_30d_pct")),
+            ("mfi", ("mfi",)),
+            ("weekly_trend_up", ("weekly_trend_up",)),
+            ("rel_str_pct", ("rel_str_pct",)),
+        ]
+        for label, keys in data_groups:
+            data_quality_expected_n += 1
+            if all(_present(ctx, key) for key in keys):
+                data_quality_present_n += 1
+            else:
+                data_quality_missing_fields.append(label)
         baseline_tech += 2
-        if "adx" in ctx and "mom_30d_pct" in ctx:
+        if _present(ctx, "adx") and _present(ctx, "mom_30d_pct"):
             baseline_tech += 1
-        else:
-            data_quality_missing_fields.append("adx_or_mom_30d_pct")
-        if "vol_ratio" in ctx and "mom_30d_pct" in ctx:
+        if _present(ctx, "vol_ratio") and _present(ctx, "mom_30d_pct"):
             baseline_tech += 1
-        else:
-            data_quality_missing_fields.append("vol_ratio_or_mom_30d_pct")
-        if "mfi" in ctx:             baseline_tech += 1
+        if _present(ctx, "mfi"):             baseline_tech += 1
         # Round-7: vwap daily vote dropped (de-dup #3) — no longer in denominator.
-        if "weekly_trend_up" in ctx: baseline_tech += 1
-        if "rel_str_pct" in ctx:     baseline_tech += 1
+        if _present(ctx, "weekly_trend_up"): baseline_tech += 1
+        if _present(ctx, "rel_str_pct"):     baseline_tech += 1
     else:
+        data_quality_expected_n = 1
         data_quality_missing_fields.append("daily_history")
     expected_n = max(1, baseline_tech)
-    if has_news:                                          expected_n += 1
-    if analyst and analyst.get("total", 0) > 0:           expected_n += 1
-    if insider and insider.get("samples", 0) > 0:         expected_n += 1
-    if regime:                                            expected_n += 1
+    if has_news:
+        expected_n += 1
+        data_quality_expected_n += 1
+        data_quality_present_n += 1
+    if analyst and analyst.get("total", 0) > 0:
+        expected_n += 1
+        data_quality_expected_n += 1
+        data_quality_present_n += 1
+    if insider and insider.get("samples", 0) > 0:
+        expected_n += 1
+        data_quality_expected_n += 1
+        data_quality_present_n += 1
+    if regime:
+        expected_n += 1
+        data_quality_expected_n += 1
+        data_quality_present_n += 1
 
     n_raw = sum(len(v) for v in cat_signals.values())
-    data_quality = min(1.0, n_raw / expected_n)
+    data_quality = min(1.0, data_quality_present_n / max(1, data_quality_expected_n))
 
     # ── Confidence ─────────────────────────────────────────────────────
     max_plausible = 14.0
@@ -533,8 +570,8 @@ def get_recommendation(sent, ctx, regime=None, earnings=None, analyst=None, insi
         "data_quality": data_quality, "is_dip": is_dip_flag,
         "categories": cat_votes, "cats_pos": cats_pos, "cats_neg": cats_neg,
         "expected_n": expected_n, "n_raw": n_raw,
-        "data_quality_actual_n": n_raw,
-        "data_quality_expected_n": expected_n,
+        "data_quality_actual_n": data_quality_present_n,
+        "data_quality_expected_n": data_quality_expected_n,
         "data_quality_missing_fields": data_quality_missing_fields,
         "penalty": penalty, "penalty_notes": penalty_notes,
         "score_total": tot,

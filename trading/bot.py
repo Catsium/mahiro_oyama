@@ -14,13 +14,13 @@ import uuid
 import json
 import os
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
-from datetime import datetime
+from datetime import datetime, timezone
 
 from flask import render_template
 
 from market.charts import RANGE_SECS  # noqa: F401 — re-export sentinel
 from market.history import get_history, get_intraday_context
-from market.quotes import get_quote
+from market.quotes import FMP_DAILY_GLOBAL_ENDPOINT, get_quote, fmp_daily_global_circuit_state
 from market.sentiment import get_news
 from trading.indicators import classify_vol_regime, median_atr_since
 from trading.risk import (
@@ -111,6 +111,14 @@ REQUIRED_TICK_LOG_FIELDS = (
     "trading_mode",
     "degraded_mode_active",
     "degraded_mode_reason",
+    "degraded_use_standard_gates_for_testing",
+    "degraded_standard_gates_active",
+    "degraded_gate_policy",
+    "effective_size_mult",
+    "effective_min_buy_confidence",
+    "normal_ev_gates_required",
+    "normal_risk_caps_required",
+    "fresh_quote_required",
     "market_open",
     "buy_window_open",
     "spy_data_ok",
@@ -126,8 +134,16 @@ REQUIRED_TICK_LOG_FIELDS = (
     "history_source_counts",
     "history_missing_count",
     "history_fmp_fallback_count",
+    "history_fmp_attempted_count",
+    "history_fmp_skipped_count",
+    "history_fmp_rate_limited_count",
+    "history_fmp_global_circuit_skipped_count",
     "history_finnhub_daily_blocked_count",
     "history_stale_cache_count",
+    "fmp_daily_global_circuit_status",
+    "fmp_daily_rate_limited",
+    "fmp_daily_cooldown_remaining_sec",
+    "fmp_daily_last_429_age_sec",
     "candidate_pool_count",
     "ranked_count",
     "tradable_count",
@@ -274,21 +290,30 @@ def _history_source_bucket(source):
     return source or "missing"
 
 
+def _degraded_standard_gates_enabled(mode_cfg):
+    return bool((mode_cfg or {}).get("degraded_use_standard_gates_for_testing", True))
+
+
+def _execution_min_confidence(cfg, degraded_mode_active=False):
+    signal_cfg = (cfg or {}).get("signal", {})
+    mode_cfg = (cfg or {}).get("market_data_modes", {})
+    normal_min = float(signal_cfg.get("min_buy_confidence", 40))
+    if degraded_mode_active and not _degraded_standard_gates_enabled(mode_cfg):
+        return float(mode_cfg.get("degraded_min_confidence", normal_min))
+    return normal_min
+
+
 def _why_not_execution_eligible(rec, cfg, degraded_mode_active=False):
     rec = rec or {}
     raw_cls = str(rec.get("cls") or "hold").lower()
     display = rec.get("display_signal_label")
-    signal_cfg = (cfg or {}).get("signal", {})
-    mode_cfg = (cfg or {}).get("market_data_modes", {})
-    normal_min = float(signal_cfg.get("min_buy_confidence", 40))
-    degraded_min = float(mode_cfg.get("degraded_min_confidence", normal_min))
-    min_conf = degraded_min if degraded_mode_active else normal_min
+    min_conf = _execution_min_confidence(cfg, degraded_mode_active)
     if raw_cls not in ("buy", "strong-buy"):
         return f"raw_class_{raw_cls}"
     if display not in ("BUY_CANDIDATE", "STRONG_BUY_CANDIDATE"):
         return f"display_signal_{display or 'missing'}"
     if float(rec.get("confidence", 0) or 0) < min_conf:
-        return "confidence_below_min"
+        return "CONFIDENCE_BELOW_MIN_BUY"
     return None
 
 
@@ -320,8 +345,15 @@ def _ticker_debug_row(t, payload, cfg, degraded_mode_active=False):
     return {
         "ticker": t,
         "history_source": ctx.get("history_source") or ("recorded" if ctx.get("source") == "recorded" else "missing"),
+        "history_status": ctx.get("history_status"),
+        "history_warnings": ctx.get("history_warnings", []),
         "history_rows": ctx.get("history_rows", 0),
         "history_last_date": ctx.get("history_last_date"),
+        "stale_daily_cache_age_hours": ctx.get("stale_daily_cache_age_hours"),
+        "provider_chain_debug": ctx.get("provider_chain_debug", []),
+        "relative_strength_source": ctx.get("relative_strength_source"),
+        "relative_strength_skipped_reason": ctx.get("relative_strength_skipped_reason"),
+        "sector_etf_history_source": ctx.get("sector_etf_history_source"),
         "quote_source": quote.get("source"),
         "quote_price": price,
         "quote_pct": quote.get("pct"),
@@ -357,17 +389,13 @@ def _ticker_debug_row(t, payload, cfg, degraded_mode_active=False):
 def is_execution_candidate(rec, cfg, *, degraded_mode_active=False):
     """True only for signals allowed to reach execution sizing."""
     rec = rec or {}
-    signal_cfg = (cfg or {}).get("signal", {})
-    mode_cfg = (cfg or {}).get("market_data_modes", {})
     raw_cls = str(rec.get("cls") or "").lower()
     display = rec.get("display_signal_label")
     try:
         conf = float(rec.get("confidence", 0) or 0)
     except Exception:
         conf = 0.0
-    normal_min = float(signal_cfg.get("min_buy_confidence", 40))
-    degraded_min = float(mode_cfg.get("degraded_min_confidence", normal_min))
-    min_conf = degraded_min if degraded_mode_active else normal_min
+    min_conf = _execution_min_confidence(cfg, degraded_mode_active)
     if raw_cls not in ("buy", "strong-buy"):
         return False
     if display not in ("BUY_CANDIDATE", "STRONG_BUY_CANDIDATE"):
@@ -393,6 +421,14 @@ def _new_no_buy_diag(now, b, force=False, user_forced=False):
         "degraded_mode_active": False,
         "degraded_mode_reason": None,
         "degraded_size_mult": None,
+        "degraded_use_standard_gates_for_testing": None,
+        "degraded_standard_gates_active": False,
+        "degraded_gate_policy": None,
+        "effective_size_mult": None,
+        "effective_min_buy_confidence": None,
+        "normal_ev_gates_required": None,
+        "normal_risk_caps_required": None,
+        "fresh_quote_required": None,
         "degraded_min_confidence": None,
         "min_trade_size_effective": None,
         "degraded_reject_counts": {},
@@ -455,8 +491,16 @@ def _new_no_buy_diag(now, b, force=False, user_forced=False):
         "history_source_counts": {},
         "history_missing_count": 0,
         "history_fmp_fallback_count": 0,
+        "history_fmp_attempted_count": 0,
+        "history_fmp_skipped_count": 0,
+        "history_fmp_rate_limited_count": 0,
+        "history_fmp_global_circuit_skipped_count": 0,
         "history_finnhub_daily_blocked_count": 0,
         "history_stale_cache_count": 0,
+        "fmp_daily_global_circuit_status": None,
+        "fmp_daily_rate_limited": False,
+        "fmp_daily_cooldown_remaining_sec": 0,
+        "fmp_daily_last_429_age_sec": None,
         "ticker_signal_debug": [],
         "buyable_reject_counts": {},
         "top_buyable_rejects": [],
@@ -524,10 +568,14 @@ def _fmt_vix_value(vix_data):
 
 def _market_data_mode(regime, vix_data, cfg):
     mode_cfg = (cfg or {}).get("market_data_modes", {})
+    signal_cfg = (cfg or {}).get("signal", {})
     spy_ok = regime.get("spy_data_ok") is True
     vol_ok = vix_data.get("data_ok") is True
     vol_source = vix_data.get("volatility_source") or vix_data.get("source")
     is_proxy = vol_ok and vol_source == "spy_realized_vol_proxy"
+    standard_gates_config = _degraded_standard_gates_enabled(mode_cfg)
+    normal_min_confidence = float(signal_cfg.get("min_buy_confidence", 40))
+    degraded_min_confidence = float(mode_cfg.get("degraded_min_confidence", normal_min_confidence))
     blocks = []
     if not spy_ok:
         blocks.append("SPY_DATA_MISSING")
@@ -544,7 +592,7 @@ def _market_data_mode(regime, vix_data, cfg):
         reason = None
     elif blocks and mode_cfg.get("allow_degraded_paper_trading", True):
         mode = "DEGRADED_MODE"
-        size_mult = float(mode_cfg.get("degraded_size_mult", 0.90))
+        size_mult = 1.0 if standard_gates_config else float(mode_cfg.get("degraded_size_mult", 0.90))
         reason = ",".join(blocks)
     else:
         mode = "DEGRADED_MODE_DISABLED" if blocks else "DATA_HEALTH_BLOCKED"
@@ -552,6 +600,34 @@ def _market_data_mode(regime, vix_data, cfg):
         reason = ",".join(blocks) if blocks else None
 
     degraded = mode == "DEGRADED_MODE"
+    degraded_standard_gates_active = bool(degraded and standard_gates_config)
+    degraded_gate_policy = None
+    if degraded:
+        degraded_gate_policy = (
+            "standard_gates_for_testing"
+            if degraded_standard_gates_active
+            else "restricted_degraded_gates"
+        )
+    effective_min_buy_confidence = (
+        normal_min_confidence
+        if not degraded or degraded_standard_gates_active
+        else degraded_min_confidence
+    )
+    normal_ev_gates_required = (
+        True
+        if not degraded or degraded_standard_gates_active
+        else bool(mode_cfg.get("degraded_require_normal_ev_gates", True))
+    )
+    normal_risk_caps_required = (
+        True
+        if not degraded or degraded_standard_gates_active
+        else bool(mode_cfg.get("degraded_require_normal_risk_caps", True))
+    )
+    fresh_quote_required = (
+        True
+        if not degraded or degraded_standard_gates_active
+        else bool(mode_cfg.get("degraded_require_fresh_quote", True))
+    )
     proxy = mode == "PROXY_MODE"
     normal = mode == "NORMAL_MODE"
     return {
@@ -560,6 +636,14 @@ def _market_data_mode(regime, vix_data, cfg):
         "proxy_mode_active": proxy,
         "degraded_mode_active": degraded,
         "degraded_mode_reason": reason if degraded else None,
+        "degraded_use_standard_gates_for_testing": standard_gates_config,
+        "degraded_standard_gates_active": degraded_standard_gates_active,
+        "degraded_gate_policy": degraded_gate_policy,
+        "effective_size_mult": size_mult,
+        "effective_min_buy_confidence": effective_min_buy_confidence,
+        "normal_ev_gates_required": normal_ev_gates_required,
+        "normal_risk_caps_required": normal_risk_caps_required,
+        "fresh_quote_required": fresh_quote_required,
         "data_health_blocks": blocks,
         "allow_buys": normal or proxy or degraded,
         "mode_size_mult": size_mult,
@@ -571,9 +655,14 @@ def _provider_health_summary(snapshot):
     snap = snapshot or {}
     if any((v or {}).get("rate_limit_recent") for v in snap.values() if isinstance(v, dict)):
         return "rate_limited"
-    if any((v or {}).get("rate_limited") for v in snap.values() if isinstance(v, dict)):
-        return "rate_limited"
-    healthy_statuses = {"ok", "healthy", "skipped_on_pythonanywhere", "skipped_missing_key"}
+    healthy_statuses = {
+        "ok",
+        "healthy",
+        "skipped_on_pythonanywhere",
+        "skipped_missing_key",
+        "skipped_by_global_rate_limit",
+        "skipped_by_circuit",
+    }
     if any((v or {}).get("status") not in healthy_statuses for v in snap.values() if isinstance(v, dict)):
         return "degraded"
     return "healthy"
@@ -651,9 +740,12 @@ def _call_with_deadline(fn, deadline_ts):
         executor.shutdown(wait=False, cancel_futures=True)
 
 
-def buyable_reason(t, s, recent_sells=None, regime_kind="neutral", holdings=None):
+def buyable_reason(t, s, recent_sells=None, regime_kind="neutral", holdings=None, cfg=None):
     recent_sells = recent_sells or {}
     holdings = holdings or {}
+    signal_cfg = (cfg or {}).get("signal", {})
+    hard_reject = float(signal_cfg.get("volume_hard_reject_ratio", 0.70))
+    adx_gate = float(signal_cfg.get("neutral_gate_adx_threshold", 20))
     if s.get("price", 0) <= 0:
         return False, "INVALID_PRICE"
     if s.get("stale"):
@@ -675,7 +767,7 @@ def buyable_reason(t, s, recent_sells=None, regime_kind="neutral", holdings=None
     if regime_kind == "bear":
         if not (ctx_local.get("rsi", 100) < 35 or ctx_local.get("is_dip")):
             return False, "BEAR_GATE_REQUIRES_DIP_OR_RSI_LT_35"
-    if (regime_kind in ("neutral", "degraded_neutral") and ctx_local.get("adx", 100) < 20
+    if (regime_kind in ("neutral", "degraded_neutral") and ctx_local.get("adx", 100) < adx_gate
             and not ctx_local.get("is_dip")):
         if t not in holdings:
             return False, "NEUTRAL_ADX_BELOW_20_NON_DIP"
@@ -690,7 +782,7 @@ def buyable_reason(t, s, recent_sells=None, regime_kind="neutral", holdings=None
     vol_regime = classify_vol_regime(ctx_local)
     if vol_regime == "explosive" and ctx_local.get("rsi", 50) < 35:
         return False, "EXPLOSIVE_OVERSOLD_BLOCK"
-    if not ctx_local.get("is_dip") and float(ctx_local.get("vol_ratio", 1.0) or 1.0) < 0.70:
+    if not ctx_local.get("is_dip") and float(ctx_local.get("vol_ratio", 1.0) or 1.0) < hard_reject:
         return False, "VERY_LOW_VOLUME_CONFIRMATION"
     return True, "buyable"
 
@@ -836,7 +928,10 @@ def _record_hold(b, reason, sigs):
 
 
 def _record_skip(b, ticker, reason, signal, confidence, *,
-                 display_signal=None, original_reason=None, skip_stage=None):
+                 display_signal=None, original_reason=None, skip_stage=None,
+                 rank_reason_code=None, gross_edge_pct=None, net_edge_pct=None,
+                 required_edge_pct=None, friction_pct=None, target_notional=None,
+                 risk_pct=None):
     """SKIP entry — a buy attempt that was prepared but failed sizing checks."""
     et, sgt = _fmt_times()
     shown_signal = display_signal or signal or "UNKNOWN"
@@ -852,6 +947,13 @@ def _record_skip(b, ticker, reason, signal, confidence, *,
         "reason": reason,
         "original_reason": original_reason,
         "skip_stage": skip_stage,
+        "rank_reason_code": rank_reason_code,
+        "gross_edge_pct": gross_edge_pct,
+        "net_edge_pct": net_edge_pct,
+        "required_edge_pct": required_edge_pct,
+        "friction_pct": friction_pct,
+        "target_notional": target_notional,
+        "risk_pct": risk_pct,
         "signals": "",
         "news_title": "", "news_link": "",
     })
@@ -1048,6 +1150,8 @@ def _persist_no_buy_diag(b, diag, blocker=None, traded=False):
 
 def _record_candidate_observation(b, cand, decision, reason, now, regime_kind):
     """Persist one candidate for forward-return attribution."""
+    if decision != "executed":
+        return False
     event = record_entry_event(b, cand, decision, reason, ts=now, regime=regime_kind)
     return bool(event)
 
@@ -1173,10 +1277,17 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
     degraded_min_confidence = float(
         mode_cfg.get("degraded_min_confidence", min_buy_confidence)
     )
+    degraded_standard_gates_config = _degraded_standard_gates_enabled(mode_cfg)
     cfg_hash = config_hash(cfg)
     no_buy_diag = _new_no_buy_diag(now, b, force=force, user_forced=user_forced)
     no_buy_diag["min_buy_confidence"] = min_buy_confidence
     no_buy_diag["degraded_min_confidence"] = degraded_min_confidence
+    no_buy_diag["degraded_use_standard_gates_for_testing"] = degraded_standard_gates_config
+    no_buy_diag["effective_min_buy_confidence"] = min_buy_confidence
+    no_buy_diag["effective_size_mult"] = 1.0
+    no_buy_diag["normal_ev_gates_required"] = True
+    no_buy_diag["normal_risk_caps_required"] = True
+    no_buy_diag["fresh_quote_required"] = True
     no_buy_diag["min_trade_size_effective"] = min_position_usd
     deadline_ts = (now + float(max_runtime_sec)) if max_runtime_sec else None
     collapse_diag = []
@@ -1390,6 +1501,31 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
         source = ctx.get("history_source") or ("recorded" if ctx.get("source") == "recorded" else "missing")
         bucket = _history_source_bucket(source if ctx else "missing")
         _bump(no_buy_diag["history_source_counts"], bucket)
+        no_buy_diag["data_health_warnings"] = list(dict.fromkeys(
+            list(no_buy_diag.get("data_health_warnings") or [])
+            + list(ctx.get("history_warnings") or [])
+        ))
+        if (
+            ctx.get("stale_daily_cache_age_hours") is not None
+            and no_buy_diag.get("stale_daily_cache_age_hours") is None
+        ):
+            no_buy_diag["stale_daily_cache_age_hours"] = ctx.get("stale_daily_cache_age_hours")
+            no_buy_diag["stale_daily_cache_age_sec"] = ctx.get("stale_daily_cache_age_sec")
+        for entry in (ctx.get("provider_chain_debug") or []):
+            if not isinstance(entry, dict):
+                continue
+            provider = str(entry.get("provider") or entry.get("source") or "")
+            if provider != "fmp_daily":
+                continue
+            status = str(entry.get("status") or "")
+            if status.startswith("skipped"):
+                no_buy_diag["history_fmp_skipped_count"] += 1
+                if status == "skipped_by_global_rate_limit":
+                    no_buy_diag["history_fmp_global_circuit_skipped_count"] += 1
+            else:
+                no_buy_diag["history_fmp_attempted_count"] += 1
+            if status == "rate_limited" or entry.get("rate_limited"):
+                no_buy_diag["history_fmp_rate_limited_count"] += 1
         if bucket == "missing":
             no_buy_diag["history_missing_count"] += 1
         elif bucket == "fmp_daily":
@@ -1400,6 +1536,20 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
     no_buy_diag["stale_ticker_count"] = len(stale_tickers)
     no_buy_diag["stale_tickers"] = stale_tickers[:10]
     no_buy_diag["api_circuit_breakers"] = api_failure_snapshot()
+    fmp_state = fmp_daily_global_circuit_state()
+    if not fmp_state.get("active"):
+        global_snap = (no_buy_diag["api_circuit_breakers"] or {}).get(FMP_DAILY_GLOBAL_ENDPOINT, {})
+        if (global_snap or {}).get("status") == "rate_limited":
+            no_buy_diag["api_circuit_breakers"].pop(FMP_DAILY_GLOBAL_ENDPOINT, None)
+    no_buy_diag["fmp_daily_global_circuit_status"] = fmp_state.get("status")
+    no_buy_diag["fmp_daily_rate_limited"] = bool(fmp_state.get("active"))
+    no_buy_diag["fmp_daily_cooldown_remaining_sec"] = int(fmp_state.get("cooldown_remaining_sec") or 0)
+    no_buy_diag["fmp_daily_last_429_age_sec"] = fmp_state.get("last_429_age_sec")
+    if fmp_state.get("active"):
+        no_buy_diag["data_health_warnings"] = list(dict.fromkeys(
+            list(no_buy_diag.get("data_health_warnings") or [])
+            + ["FMP_DAILY_RATE_LIMITED", "FMP_DAILY_GLOBAL_COOLDOWN"]
+        ))
     no_buy_diag["history_finnhub_daily_blocked_count"] = sum(
         1 for t in fetch_list
         if (
@@ -1407,16 +1557,30 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
             .get("status")
         ) == "blocked_or_forbidden"
     )
-    no_buy_diag["provider_health_status"] = _provider_health_summary(no_buy_diag["api_circuit_breakers"])
+    no_buy_diag["provider_health_status"] = (
+        "rate_limited"
+        if fmp_state.get("active")
+        else _provider_health_summary(no_buy_diag["api_circuit_breakers"])
+    )
     no_buy_diag["rate_limit_recent"] = any(
         (snap or {}).get("rate_limit_recent")
         for snap in (no_buy_diag.get("api_circuit_breakers") or {}).values()
         if isinstance(snap, dict)
-    )
+    ) or bool(fmp_state.get("active"))
     for endpoint, snap in (no_buy_diag.get("api_circuit_breakers") or {}).items():
-        if snap.get("rate_limited"):
+        if snap.get("rate_limited") and (
+            snap.get("rate_limit_recent")
+            or (endpoint == "fmp_daily:global" and fmp_state.get("active"))
+        ):
             _log_bot_event("RATE_LIMIT_HIT", endpoint=endpoint, provider_status=snap)
-        elif snap.get("status") not in {"ok", "healthy", "skipped_on_pythonanywhere", "skipped_missing_key"}:
+        elif snap.get("status") not in {
+            "ok",
+            "healthy",
+            "skipped_on_pythonanywhere",
+            "skipped_missing_key",
+            "skipped_by_global_rate_limit",
+            "skipped_by_circuit",
+        }:
             _log_bot_event("PROVIDER_DEGRADED", endpoint=endpoint, provider_status=snap)
 
     obs_updates = _update_candidate_observations(b, sigs, now)
@@ -1464,6 +1628,14 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
         "proxy_mode_active": mode_info["proxy_mode_active"],
         "degraded_mode_active": mode_info["degraded_mode_active"],
         "degraded_mode_reason": mode_info["degraded_mode_reason"],
+        "degraded_use_standard_gates_for_testing": mode_info["degraded_use_standard_gates_for_testing"],
+        "degraded_standard_gates_active": mode_info["degraded_standard_gates_active"],
+        "degraded_gate_policy": mode_info["degraded_gate_policy"],
+        "effective_size_mult": mode_info["effective_size_mult"],
+        "effective_min_buy_confidence": mode_info["effective_min_buy_confidence"],
+        "normal_ev_gates_required": mode_info["normal_ev_gates_required"],
+        "normal_risk_caps_required": mode_info["normal_risk_caps_required"],
+        "fresh_quote_required": mode_info["fresh_quote_required"],
     })
     no_buy_diag["ticker_signal_debug"] = [
         _ticker_debug_row(
@@ -1516,7 +1688,15 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
     if mode_info["degraded_mode_active"]:
         regime_label = "DEGRADED NEUTRAL"
         _log_bot_event("DEGRADED_MODE_ACTIVE", blocks=data_health_blocks,
-                       size_mult=mode_info["mode_size_mult"])
+                       size_mult=mode_info["mode_size_mult"],
+                       degraded_gate_policy=mode_info["degraded_gate_policy"],
+                       degraded_use_standard_gates_for_testing=mode_info["degraded_use_standard_gates_for_testing"],
+                       degraded_standard_gates_active=mode_info["degraded_standard_gates_active"],
+                       effective_size_mult=mode_info["effective_size_mult"],
+                       effective_min_buy_confidence=mode_info["effective_min_buy_confidence"],
+                       normal_ev_gates_required=mode_info["normal_ev_gates_required"],
+                       normal_risk_caps_required=mode_info["normal_risk_caps_required"],
+                       fresh_quote_required=mode_info["fresh_quote_required"])
     elif mode_info["trading_mode"] == "DEGRADED_MODE_DISABLED":
         _log_bot_event("DEGRADED_MODE_DISABLED", blocks=data_health_blocks)
 
@@ -1886,6 +2066,14 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
     no_buy_diag["degraded_buys_today"] = int(degraded_buys_today)
     no_buy_diag["degraded_max_buys_today"] = degraded_max_buys_today
     no_buy_diag["degraded_size_mult"] = mode_cfg.get("degraded_size_mult", 0.90)
+    no_buy_diag["effective_size_mult"] = mode_info["effective_size_mult"]
+    no_buy_diag["effective_min_buy_confidence"] = mode_info["effective_min_buy_confidence"]
+    no_buy_diag["degraded_use_standard_gates_for_testing"] = mode_info["degraded_use_standard_gates_for_testing"]
+    no_buy_diag["degraded_standard_gates_active"] = mode_info["degraded_standard_gates_active"]
+    no_buy_diag["degraded_gate_policy"] = mode_info["degraded_gate_policy"]
+    no_buy_diag["normal_ev_gates_required"] = mode_info["normal_ev_gates_required"]
+    no_buy_diag["normal_risk_caps_required"] = mode_info["normal_risk_caps_required"]
+    no_buy_diag["fresh_quote_required"] = mode_info["fresh_quote_required"]
     no_buy_diag["degraded_gross_exposure_pct"] = no_buy_diag.get("gross_exposure_pct")
     no_buy_diag["degraded_max_gross_exposure_pct"] = degraded_max_gross_exposure_pct
 
@@ -1925,7 +2113,7 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
                 corr_value[grp] = corr_value.get(grp, 0) + h2["shares"] * sigs[tt]["price"]
 
     def buyable_reason_local(t, s):
-        return buyable_reason(t, s, recent_sells, regime_kind, b.get("holdings", {}))
+        return buyable_reason(t, s, recent_sells, regime_kind, b.get("holdings", {}), cfg=cfg)
 
     def buyable(t, s):
         ok, reason = buyable_reason_local(t, s)
@@ -2045,16 +2233,21 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
     no_buy_diag["scan_rows_count"] = len(scan_rows_all)
     no_buy_diag["scan_fresh_rows_count"] = len(fresh_scan_rows)
 
-    if mode_info["degraded_mode_active"]:
+    degraded_restricted_mode = (
+        mode_info["degraded_mode_active"]
+        and not mode_info["degraded_standard_gates_active"]
+    )
+
+    if degraded_restricted_mode:
         daily_buy_room = degraded_buys_today < degraded_max_buys_today
         exposure_room = (no_buy_diag.get("gross_exposure_pct") or 0) < degraded_max_gross_exposure_pct
     else:
         daily_buy_room = buys_today < max_buys_today
         exposure_room = (no_buy_diag.get("gross_exposure_pct") or 0) < MAX_GROSS_EXPOSURE_PCT
     if not daily_buy_room:
-        _bump(no_buy_diag["skip_reason_counts"], "daily buy cap reached")
+        _bump(no_buy_diag["skip_reason_counts"], "MAX_BUYS_PER_DAY")
     if not exposure_room:
-        _bump(no_buy_diag["skip_reason_counts"], "gross exposure cap reached")
+        _bump(no_buy_diag["skip_reason_counts"], "MAX_GROSS_EXPOSURE")
 
     if not buys_paused and regime_allow_buys and tod_ok and daily_buy_room and exposure_room:
         for t, s in sigs.items():
@@ -2153,6 +2346,10 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
             "gross_edge_pct": c.get("gross_edge_pct"),
             "friction_pct": (c.get("friction") or {}).get("total_pct"),
             "net_edge_pct": c.get("net_edge_pct"), "ev_score": c.get("ev_score"),
+            "rank_reason_code": c.get("rank_reason_code"),
+            "friction_diagnostics": c.get("friction_diagnostics"),
+            "edge_diagnostics": c.get("edge_diagnostics"),
+            "ev_diagnostics": c.get("ev_diagnostics"),
             "risk_pct": (c.get("risk") or {}).get("risk_pct"),
             "target_notional": (c.get("risk") or {}).get("target_notional"),
             "tradable": c.get("tradable"), "reason": c.get("rank_reason"),
@@ -2173,33 +2370,52 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
     no_buy_diag["top_ranked"] = _ranking_rows()[:10]
     for c in ranked_candidates:
         if not c.get("tradable"):
-            _bump(no_buy_diag["skip_reason_counts"], c.get("rank_reason"))
+            _bump(no_buy_diag["skip_reason_counts"], c.get("rank_reason_code") or c.get("rank_reason"))
             if len(no_buy_diag["top_ranked_rejections"]) < 10:
                 rec = c.get("rec") or {}
+                risk = c.get("risk") or {}
                 no_buy_diag["top_ranked_rejections"].append({
                     "ticker": c.get("ticker"),
                     "raw_signal_label": rec.get("raw_signal_label") or rec.get("signal"),
                     "display_signal_label": rec.get("display_signal_label"),
                     "confidence": rec.get("confidence"),
+                    "rank_reason_code": c.get("rank_reason_code"),
                     "rank_reason": c.get("rank_reason"),
                     "original_rank_reason": c.get("original_rank_reason") or c.get("rank_reason"),
+                    "gross_edge_pct": c.get("gross_edge_pct"),
+                    "friction_pct": (c.get("friction") or {}).get("total_pct"),
+                    "friction_diagnostics": c.get("friction_diagnostics"),
+                    "edge_diagnostics": c.get("edge_diagnostics"),
+                    "ev_diagnostics": c.get("ev_diagnostics"),
                     "net_edge_pct": c.get("net_edge_pct"),
                     "required_edge_pct": c.get("required_edge_pct"),
+                    "edge_source": c.get("edge_source"),
+                    "edge_samples": c.get("edge_samples"),
+                    "risk": risk,
+                    "target_notional": risk.get("target_notional"),
                 })
 
     scan_taken = 0
     total_taken = 0
     max_cycle_buys = int(risk_cfg.get("max_new_buys_per_tick", BOT_MAX_BUYS)) + BOT_SCAN_BUY
     max_cycle_buys = max(0, min(max_cycle_buys, max_buys_today - buys_today))
-    if mode_info["degraded_mode_active"]:
+    if degraded_restricted_mode:
         degraded_day_room = max(0, degraded_max_buys_today - degraded_buys_today)
         max_cycle_buys = min(max_cycle_buys, degraded_max_buys_per_tick, degraded_day_room)
 
     def _collapse_skip(cand, reason, skip_stage, original_reason=None):
         rec = cand.get("rec") or {}
+        risk = cand.get("risk") or {}
         collapse_diag.append({
             "ticker": cand.get("ticker"),
             "reason": reason,
+            "rank_reason_code": cand.get("rank_reason_code"),
+            "gross_edge_pct": cand.get("gross_edge_pct"),
+            "net_edge_pct": cand.get("net_edge_pct"),
+            "required_edge_pct": cand.get("required_edge_pct"),
+            "friction_pct": (cand.get("friction") or {}).get("total_pct"),
+            "target_notional": risk.get("target_notional"),
+            "risk_pct": risk.get("risk_pct"),
             "raw_signal": rec.get("raw_signal_label") or rec.get("signal"),
             "display_signal": rec.get("display_signal_label") or rec.get("signal"),
             "confidence": rec.get("confidence"),
@@ -2221,7 +2437,15 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
             original_rank_reason=cand.get("original_rank_reason"),
             allowed_reason=reason if event.endswith("ALLOWED") else None,
             original_size=risk.get("pre_mode_target_notional", risk.get("target_notional")),
-            degraded_size_mult=mode_info["mode_size_mult"],
+            degraded_size_mult=mode_cfg.get("degraded_size_mult", 0.90),
+            degraded_use_standard_gates_for_testing=mode_info.get("degraded_use_standard_gates_for_testing"),
+            degraded_standard_gates_active=mode_info.get("degraded_standard_gates_active"),
+            degraded_gate_policy=mode_info.get("degraded_gate_policy"),
+            effective_size_mult=mode_info.get("effective_size_mult"),
+            effective_min_buy_confidence=mode_info.get("effective_min_buy_confidence"),
+            normal_ev_gates_required=mode_info.get("normal_ev_gates_required"),
+            normal_risk_caps_required=mode_info.get("normal_risk_caps_required"),
+            fresh_quote_required=mode_info.get("fresh_quote_required"),
             final_size=final_size if final_size is not None else risk.get("target_notional"),
             gross_exposure_after_trade=gross_after,
         )
@@ -2229,12 +2453,29 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
     def _degraded_reject_reason(cand, s, taken_this_tick):
         rec = cand.get("rec") or {}
         display = rec.get("display_signal_label")
-        if s.get("stale"):
+        warnings = cand.get("warnings") or []
+        risk_penalties = (cand.get("risk") or {}).get("size_penalties") or []
+        mode_cfg_local = mode_cfg or {}
+        if mode_info.get("degraded_standard_gates_active"):
+            return None
+        if mode_cfg_local.get("degraded_require_fresh_quote", True) and s.get("stale"):
             return "DEGRADED_STALE_QUOTE_BLOCKED"
-        if display not in ("BUY_CANDIDATE", "STRONG_BUY_CANDIDATE"):
+        if mode_cfg_local.get("degraded_require_buy_candidate", True) and display not in ("BUY_CANDIDATE", "STRONG_BUY_CANDIDATE"):
             return "DEGRADED_NOT_BUY_CANDIDATE"
         if float(rec.get("confidence", 0) or 0) < degraded_min_confidence:
-            return "DEGRADED_CONFIDENCE_BELOW_MIN"
+            return "DEGRADED_CONFIDENCE_BELOW_MIN_BUY"
+        if mode_cfg_local.get("degraded_block_low_volume_penalty", False):
+            if "LOW_VOLUME_PENALTY_ONLY" in warnings or "LOW_VOLUME_PENALTY_ONLY" in risk_penalties:
+                return "DEGRADED_LOW_VOLUME_BLOCKED"
+        if mode_cfg_local.get("degraded_block_confidence_prior", False):
+            if cand.get("edge_source") == "confidence_prior":
+                return "DEGRADED_CONFIDENCE_PRIOR_BLOCKED"
+        if mode_cfg_local.get("degraded_block_pyramiding", False):
+            if cand.get("ticker") in b.get("holdings", {}):
+                return "DEGRADED_PYRAMIDING_BLOCKED"
+        if mode_cfg_local.get("degraded_block_experimental", False):
+            if cand.get("trade_bucket") == "experimental" or "EXPERIMENTAL_SIZE_REDUCED" in risk_penalties:
+                return "DEGRADED_EXPERIMENTAL_BLOCKED"
         if taken_this_tick >= degraded_max_buys_per_tick:
             return "DEGRADED_MAX_BUYS_PER_TICK"
         if degraded_buys_today + taken_this_tick >= degraded_max_buys_today:
@@ -2247,8 +2488,8 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
         rec = cand["rec"]
         conf = rec.get("confidence", 0)
         if total_taken >= max_cycle_buys:
-            reason = "cycle buy cap reached"
-            if mode_info["degraded_mode_active"]:
+            reason = "MAX_BUYS_PER_TICK"
+            if degraded_restricted_mode:
                 reason = ("DEGRADED_MAX_BUYS_PER_DAY" if degraded_buys_today >= degraded_max_buys_today
                           else "DEGRADED_MAX_BUYS_PER_TICK")
                 _bump(no_buy_diag["degraded_reject_counts"], reason)
@@ -2258,16 +2499,21 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
                                           now, regime_kind)
             continue
         if cand["source"] == "scan" and scan_taken >= BOT_SCAN_BUY:
-            _bump(no_buy_diag["skip_reason_counts"], "scan buy cap reached")
-            _record_candidate_observation(b, cand, "skipped", "scan buy cap reached",
+            _bump(no_buy_diag["skip_reason_counts"], "MAX_SCAN_BUYS_PER_TICK")
+            _record_candidate_observation(b, cand, "skipped", "MAX_SCAN_BUYS_PER_TICK",
                                           now, regime_kind)
             continue
-        if not cand.get("tradable"):
+        require_normal_ev = (
+            not mode_info["degraded_mode_active"]
+            or mode_info["degraded_standard_gates_active"]
+            or mode_cfg.get("degraded_require_normal_ev_gates", True)
+        )
+        if not cand.get("tradable") and require_normal_ev:
             original_reason = cand.get("rank_reason")
-            reason = original_reason
-            if mode_info["degraded_mode_active"]:
+            reason = cand.get("rank_reason_code") or original_reason
+            if degraded_restricted_mode:
                 reason = ("DEGRADED_FINAL_SIZE_TOO_SMALL"
-                          if "below" in str(original_reason or "").lower()
+                          if cand.get("rank_reason_code") == "FINAL_SIZE_TOO_SMALL"
                           else "DEGRADED_NORMAL_EV_GATE_FAILED")
                 cand["original_rank_reason"] = original_reason
                 _bump(no_buy_diag["degraded_reject_counts"], reason)
@@ -2302,7 +2548,7 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
             sizing_note = f"pyramid +{exist_pnl:.1f}% ({since_last_min:.0f}m since add)"
         else:
             if len(b["holdings"]) >= max_positions:
-                reason = f"position cap reached ({max_positions})"
+                reason = "MAX_POSITIONS_REACHED"
                 _bump(no_buy_diag["skip_reason_counts"], reason)
                 _record_candidate_observation(b, cand, "skipped", reason, now, regime_kind)
                 continue
@@ -2322,7 +2568,8 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
         if grp:
             grp_current = corr_value.get(grp, 0)
             spend = min(spend, max(0, pt * MAX_CORR_GROUP_PCT - grp_current))
-        if mode_info["degraded_mode_active"]:
+        if (degraded_restricted_mode
+                and mode_cfg.get("degraded_require_normal_risk_caps", True)):
             degraded_pos_room = max(0, pt * degraded_max_position_pct - existing_val)
             if degraded_pos_room < min_position_usd:
                 reason = "DEGRADED_MAX_POSITION_CAP"
@@ -2357,11 +2604,11 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
         cand["portfolio_variance"] = variance_diag
         variance_checks.append(variance_diag)
         if variance_diag.get("risk_action") == "skip":
-            reason = f"{variance_diag.get('skip_reason')}: {variance_reason(variance_diag)}"
-            cand["rank_reason"] = reason
+            reason = variance_diag.get("skip_reason") or "PORTFOLIO_VARIANCE"
+            cand["rank_reason"] = f"{reason}: {variance_reason(variance_diag)}"
             _bump(no_buy_diag["skip_reason_counts"], reason)
             _record_candidate_observation(b, cand, "skipped", reason, now, regime_kind)
-            _collapse_skip(cand, reason, "portfolio_variance")
+            _collapse_skip(cand, cand["rank_reason"], "portfolio_variance", original_reason=reason)
             continue
         if variance_diag.get("size_mult", 1.0) < 1.0:
             spend *= variance_diag.get("size_mult", 1.0)
@@ -2369,7 +2616,8 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
             original_reason = (f"Risk/cap spend ${spend:.0f} below ${min_position_usd:.0f} floor "
                                f"(target ${cand['risk']['target_notional']:.0f})")
             reason = original_reason
-            if mode_info["degraded_mode_active"]:
+            cand["rank_reason_code"] = "FINAL_SIZE_TOO_SMALL"
+            if degraded_restricted_mode:
                 cand["original_rank_reason"] = original_reason
                 reason = "DEGRADED_FINAL_SIZE_TOO_SMALL"
                 _bump(no_buy_diag["degraded_reject_counts"], reason)
@@ -2409,6 +2657,9 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
             "trading_mode": mode_info["trading_mode"],
             "degraded_mode_active": mode_info["degraded_mode_active"],
             "degraded_mode_reason": mode_info["degraded_mode_reason"],
+            "degraded_gate_policy": mode_info["degraded_gate_policy"],
+            "effective_size_mult": mode_info["effective_size_mult"],
+            "effective_min_buy_confidence": mode_info["effective_min_buy_confidence"],
             "sector": sec,
             "confidence": conf,
             "signal": rec.get("signal"),
@@ -2487,11 +2738,18 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
                 + buy_reason
             )
         elif mode_info["degraded_mode_active"]:
-            buy_reason = (
-                f"DEGRADED MODE ENTRY: SPY/VIX data missing; restricted paper-only "
-                f"fallback active, size x{mode_info['mode_size_mult']:.2f}. "
-                + buy_reason
-            )
+            blocks_text = ",".join(data_health_blocks) or "unknown"
+            if mode_info["degraded_standard_gates_active"]:
+                prefix = (
+                    f"DEGRADED MODE ENTRY: standard-gates test active; "
+                    f"data health: {blocks_text}; size x{mode_info['mode_size_mult']:.2f}. "
+                )
+            else:
+                prefix = (
+                    f"DEGRADED MODE ENTRY: SPY/VIX data missing; restricted paper-only "
+                    f"fallback active, size x{mode_info['mode_size_mult']:.2f}. "
+                )
+            buy_reason = prefix + buy_reason
         if mode_info["degraded_mode_active"]:
             gross_after = round((exposure_value + cost) / pt, 4) if pt else None
             _log_degraded_decision(cand, "DEGRADED_MODE_ENTRY_ALLOWED",
@@ -2506,6 +2764,9 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
                 "proxy_mode_active": mode_info["proxy_mode_active"],
                 "degraded_mode_active": mode_info["degraded_mode_active"],
                 "degraded_mode_reason": mode_info["degraded_mode_reason"],
+                "degraded_gate_policy": mode_info["degraded_gate_policy"],
+                "effective_size_mult": mode_info["effective_size_mult"],
+                "effective_min_buy_confidence": mode_info["effective_min_buy_confidence"],
             })
         _record_candidate_observation(b, cand, "executed", buy_reason, now, regime_kind)
         traded = True
@@ -2544,6 +2805,9 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
                 "proxy_mode_active": mode_info["proxy_mode_active"],
                 "degraded_mode_active": mode_info["degraded_mode_active"],
                 "degraded_mode_reason": mode_info["degraded_mode_reason"],
+                "degraded_gate_policy": mode_info["degraded_gate_policy"],
+                "effective_size_mult": mode_info["effective_size_mult"],
+                "effective_min_buy_confidence": mode_info["effective_min_buy_confidence"],
             })
 
     for cd in collapse_diag[:5]:
@@ -2557,6 +2821,13 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
                 display_signal=cd.get("display_signal"),
                 original_reason=cd.get("original_reason"),
                 skip_stage=cd.get("skip_stage"),
+                rank_reason_code=cd.get("rank_reason_code"),
+                gross_edge_pct=cd.get("gross_edge_pct"),
+                net_edge_pct=cd.get("net_edge_pct"),
+                required_edge_pct=cd.get("required_edge_pct"),
+                friction_pct=cd.get("friction_pct"),
+                target_notional=cd.get("target_notional"),
+                risk_pct=cd.get("risk_pct"),
             )
             _tag_last_decision_mode()
             continue
@@ -2579,6 +2850,13 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
             display_signal=cd.get("display_signal"),
             original_reason=cd.get("original_reason") or skip_reason,
             skip_stage=cd.get("skip_stage") or "sizing_floor",
+            rank_reason_code=cd.get("rank_reason_code"),
+            gross_edge_pct=cd.get("gross_edge_pct"),
+            net_edge_pct=cd.get("net_edge_pct"),
+            required_edge_pct=cd.get("required_edge_pct"),
+            friction_pct=cd.get("friction_pct"),
+            target_notional=cd.get("target_notional"),
+            risk_pct=cd.get("risk_pct"),
         )
         _tag_last_decision_mode()
     if not traded and not collapse_diag:
@@ -2594,10 +2872,16 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
         if no_buy_diag.get("data_health_blocks"):
             blocks_text = ",".join(no_buy_diag.get("data_health_blocks") or [])
             if mode_info["degraded_mode_active"]:
-                reasons.append(
-                    f"DEGRADED MODE: restricted paper-only fallback active, "
-                    f"size x{mode_info['mode_size_mult']:.2f}; data health: {blocks_text}"
-                )
+                if mode_info["degraded_standard_gates_active"]:
+                    reasons.append(
+                        f"DEGRADED MODE: standard-gates test active; "
+                        f"data health: {blocks_text}; size x{mode_info['mode_size_mult']:.2f}"
+                    )
+                else:
+                    reasons.append(
+                        f"DEGRADED MODE: restricted paper-only fallback active, "
+                        f"size x{mode_info['mode_size_mult']:.2f}; data health: {blocks_text}"
+                    )
             else:
                 reasons.append("buys blocked by data health: " + blocks_text)
         elif not regime_allow_buys:
@@ -2608,12 +2892,12 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
         elif buys_paused:
             reasons.append(f"drawdown circuit-breaker active ({drawdown_pct:.1f}% from peak)")
         elif not daily_buy_room:
-            if mode_info["degraded_mode_active"]:
+            if degraded_restricted_mode:
                 reasons.append(f"degraded daily buy cap reached ({degraded_buys_today}/{degraded_max_buys_today})")
             else:
                 reasons.append(f"daily buy cap reached ({buys_today}/{max_buys_today})")
         elif not exposure_room:
-            if mode_info["degraded_mode_active"]:
+            if degraded_restricted_mode:
                 reasons.append(
                     f"degraded gross exposure cap reached ({no_buy_diag.get('gross_exposure_pct'):.0%}/"
                     f"{degraded_max_gross_exposure_pct:.0%})"
@@ -2664,7 +2948,7 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
         from zoneinfo import ZoneInfo
         et_today = datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
     except Exception:
-        et_today = datetime.utcnow().strftime("%Y-%m-%d")
+        et_today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     # We compute end_total below; defer the today-open capture to after that
 
     # Round-2 fix #1: scheduler-end snapshot. With Round-3 #1 + Round-4 stale
@@ -2818,6 +3102,14 @@ def _render_bot_page(read_only):
         "min_buy_confidence": no_buy.get("min_buy_confidence"),
         "min_trade_size_effective": no_buy.get("min_trade_size_effective"),
         "degraded_size_mult": no_buy.get("degraded_size_mult"),
+        "degraded_use_standard_gates_for_testing": no_buy.get("degraded_use_standard_gates_for_testing"),
+        "degraded_standard_gates_active": no_buy.get("degraded_standard_gates_active"),
+        "degraded_gate_policy": no_buy.get("degraded_gate_policy"),
+        "effective_size_mult": no_buy.get("effective_size_mult"),
+        "effective_min_buy_confidence": no_buy.get("effective_min_buy_confidence"),
+        "normal_ev_gates_required": no_buy.get("normal_ev_gates_required"),
+        "normal_risk_caps_required": no_buy.get("normal_risk_caps_required"),
+        "fresh_quote_required": no_buy.get("fresh_quote_required"),
         "degraded_min_confidence": no_buy.get("degraded_min_confidence"),
         "degraded_reject_counts": no_buy.get("degraded_reject_counts", {}),
         "finnhub_key_configured": no_buy.get("finnhub_key_configured"),
@@ -2834,14 +3126,24 @@ def _render_bot_page(read_only):
         "history_source_counts": no_buy.get("history_source_counts", {}),
         "history_missing_count": no_buy.get("history_missing_count", 0),
         "history_fmp_fallback_count": no_buy.get("history_fmp_fallback_count", 0),
+        "history_fmp_attempted_count": no_buy.get("history_fmp_attempted_count", 0),
+        "history_fmp_skipped_count": no_buy.get("history_fmp_skipped_count", 0),
+        "history_fmp_rate_limited_count": no_buy.get("history_fmp_rate_limited_count", 0),
+        "history_fmp_global_circuit_skipped_count": no_buy.get("history_fmp_global_circuit_skipped_count", 0),
         "history_finnhub_daily_blocked_count": no_buy.get("history_finnhub_daily_blocked_count", 0),
         "history_stale_cache_count": no_buy.get("history_stale_cache_count", 0),
-        "ticker_signal_debug": (no_buy.get("ticker_signal_debug") or [])[:10],
+        "fmp_daily_global_circuit_status": no_buy.get("fmp_daily_global_circuit_status"),
+        "fmp_daily_rate_limited": no_buy.get("fmp_daily_rate_limited", False),
+        "fmp_daily_cooldown_remaining_sec": no_buy.get("fmp_daily_cooldown_remaining_sec", 0),
+        "fmp_daily_last_429_age_sec": no_buy.get("fmp_daily_last_429_age_sec"),
+        "ticker_signal_debug": (no_buy.get("ticker_signal_debug") or [])[:PA_TICKERS_PER_BOT_RUN],
         "stale_ticker_count": no_buy.get("stale_ticker_count", 0),
         "stale_tickers": no_buy.get("stale_tickers", []),
         "stale_positions": no_buy.get("stale_positions", []),
         "risk_unmanaged_positions": no_buy.get("risk_unmanaged_positions", []),
         "api_circuit_breakers": no_buy.get("api_circuit_breakers", {}),
+        "provider_health_status": no_buy.get("provider_health_status"),
+        "rate_limit_recent": no_buy.get("rate_limit_recent", False),
         "candidate_pool_count": no_buy.get("candidate_pool_count", 0),
         "ranked_count": no_buy.get("ranked_count", 0),
         "tradable_count": no_buy.get("tradable_count", 0),

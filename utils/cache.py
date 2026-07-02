@@ -88,6 +88,13 @@ def _classify_provider_status(error=None, status=None):
 
 _api_failures.update(_load_provider_health())
 
+SKIP_PROVIDER_STATUSES = {
+    "skipped_on_pythonanywhere",
+    "skipped_missing_key",
+    "skipped_by_global_rate_limit",
+    "skipped_by_circuit",
+}
+
 
 def _safe_key(k):
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", str(k))[:180]
@@ -222,7 +229,7 @@ def should_skip_api(endpoint, cooldown_sec=300, failure_threshold=3):
         rec = _api_failures.get(key)
         if not rec:
             return False
-        if rec.get("status") in {"ok", "healthy", "skipped_on_pythonanywhere", "skipped_missing_key"}:
+        if rec.get("status") in {"ok", "healthy", *SKIP_PROVIDER_STATUSES}:
             return False
         now = time.time()
         recent = [
@@ -238,19 +245,54 @@ def should_skip_api(endpoint, cooldown_sec=300, failure_threshold=3):
         return now - rec.get("ts", 0) < float(cooldown_sec or 0)
 
 
-def record_api_failure(endpoint, error=None, status=None):
+def api_cooldown_state(endpoint, cooldown_sec=300, active_statuses=None):
+    """Return passive circuit state for an endpoint without mutating counters."""
+    key = str(endpoint or "")
+    active_statuses = set(active_statuses or {"rate_limited"})
+    now = time.time()
+    with _cache_lock:
+        rec = dict(_api_failures.get(key) or {})
+    status = rec.get("status") or "ok"
+    ts = float(rec.get("ts", 0) or 0)
+    age_sec = int(max(0, now - ts)) if ts else None
+    effective_cooldown = float(rec.get("cooldown_sec") or cooldown_sec or 0)
+    active = bool(ts and status in active_statuses and (now - ts) < effective_cooldown)
+    rate_limited = bool(rec.get("rate_limited") or status == "rate_limited")
+    return {
+        "status": status,
+        "active": active,
+        "rate_limited": rate_limited,
+        "cooldown_remaining_sec": int(max(0, effective_cooldown - (age_sec or 0))) if active else 0,
+        "cooldown_sec": int(effective_cooldown),
+        "last_429_age_sec": age_sec if rate_limited else None,
+        "last_error": rec.get("last_error"),
+        "count": int(rec.get("count", 0) or 0),
+    }
+
+
+def record_api_failure(endpoint, error=None, status=None, cooldown_sec=None):
     key = str(endpoint or "")
     resolved_status = _classify_provider_status(error, status)
-    if resolved_status in {"skipped_on_pythonanywhere", "skipped_missing_key"}:
-        return {
+    if resolved_status in SKIP_PROVIDER_STATUSES:
+        now = time.time()
+        rec = {
             "count": 0,
-            "ts": time.time(),
+            "ts": now,
             "failures": [],
             "status": resolved_status,
             "rate_limited": False,
             "last_error": sanitize_provider_error(error),
             "persisted": True,
         }
+        if cooldown_sec is not None:
+            try:
+                rec["cooldown_sec"] = int(max(0, float(cooldown_sec)))
+            except Exception:
+                pass
+        with _cache_lock:
+            _api_failures[key] = rec
+            rec["persisted"] = _save_provider_health()
+        return rec
     with _cache_lock:
         now = time.time()
         rec = _api_failures.setdefault(key, {"count": 0, "ts": 0, "failures": []})
@@ -265,6 +307,11 @@ def record_api_failure(endpoint, error=None, status=None):
         rec["last_error"] = sanitize_provider_error(error) if error is not None else rec.get("last_error")
         rec["rate_limited"] = bool(resolved_status == "rate_limited" or rec.get("rate_limited"))
         rec["status"] = resolved_status
+        if cooldown_sec is not None:
+            try:
+                rec["cooldown_sec"] = int(max(0, float(cooldown_sec)))
+            except Exception:
+                pass
         rec["persisted"] = _save_provider_health()
     return rec
 
@@ -281,6 +328,7 @@ def record_api_success(endpoint):
             "rate_limited": False,
             "last_error": None,
         })
+        rec.pop("cooldown_sec", None)
         rec["persisted"] = _save_provider_health()
 
 
@@ -295,9 +343,10 @@ def api_failure_snapshot():
                 "rate_limited": bool(rec.get("rate_limited")),
                 "last_error": rec.get("last_error"),
                 "persisted": bool(rec.get("persisted", True)),
+                "cooldown_sec": rec.get("cooldown_sec"),
             }
             for key, rec in _api_failures.items()
-            if rec.get("status") not in {"ok", "healthy", "skipped_on_pythonanywhere", "skipped_missing_key"}
+            if rec.get("status") not in {"ok", "healthy", *SKIP_PROVIDER_STATUSES}
             or int(rec.get("count", 0) or 0) > 0
         }
         for rec in snapshot.values():

@@ -40,6 +40,8 @@ def _history_meta_from_df(df):
     if attrs.get("stale_daily_cache_age_hours") is not None:
         out["stale_daily_cache_age_hours"] = attrs.get("stale_daily_cache_age_hours")
         out["stale_daily_cache_age_sec"] = attrs.get("stale_daily_cache_age_sec")
+    if attrs.get("provider_chain_debug"):
+        out["provider_chain_debug"] = list(attrs.get("provider_chain_debug") or [])
     return out
 
 
@@ -83,7 +85,8 @@ def get_history(tk):
         rs = sector_relative_strength(tk, sec, lookback_days=20)
         if rs:
             r.update(rs)
-    cache_set(f"h_{tk}", r)
+    if r:
+        cache_set(f"h_{tk}", r)
     return r
 
 

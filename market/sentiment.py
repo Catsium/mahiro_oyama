@@ -5,7 +5,7 @@ re-exported from trading.signals so the recommendation engine can call it; we
 just define it once.
 """
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from market import fh
 from utils.cache import (
@@ -112,7 +112,7 @@ def get_news(tk):
                 try:
                     if ts:
                         pub_ts = int(ts)
-                        pub = datetime.utcfromtimestamp(pub_ts).strftime("%Y-%m-%d")
+                        pub = datetime.fromtimestamp(pub_ts, timezone.utc).strftime("%Y-%m-%d")
                     else:
                         pub = ""
                 except Exception:

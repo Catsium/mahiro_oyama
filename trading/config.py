@@ -199,6 +199,7 @@ MARKET_DATA_MODES_CONFIG = {
     "proxy_vol_window_days": 20,
     "proxy_min_spy_bars": 60,
     "degraded_size_mult": 0.90,
+    "degraded_use_standard_gates_for_testing": True,
     "degraded_min_confidence": 40,
     "degraded_max_new_buys_per_tick": 1,
     "degraded_max_new_buys_per_day": 1,

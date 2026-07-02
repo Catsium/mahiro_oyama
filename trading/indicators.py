@@ -253,6 +253,15 @@ def weekly_posture(daily_df):
         return {}
 
 
+def _daily_source_info(df):
+    attrs = getattr(df, "attrs", {}) or {}
+    return {
+        "source": attrs.get("source"),
+        "status": attrs.get("status"),
+        "rows": int(len(df)) if df is not None and hasattr(df, "__len__") else 0,
+    }
+
+
 def sector_relative_strength(tk, sector, lookback_days=20):
     """#1.3 sector-relative strength. Returns dict {rel_str_pct, sector_etf}
     where rel_str_pct = stock return MINUS sector ETF return over `lookback_days`.
@@ -272,19 +281,50 @@ def sector_relative_strength(tk, sector, lookback_days=20):
         etf_df = get_daily(etf)
         if (tk_df is None or etf_df is None or
             len(tk_df) < lookback_days + 1 or len(etf_df) < lookback_days + 1):
-            cache_set(cache_key, {})
-            return {}
+            tk_info = _daily_source_info(tk_df)
+            etf_info = _daily_source_info(etf_df)
+            out = {
+                "sector_etf": etf,
+                "relative_strength_source": "skipped",
+                "relative_strength_skipped_reason": "missing_or_insufficient_history",
+                "ticker_history_source": tk_info.get("source"),
+                "ticker_history_status": tk_info.get("status"),
+                "ticker_history_rows": tk_info.get("rows"),
+                "sector_etf_history_source": etf_info.get("source"),
+                "sector_etf_history_status": etf_info.get("status"),
+                "sector_etf_history_rows": etf_info.get("rows"),
+            }
+            cache_set(cache_key, out)
+            return out
         tk_ret  = float(tk_df["Close"].iloc[-1])  / float(tk_df["Close"].iloc[-(lookback_days + 1)]) - 1
         etf_ret = float(etf_df["Close"].iloc[-1]) / float(etf_df["Close"].iloc[-(lookback_days + 1)]) - 1
         rel_str_pct = round((tk_ret - etf_ret) * 100, 2)
-        out = {"rel_str_pct": rel_str_pct, "sector_etf": etf}
+        tk_info = _daily_source_info(tk_df)
+        etf_info = _daily_source_info(etf_df)
+        sources = [str(tk_info.get("source") or ""), str(etf_info.get("source") or "")]
+        out = {
+            "rel_str_pct": rel_str_pct,
+            "sector_etf": etf,
+            "relative_strength_source": "stale_cache" if any(s.startswith("stale_cache:") for s in sources) else "daily",
+            "ticker_history_source": tk_info.get("source"),
+            "ticker_history_status": tk_info.get("status"),
+            "ticker_history_rows": tk_info.get("rows"),
+            "sector_etf_history_source": etf_info.get("source"),
+            "sector_etf_history_status": etf_info.get("status"),
+            "sector_etf_history_rows": etf_info.get("rows"),
+        }
         cache_set(cache_key, out)
         return out
     except Exception as e:
         try: print(f"[rel_str] {tk} vs {etf} failed: {type(e).__name__}: {e}")
         except Exception: pass
-        cache_set(cache_key, {})
-        return {}
+        out = {
+            "sector_etf": etf,
+            "relative_strength_source": "skipped",
+            "relative_strength_skipped_reason": "error",
+        }
+        cache_set(cache_key, out)
+        return out
 
 
 def median_atr_since(tk, since_ts):
