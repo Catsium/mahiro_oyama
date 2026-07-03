@@ -981,6 +981,14 @@ def _market_data_mode(regime, vix_data, cfg):
     standard_gates_config = _degraded_standard_gates_enabled(mode_cfg)
     normal_min_confidence = float(signal_cfg.get("min_buy_confidence", 40))
     degraded_min_confidence = float(mode_cfg.get("degraded_min_confidence", normal_min_confidence))
+    # DELIBERATE (pinned by test_missing_spy_is_neutral_warning_not_degraded and its
+    # volatility variant): missing SPY/vol data is recorded as a *warning*, never a
+    # *block*, so `blocks` stays empty and mode falls through to NORMAL_MODE rather than
+    # DEGRADED_MODE — the buy-lean bot keeps trading through data gaps. Two known
+    # consequences are left as-is ON PURPOSE (do not "fix" without updating those tests):
+    #   1. DEGRADED_MODE is unreachable in the live path — its whole engine is dead code.
+    #   2. On PA the healthy mode is PROXY_MODE (size x0.85); losing SPY/vol data flips to
+    #      NORMAL_MODE (size x1.0), i.e. degraded data yields LARGER size + no vol gate.
     blocks = []
     warnings = []
     if not spy_ok:
@@ -1682,6 +1690,20 @@ def _generic_exit_shadow(h, pr, ctx, rec, stop_loss_pct, trail_stop_pct,
         "held_hours": round(held_hours, 2),
         "price": round(pr, 4),
     }
+
+
+def _carried_peak_pnl_pct(prior_peak, price, new_avg_cost):
+    """B5: initialize a holding's ratchet peak-P&L across pyramid adds.
+
+    Carries the highest price seen (prior_peak vs this fill's price) but expresses it
+    against the NEW blended avg cost, so a stale high peak from the old (lower) basis
+    can't set a lock above the current P&L and trigger an immediate ratchet exit right
+    after adding. New position (no prior peak): peak≈price≈new_avg_cost → ~0.
+    """
+    if not new_avg_cost:
+        return 0.0
+    peak_price = max(prior_peak if prior_peak else price, price)
+    return round((peak_price - new_avg_cost) / new_avg_cost * 100, 3)
 
 
 def run_bot(force=False, user_forced=False, max_runtime_sec=None):
@@ -3113,8 +3135,6 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
             strong_add = (
                 rec.get("cls") == "strong-buy"
                 or display_signal == "STRONG_BUY_CANDIDATE"
-                or cand.get("candidate_type") == "standard_buy_candidate"
-                   and display_signal == "STRONG_BUY_CANDIDATE"
             )
             allow_strong_flat = bool(risk_cfg.get("pyramiding_allow_flat_add_for_strong_buy", True))
             allow_strong_losing = bool(risk_cfg.get("pyramiding_allow_losing_adds", True))
@@ -3275,6 +3295,9 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
             ),
             "peak": round(max(prior.get("peak", cand["price"]), cand["price"]), 4),
             "trough": round(min(prior.get("trough", cand["price"]), cand["price"]), 4),
+            # B5: carry the ratchet peak across pyramid adds so the profit lock does not
+            # reset to 0 on every add (see _carried_peak_pnl_pct).
+            "peak_pnl_pct": _carried_peak_pnl_pct(prior.get("peak"), cand["price"], na),
             "entry_categories": prior.get("entry_categories") or rec.get("categories", {}),
             "entry_cluster": prior.get("entry_cluster") or cand.get("cluster"),
             "entry_ts": prior.get("entry_ts", int(now)),

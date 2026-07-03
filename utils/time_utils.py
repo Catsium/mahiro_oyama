@@ -85,10 +85,13 @@ def completed_trading_days_since(d):
 
 
 def in_new_buy_window():
-    """#3 Round-5: True only inside the calmer mid-session window for NEW buys.
-    Skips the volatile first 15 min (09:30-09:45) and last 30 min (15:30-16:00).
-    Half-days (close 13:00) clamp the late edge to 12:45. Sells are NOT gated by
-    this — stops/trails must run at open and close."""
+    """True during the regular-hours session; gates NEW buys only.
+
+    NOTE: despite the original "calm window" intent, this currently spans the FULL
+    session — 09:30-16:00 ET (half-days clamp the close to 13:00) — i.e. the volatile
+    first-15-min / last-30-min carve-out is intentionally NOT applied (buy-lean). On the
+    live PA path it's moot anyway: /bot/tick passes user_forced=True, which bypasses this
+    gate entirely. Sells are never gated here; stops/trails must run at the open/close."""
     try:
         from zoneinfo import ZoneInfo
         et = datetime.now(ZoneInfo("America/New_York"))

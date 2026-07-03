@@ -5118,5 +5118,27 @@ class TradingV1TemplateTests(unittest.TestCase):
         self.assertIn('return "ok"', health_body)
 
 
+class RatchetPeakOnPyramidTests(unittest.TestCase):
+    """B5: pyramid adds carry the ratchet peak, expressed against the new blended cost."""
+
+    def test_carried_peak_pnl_pct(self):
+        import trading.bot as bot
+        # New position: peak ≈ price ≈ avg_cost → ~0 (matches the old reset behavior).
+        self.assertEqual(bot._carried_peak_pnl_pct(None, 100.0, 100.0), 0.0)
+        # Pyramid add: carry the old peak PRICE but express it vs the NEW blended cost.
+        self.assertAlmostEqual(
+            bot._carried_peak_pnl_pct(120.0, 100.0, 110.0),
+            round((120.0 - 110.0) / 110.0 * 100, 3),
+        )
+        # Basis adjustment must be strictly below the stale old-basis value — this is what
+        # prevents a too-high lock from tripping an immediate ratchet exit after adding.
+        self.assertLess(
+            bot._carried_peak_pnl_pct(120.0, 100.0, 110.0),
+            (120.0 - 100.0) / 100.0 * 100,
+        )
+        # Zero-guard: no divide-by-zero on a bad avg cost.
+        self.assertEqual(bot._carried_peak_pnl_pct(120.0, 100.0, 0.0), 0.0)
+
+
 if __name__ == "__main__":
     unittest.main()
