@@ -73,3 +73,9 @@ tests/test_stabilization.py
 .codex/environments/environment.toml
 docs/superpowers/plans/2026-06-25-paper-trading-hardening-freeze.md
 README.md
+rules/IMPORTANT_AGENT_WARNING_updated.md
+rules/Handoff.md
+docs/superpowers/reviews/2026-06-26-paper-trading-threshold-policy-review.md
+docs/superpowers/plans/2026-06-30-pythonanywhere-fmp-ticker-history-diagnostics.md
+docs/superpowers/plans/2026-06-26-paper-trading-threshold-policy.md
+PRODUCT.md
