@@ -40,6 +40,16 @@ def _regime_key(regime):
     return "neutral"
 
 
+def _regime_key_effective(regime):
+    """Like _regime_key but prefers the tilt/credit-adjusted `regime_effective` for
+    dict input, so the signal thresholds + REGIME vote agree with sizing/buyable
+    (which key off regime_effective). Falls back to base macro `regime` when the
+    effective field is absent (e.g. unit tests that pass {"regime": ...})."""
+    if isinstance(regime, dict):
+        return _regime_key(regime.get("regime_effective") or regime.get("regime"))
+    return _regime_key(regime)
+
+
 def classify_display_signal(raw_cls, confidence):
     """Human label for signal strength; execution still uses raw cls + gates."""
     cls = str(raw_cls or "hold").lower()
@@ -138,7 +148,7 @@ def get_recommendation(sent, ctx, regime=None, earnings=None, analyst=None, insi
     weights = load_signal_weights() if weights is None else weights
     # Round-4 algorithm #7: prefer regime-specific weight (e.g. "bull:momentum")
     # before falling back to plain "momentum" before defaulting to 1.0
-    _cur_regime = _regime_key(regime) if regime else "neutral"
+    _cur_regime = _regime_key_effective(regime) if regime else "neutral"
     def w(cat):
         return weights.get(f"{_cur_regime}:{cat}",
                weights.get(cat, 1.0))
@@ -352,7 +362,7 @@ def get_recommendation(sent, ctx, regime=None, earnings=None, analyst=None, insi
 
     # ── REGIME ──────────────────────────────────────────────────────────
     if regime:
-        rg = regime.get("regime")
+        rg = regime.get("regime_effective") or regime.get("regime")
         m = regime.get("spy_mom_30d") or 0
         if   rg == "bull": cat_signals["regime"].append(1);  reasons.append(f"Broad market bullish (SPY {m:+.1f}% / 30d) — tailwind")
         elif rg == "bear": cat_signals["regime"].append(-1); reasons.append(f"Broad market bearish (SPY {m:+.1f}% / 30d) — headwind")
@@ -391,7 +401,7 @@ def get_recommendation(sent, ctx, regime=None, earnings=None, analyst=None, insi
 
     # Round-5 #1: regime-conditional thresholds. Bull = easier to buy / harder
     # to sell; bear = harder to buy / easier to sell; neutral = unchanged.
-    rk = _regime_key(regime) if regime else "neutral"
+    rk = _regime_key_effective(regime) if regime else "neutral"
     if rk == "bull":
         sb_t, sb_c, b_t, b_c = 3.5, 2, 1.25, 2     # buy side looser
         ss_t, ss_c, s_t, s_c = -4.5, 3, -1.75, 2   # sell side tighter
@@ -518,6 +528,11 @@ def get_recommendation(sent, ctx, regime=None, earnings=None, analyst=None, insi
             atr = ctx.get("atr_pct", 0) or 0
             low_adv_warning = float(signal_cfg.get("low_avg_dollar_volume_warning", 1_000_000))
             high_atr_warning = float(signal_cfg.get("high_atr_warning_pct", 10.0))
+            # NOTE: low-liquidity / high-ATR are surfaced as *warnings* only — for
+            # display and for the size penalties applied downstream in
+            # sizing.evaluate_candidate. They deliberately do NOT deduct confidence here
+            # (unlike the volatility/weekly/gap penalties that do `penalty += ...`).
+            # Kept this way on purpose (buy-lean); sizing already trims these names.
             if 0 < adv < low_adv_warning:
                 penalty_notes.append(f"low liquidity ADV ${adv/1e6:.1f}M warning")
                 confidence_penalties.append("low_liquidity_warning")
@@ -553,7 +568,11 @@ def get_recommendation(sent, ctx, regime=None, earnings=None, analyst=None, insi
             floor_blockers.append("low_data_quality")
         if cats_neg > 1:
             floor_blockers.append("high_negative_category_count")
-        for code in ("volatility_panic", "low_liquidity", "high_atr"):
+        # Only "volatility_panic" is ever emitted into confidence_penalties by this exact
+        # name. The low-liquidity / high-ATR codes carry a `_warning` suffix and are
+        # warnings, not floor blockers (see NOTE above), so they were never matched here —
+        # the dead "low_liquidity"/"high_atr" entries are removed to keep this honest.
+        for code in ("volatility_panic",):
             if code in confidence_penalties:
                 floor_blockers.append(code)
     confidence_before_floor = conf
