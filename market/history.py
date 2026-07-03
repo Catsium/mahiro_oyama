@@ -12,25 +12,45 @@ to the regime-static defaults.
 import pandas as pd
 
 from market.data_manager import get_daily as _daily_bars
-from market.quotes import _append_live_bar
+from market.quotes import _append_live_bar, set_history_fetch_budget
+from trading.config import DEFAULT_CONFIG
 from trading.indicators import (
     _ctx_from_series, _ctx_from_recorded, weekly_posture, sector_relative_strength, _safe
 )
-from utils.cache import cache_get, cache_set
+from utils.cache import api_failure_snapshot, cache_get, cache_set
 from utils.deploy_config import PYTHONANYWHERE_MODE
 from utils.time_utils import is_market_open
 
 
+def _norm_symbol(tk):
+    return str(tk or "").upper().strip()
+
+
 def _history_meta_from_df(df):
     attrs = getattr(df, "attrs", {}) or {}
+    chain = list(attrs.get("provider_chain_debug") or [])
+    providers = [row for row in chain if str(row.get("provider", "")).endswith("_daily")]
+    failures = [row for row in providers if row.get("status") not in {"ok", "cache"}]
     out = {
         "history_source": attrs.get("source") or "daily",
         "history_status": attrs.get("status") or "ok",
         "history_provider": attrs.get("provider"),
         "history_rows": int(len(df)) if df is not None else 0,
         "history_warnings": list(attrs.get("warnings") or []),
+        "history_cache_used": bool(attrs.get("history_cache_used") or attrs.get("cache_used")),
+        "history_cache_age_completed_trading_days": attrs.get("history_cache_age_completed_trading_days"),
+        "history_cache_valid": attrs.get("history_cache_valid"),
+        "history_cache_invalid_reason": attrs.get("history_cache_invalid_reason"),
+        "history_fetch_attempted": bool(providers and not attrs.get("history_cache_used")),
+        "history_fetch_skipped_reason": None,
+        "history_provider_used": attrs.get("provider"),
+        "history_provider_error_type": failures[-1].get("provider_error_type") if failures else None,
         "live_bar_applied": bool(attrs.get("live_bar_applied", False)),
         "live_bar_reason": attrs.get("live_bar_reason"),
+        "live_quote_overlay_enabled": attrs.get("live_quote_overlay_enabled"),
+        "live_quote_overlay_source": attrs.get("live_quote_overlay_source"),
+        "base_history_rows_before_live_overlay": attrs.get("base_history_rows_before_live_overlay"),
+        "history_rows_after_live_overlay": attrs.get("history_rows_after_live_overlay"),
         "quote_fresh": attrs.get("quote_fresh"),
     }
     try:
@@ -42,12 +62,43 @@ def _history_meta_from_df(df):
         out["stale_daily_cache_age_sec"] = attrs.get("stale_daily_cache_age_sec")
     if attrs.get("provider_chain_debug"):
         out["provider_chain_debug"] = list(attrs.get("provider_chain_debug") or [])
+        budget_rows = [
+            row for row in out["provider_chain_debug"]
+            if row.get("provider") == "history_fetch_budget"
+        ]
+        if budget_rows:
+            out["history_fetch_skipped_reason"] = budget_rows[-1].get("reason")
     return out
+
+
+def _missing_history(tk, skipped_reason=None):
+    return {
+        "history_source": "missing",
+        "history_status": "missing",
+        "history_rows": 0,
+        "history_last_date": None,
+        "history_cache_used": False,
+        "history_cache_valid": False,
+        "history_cache_invalid_reason": "missing",
+        "history_fetch_attempted": skipped_reason is None,
+        "history_fetch_skipped_reason": skipped_reason,
+        "history_provider_used": None,
+        "history_provider_error_type": None,
+        "history_warnings": ["MISSING_HISTORY"],
+    }
 
 
 def get_history(tk):
     """Daily history + weekly posture. Cached 5 min."""
+    tk = _norm_symbol(tk)
     c = cache_get(f"h_{tk}", max_age=300)
+    if c is not None:
+        try:
+            cached_rows = int((c if isinstance(c, dict) else {}).get("history_rows") or 0)
+        except Exception:
+            cached_rows = 0
+        if cached_rows <= 0:
+            c = None
     if c is not None:
         return c
     r = {}
@@ -63,8 +114,9 @@ def get_history(tk):
                 if r:
                     r.update(_history_meta_from_df(df))
                 used_df = df
-        except Exception:
-            pass
+        except Exception as e:
+            r = _missing_history(tk)
+            r["history_provider_error_type"] = type(e).__name__
     # Locally recorded snapshots (last resort; no weekly possible).
     if not r:
         r = _ctx_from_recorded(tk)
@@ -79,15 +131,62 @@ def get_history(tk):
         if wk:
             r.update(wk)
     # #1.3: sector-relative strength (lazy import of get_sector to break cycle)
-    if r:
+    if r and r.get("history_status") != "missing":
         from trading.risk import get_sector
         sec = get_sector(tk)
         rs = sector_relative_strength(tk, sec, lookback_days=20)
         if rs:
             r.update(rs)
-    if r:
+    if r and r.get("history_status") != "missing" and int(r.get("history_rows") or 0) > 0:
         cache_set(f"h_{tk}", r)
-    return r
+        return r
+    return r or _missing_history(tk)
+
+
+def warm_history(symbols, max_symbols=None, max_fetches=None):
+    cfg = DEFAULT_CONFIG.get("history", {})
+    max_symbols = int(max_symbols or cfg.get("max_symbols_per_warm_call", 3))
+    max_fetches = int(max_fetches or cfg.get("max_history_fetches_per_warm_call", 3))
+    requested = [_norm_symbol(s) for s in (symbols or []) if _norm_symbol(s)]
+    attempted = []
+    warmed = []
+    cache_hits = []
+    failed = []
+    skipped = []
+    provider_used = {}
+    rows_by_symbol = {}
+    errors = {}
+    set_history_fetch_budget(max_fetches)
+    try:
+        for sym in requested[:max_symbols]:
+            attempted.append(sym)
+            ctx = get_history(sym)
+            rows = int(ctx.get("history_rows") or 0)
+            rows_by_symbol[sym] = rows
+            if ctx.get("history_cache_used"):
+                cache_hits.append(sym)
+            if rows >= int(cfg.get("min_history_rows_for_buy", 25)):
+                warmed.append(sym)
+                provider_used[sym] = ctx.get("history_source")
+            else:
+                failed.append(sym)
+                errors[sym] = ctx.get("history_fetch_skipped_reason") or ctx.get("history_status") or "MISSING_HISTORY"
+        for sym in requested[max_symbols:]:
+            skipped.append({"symbol": sym, "reason": "max_symbols_per_warm_call"})
+    finally:
+        set_history_fetch_budget(None)
+    return {
+        "requested_symbols": requested,
+        "attempted_symbols": attempted,
+        "warmed_symbols": warmed,
+        "skipped_symbols": skipped,
+        "failed_symbols": failed,
+        "cache_hit_symbols": cache_hits,
+        "provider_used_by_symbol": provider_used,
+        "rows_by_symbol": rows_by_symbol,
+        "errors_by_symbol": errors,
+        "provider_circuits": api_failure_snapshot(),
+    }
 
 
 def get_intraday_context(tk):

@@ -9,11 +9,19 @@ import threading
 import time
 from collections import OrderedDict
 
+from trading.config import DEFAULT_CONFIG
 from utils.cache import cache_get, cache_set
+
+# Entry 027 (B2) — daily-history cache TTL. Completed daily bars are stable
+# intraday (today's forming bar is applied separately via the live-quote
+# overlay), so a longer TTL avoids burning FMP's free-tier request budget.
+_DAILY_TTL_SEC = int(
+    DEFAULT_CONFIG.get("history", {}).get("daily_history_cache_ttl_sec", 18 * 3600)
+)
 
 
 class DataManager:
-    def __init__(self, max_items=80, disk_ttl_sec=6 * 3600):
+    def __init__(self, max_items=80, disk_ttl_sec=_DAILY_TTL_SEC):
         self.max_items = int(max_items)
         self.disk_ttl_sec = int(disk_ttl_sec)
         self._lock = threading.RLock()

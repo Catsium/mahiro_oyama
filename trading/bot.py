@@ -14,13 +14,20 @@ import uuid
 import json
 import os
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from flask import render_template
 
 from market.charts import RANGE_SECS  # noqa: F401 — re-export sentinel
 from market.history import get_history, get_intraday_context
-from market.quotes import FMP_DAILY_GLOBAL_ENDPOINT, get_quote, fmp_daily_global_circuit_state
+from market.quotes import (
+    EXECUTION_CACHE_MAX_AGE_SEC,
+    FMP_DAILY_GLOBAL_ENDPOINT,
+    get_quote,
+    fmp_daily_global_circuit_state,
+    finnhub_daily_global_circuit_state,
+    set_history_fetch_budget,
+)
 from market.sentiment import get_news
 from trading.indicators import classify_vol_regime, median_atr_since
 from trading.risk import (
@@ -38,9 +45,6 @@ from trading.exits import (
     round_trip_cost_pct, breakeven_lock_pct, dynamic_stop_pct, dynamic_trail_width,
 )
 from trading.exit_ladders import apply_regime_exit_tightening, compose_exit_profile
-from trading.portfolio_variance import (
-    candidate_variance_check, load_close_history, variance_reason,
-)
 from trading.sizing import (
     slippage_bps, _partial_trim,
     PARTIAL_TAKE_ENABLED, PARTIAL_TAKE_PCT, PARTIAL_TAKE_FRACTION,
@@ -71,16 +75,24 @@ from utils.storage import (
     DATA_DIR, storage_debug_info,
 )
 from utils.threading_utils import _bot_run_lock, _BOT_STATUS, BOT_INTERVAL
-from utils.time_utils import is_market_open, _fmt_times, in_new_buy_window
+from utils.time_utils import (
+    NYSE_HOLIDAYS_FULL,
+    is_market_open,
+    _fmt_times,
+    in_new_buy_window,
+)
 
 # ── Bot config ──────────────────────────────────────────────────────────────
 STARTING_CASH      = 10_000.0
-BOT_MAX_BUYS       = 1
-BOT_SCAN_BUY       = 0
-MAX_POSITIONS      = 8
-SCAN_BUY_MIN_CONF  = 60   # execution threshold for outside-watchlist buy
+_RISK_DEFAULTS = DEFAULT_CONFIG.get("risk", {})
+_SCAN_DEFAULTS = DEFAULT_CONFIG.get("scan", {})
+_HISTORY_DEFAULTS = DEFAULT_CONFIG.get("history", {})
+BOT_MAX_BUYS       = int(_RISK_DEFAULTS.get("max_new_buys_per_tick", 10))
+BOT_SCAN_BUY       = int(_SCAN_DEFAULTS.get("max_scan_buys_per_tick", 10))
+MAX_POSITIONS      = 24
+SCAN_BUY_MIN_CONF  = int(_SCAN_DEFAULTS.get("scan_buy_min_confidence", 45))
 SUGGESTION_MIN_SCAN_CONF = 68
-SCAN_FRESHNESS_SEC = 120  # outside-watchlist buys require scan data <2 min old
+SCAN_FRESHNESS_SEC = int(_SCAN_DEFAULTS.get("scan_data_max_age_sec", 300))
 SUGGESTION_MAX_EXTRA_TICKERS = 2
 SUGGESTION_DISCOVERY_TOP_CONF = 6
 SUGGESTION_DISCOVERY_TOP_GAIN = 4
@@ -102,9 +114,13 @@ KNIFE_CATALYST_TYPES = {
 # the round-trip commission is roughly 2% of a $100 trade, so this remains a floor,
 # not a target. Sizing and EV gates still decide whether a candidate is worth taking.
 # Pyramid adds, new positions, and outside positions use the same minimum.
-MIN_POSITION_USD   = 100
+MIN_POSITION_USD   = float(_RISK_DEFAULTS.get("min_trade_size", 10.0))
 BOT_TICK_MAX_RUNTIME_SEC = 25
-MIN_SIGNAL_HISTORY_ROWS = 60
+MIN_SIGNAL_HISTORY_ROWS = int(_HISTORY_DEFAULTS.get("min_history_rows_for_buy", 25))
+PREFERRED_SIGNAL_HISTORY_ROWS = int(_HISTORY_DEFAULTS.get("preferred_history_rows", 60))
+STALE_HISTORY_MAX_COMPLETED_TRADING_DAYS = int(
+    _HISTORY_DEFAULTS.get("stale_history_max_completed_trading_days", 2)
+)
 USE_CONFIDENCE_WEIGHTING = True
 REQUIRED_TICK_LOG_FIELDS = (
     "timestamp",
@@ -133,6 +149,7 @@ REQUIRED_TICK_LOG_FIELDS = (
     "display_buy_candidate_count",
     "history_source_counts",
     "history_missing_count",
+    "top_missing_history_symbols",
     "history_fmp_fallback_count",
     "history_fmp_attempted_count",
     "history_fmp_skipped_count",
@@ -144,6 +161,13 @@ REQUIRED_TICK_LOG_FIELDS = (
     "fmp_daily_rate_limited",
     "fmp_daily_cooldown_remaining_sec",
     "fmp_daily_last_429_age_sec",
+    "finnhub_daily_global_circuit_status",
+    "finnhub_daily_forbidden",
+    "finnhub_daily_cooldown_remaining_sec",
+    "max_history_fetches_per_tick",
+    "blocker_stage",
+    "blocker_code",
+    "blocker_detail",
     "candidate_pool_count",
     "ranked_count",
     "tradable_count",
@@ -230,22 +254,23 @@ def _finalize_signal_confidence(payload, cfg):
     ctx = payload.get("ctx") or {}
     quote = payload.get("quote") or {}
     price = quote.get("price", payload.get("price", 0))
-    quote_fresh = bool(price and price > 0 and not payload.get("stale") and not quote.get("stale"))
+    quote_status = _quote_execution_status(payload)
     blockers = list(rec.get("confidence_floor_blockers") or [])
-    if not quote_fresh:
+    if not quote_status["execution_trusted"]:
         blockers.append("stale_quote" if price and price > 0 else "invalid_price")
-    try:
-        history_rows = int(ctx.get("history_rows") or 0)
-    except Exception:
-        history_rows = 0
-    if history_rows <= 0:
-        blockers.append("missing_history")
-    elif history_rows < MIN_SIGNAL_HISTORY_ROWS:
-        blockers.append("insufficient_history")
-    history_source = str(ctx.get("history_source") or "")
-    history_status = str(ctx.get("history_status") or "")
-    if history_source.startswith("stale_cache") or history_status == "stale_cache":
-        blockers.append("stale_history")
+    history_status = _history_execution_status(ctx)
+    if history_status["blocker"]:
+        blockers.append(history_status["blocker"])
+    elif history_status["warning"]:
+        rec["data_quality_warning"] = history_status["warning"]
+    if history_status.get("trusted"):
+        blockers = [b for b in blockers if b != "low_data_quality"]
+    ctx["history_warnings"] = history_status.get("history_warnings", ctx.get("history_warnings", []))
+    payload["ctx"] = ctx
+    payload["execution_trusted"] = quote_status["execution_trusted"]
+    payload["quote_age_seconds"] = quote_status["quote_age_seconds"]
+    payload["cache_used"] = quote_status["cache_used"]
+    payload["stale"] = not quote_status["execution_trusted"]
 
     blockers = list(dict.fromkeys(blockers))
     rec["confidence_floor_blockers"] = blockers
@@ -280,7 +305,11 @@ def _finalize_signal_confidence(payload, cfg):
         rec["confidence_floor_applied"] = False
         if rec.get("confidence_floor_candidate") and blockers:
             rec["confidence_floor_reason"] = blockers[0]
-    return _annotate_signal(rec)
+        elif not blockers:
+            rec["confidence_floor_reason"] = None
+    rec = _annotate_signal(rec)
+    _apply_execution_profile(rec, cfg)
+    return rec
 
 
 def _history_source_bucket(source):
@@ -303,18 +332,264 @@ def _execution_min_confidence(cfg, degraded_mode_active=False):
     return normal_min
 
 
-def _why_not_execution_eligible(rec, cfg, degraded_mode_active=False):
+def _quote_execution_status(payload):
+    payload = payload or {}
+    quote = payload.get("quote") if isinstance(payload.get("quote"), dict) else payload
+    quote = quote or {}
+    try:
+        price = float(quote.get("price", payload.get("price", 0)) or 0)
+    except Exception:
+        price = 0.0
+    age = quote.get("quote_age_seconds")
+    if age is None:
+        age = quote.get("stale_age_sec")
+    try:
+        age = int(float(age)) if age is not None and float(age) >= 0 else None
+    except Exception:
+        age = None
+    trusted = quote.get("execution_trusted")
+    if trusted is None:
+        stale = bool(payload.get("stale") or quote.get("stale"))
+        trusted = bool(
+            price > 0
+            and (
+                not stale
+                or (age is not None and age <= EXECUTION_CACHE_MAX_AGE_SEC)
+            )
+        )
+    trusted = bool(price > 0 and trusted)
+    if price <= 0:
+        blocker = "INVALID_PRICE"
+        stale_reason = "invalid_price"
+    elif not trusted:
+        blocker = "STALE_CANDIDATE_QUOTE"
+        stale_reason = quote.get("stale_reason") or (
+            "quote_cache_missing_timestamp"
+            if age is None
+            else "quote_cache_older_than_execution_limit"
+        )
+    else:
+        blocker = None
+        stale_reason = quote.get("stale_reason")
+    return {
+        "price": price,
+        "execution_trusted": trusted,
+        "blocker": blocker,
+        "quote_source": quote.get("quote_source") or quote.get("source"),
+        "cache_used": bool(quote.get("cache_used")),
+        "quote_age_seconds": age,
+        "execution_cache_max_age_sec": EXECUTION_CACHE_MAX_AGE_SEC,
+        "stale_reason": stale_reason,
+    }
+
+
+def _is_trading_day(d):
+    return d.weekday() < 5 and d.strftime("%Y-%m-%d") not in NYSE_HOLIDAYS_FULL
+
+
+def _previous_trading_day(d):
+    cur = d - timedelta(days=1)
+    while not _is_trading_day(cur):
+        cur -= timedelta(days=1)
+    return cur
+
+
+def _latest_completed_trading_day():
+    try:
+        from zoneinfo import ZoneInfo
+
+        et = datetime.now(ZoneInfo("America/New_York"))
+        today = et.date()
+        if _is_trading_day(today) and (et.hour * 60 + et.minute) >= 16 * 60:
+            return today
+        return _previous_trading_day(today)
+    except Exception:
+        today = datetime.utcnow().date()
+        return today if _is_trading_day(today) else _previous_trading_day(today)
+
+
+def _completed_trading_days_since(d):
+    latest = _latest_completed_trading_day()
+    if d >= latest:
+        return 0
+    cur = d + timedelta(days=1)
+    days = 0
+    while cur <= latest:
+        if _is_trading_day(cur):
+            days += 1
+        cur += timedelta(days=1)
+    return days
+
+
+def _history_execution_status(ctx):
+    ctx = ctx or {}
+    try:
+        rows = int(ctx.get("history_rows") or 0)
+    except Exception:
+        rows = 0
+    source = str(ctx.get("history_source") or "")
+    status = str(ctx.get("history_status") or "")
+    warnings = list(ctx.get("history_warnings") or [])
+    if rows <= 0:
+        return {
+            "trusted": False,
+            "blocker": "missing_history",
+            "warning": None,
+            "history_rows": rows,
+            "history_status": status or "missing",
+            "history_source": source or "missing",
+            "history_warnings": warnings,
+        }
+    if rows < MIN_SIGNAL_HISTORY_ROWS:
+        return {
+            "trusted": False,
+            "blocker": "insufficient_history",
+            "warning": None,
+            "history_rows": rows,
+            "history_status": status or "insufficient",
+            "history_source": source or "daily",
+            "history_warnings": warnings,
+        }
+    warning = None
+    if rows < PREFERRED_SIGNAL_HISTORY_ROWS:
+        warning = "INSUFFICIENT_HISTORY_WARNING"
+        warnings.append(warning)
+    stale = source.startswith("stale_cache") or status == "stale_cache"
+    if stale:
+        last_date = None
+        try:
+            last_date = datetime.strptime(str(ctx.get("history_last_date")), "%Y-%m-%d").date()
+        except Exception:
+            last_date = None
+        stale_days = _completed_trading_days_since(last_date) if last_date else None
+        if stale_days is None or stale_days > STALE_HISTORY_MAX_COMPLETED_TRADING_DAYS:
+            return {
+                "trusted": False,
+                "blocker": "stale_history",
+                "warning": None,
+                "history_rows": rows,
+                "history_status": status or "stale_cache",
+                "history_source": source,
+                "history_warnings": warnings,
+                "stale_history_completed_trading_days": stale_days,
+            }
+        warning = warning or "STALE_HISTORY_CACHE_USED"
+        warnings.append("STALE_HISTORY_CACHE_USED")
+    return {
+        "trusted": True,
+        "blocker": None,
+        "warning": warning,
+        "history_rows": rows,
+        "history_status": status or "ok",
+        "history_source": source or "daily",
+        "history_warnings": list(dict.fromkeys(warnings)),
+    }
+
+
+def _has_hard_bearish_signal(rec):
     rec = rec or {}
-    raw_cls = str(rec.get("cls") or "hold").lower()
+    raw_cls = str(rec.get("cls") or "").lower()
+    display = str(rec.get("display_signal_label") or "").upper()
+    if raw_cls in ("sell", "strong-sell") or display in ("SELL", "STRONG_SELL"):
+        return True
+    if bool(rec.get("force_hold")):
+        return True
+    try:
+        if float(rec.get("cats_neg", 0) or 0) > 1:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _execution_profile(rec, cfg, *, degraded_mode_active=False):
+    rec = _annotate_signal(rec or {})
+    signal_cfg = (cfg or {}).get("signal", {})
+    raw_cls = str(rec.get("cls") or "").lower()
     display = rec.get("display_signal_label")
+    try:
+        conf = float(rec.get("confidence", 0) or 0)
+    except Exception:
+        conf = 0.0
     min_conf = _execution_min_confidence(cfg, degraded_mode_active)
-    if raw_cls not in ("buy", "strong-buy"):
-        return f"raw_class_{raw_cls}"
-    if display not in ("BUY_CANDIDATE", "STRONG_BUY_CANDIDATE"):
-        return f"display_signal_{display or 'missing'}"
-    if float(rec.get("confidence", 0) or 0) < min_conf:
-        return "CONFIDENCE_BELOW_MIN_BUY"
-    return None
+    hard_bearish = _has_hard_bearish_signal(rec)
+    base = {
+        "eligible": False,
+        "candidate_type": None,
+        "candidate_size_multiplier": 1.0,
+        "reason": None,
+    }
+    if hard_bearish:
+        base["reason"] = f"raw_class_{raw_cls or 'missing'}"
+        return base
+    if raw_cls in ("buy", "strong-buy"):
+        if display in ("BUY_CANDIDATE", "STRONG_BUY_CANDIDATE") and conf >= min_conf:
+            base.update({
+                "eligible": True,
+                "candidate_type": "standard_buy_candidate",
+                "reason": "executable_buy_candidate",
+            })
+            return base
+        if (
+            display == "BULLISH_LEAN"
+            and bool(signal_cfg.get("allow_bullish_lean_buy_attempts", False))
+        ):
+            base.update({
+                "eligible": True,
+                "candidate_type": "weak_paper_test_candidate",
+                "candidate_size_multiplier": float(
+                    signal_cfg.get("bullish_lean_candidate_size_multiplier", 0.85)
+                ),
+                "reason": "bullish_lean_paper_test_candidate",
+            })
+            return base
+        if conf < min_conf:
+            base["reason"] = "CONFIDENCE_BELOW_MIN_BUY"
+        else:
+            base["reason"] = f"display_signal_{display or 'missing'}"
+        return base
+    if (
+        raw_cls == "hold"
+        and display == "HOLD"
+        and bool(signal_cfg.get("allow_high_confidence_hold_buy_attempts", False))
+        and conf >= float(signal_cfg.get("high_confidence_hold_min_confidence", 55))
+    ):
+        base.update({
+            "eligible": True,
+            "candidate_type": "experimental_near_buy_candidate",
+            "candidate_size_multiplier": float(
+                signal_cfg.get("high_confidence_hold_candidate_size_multiplier", 0.65)
+            ),
+            "reason": "high_confidence_hold_paper_test_candidate",
+        })
+        return base
+    if raw_cls == "hold":
+        base["reason"] = "HOLD_BELOW_EXPERIMENTAL_THRESHOLD"
+    else:
+        base["reason"] = f"raw_class_{raw_cls or 'missing'}"
+    return base
+
+
+def _apply_execution_profile(rec, cfg, *, degraded_mode_active=False):
+    profile = _execution_profile(rec, cfg, degraded_mode_active=degraded_mode_active)
+    rec = rec or {}
+    rec["candidate_type"] = profile.get("candidate_type")
+    rec["candidate_size_multiplier"] = profile.get("candidate_size_multiplier", 1.0)
+    rec["execution_candidate_reason"] = profile.get("reason")
+    if profile.get("eligible") and profile.get("candidate_type") == "weak_paper_test_candidate":
+        min_conf = _execution_min_confidence(cfg, degraded_mode_active)
+        try:
+            sizing_conf = float(rec.get("sizing_confidence", rec.get("confidence", 0)) or 0)
+        except Exception:
+            sizing_conf = 0.0
+        if sizing_conf < min_conf:
+            rec["sizing_confidence"] = min_conf
+    return profile
+
+
+def _why_not_execution_eligible(rec, cfg, degraded_mode_active=False):
+    profile = _execution_profile(rec, cfg, degraded_mode_active=degraded_mode_active)
+    return None if profile.get("eligible") else profile.get("reason")
 
 
 def _ticker_debug_row(t, payload, cfg, degraded_mode_active=False):
@@ -323,7 +598,8 @@ def _ticker_debug_row(t, payload, cfg, degraded_mode_active=False):
     ctx = payload.get("ctx") or {}
     quote = payload.get("quote") or {}
     price = quote.get("price", payload.get("price", 0))
-    quote_fresh = bool(price and price > 0 and not payload.get("stale") and not quote.get("stale"))
+    quote_status = _quote_execution_status(payload)
+    history_status = _history_execution_status(ctx)
     execution_eligible = is_execution_candidate(
         rec,
         cfg,
@@ -337,29 +613,39 @@ def _ticker_debug_row(t, payload, cfg, degraded_mode_active=False):
     why_not_buy = None
     if not execution_eligible:
         why_not_buy = why_not_execution or "score_below_buy_threshold_or_not_enough_positive_categories"
-    if payload.get("stale"):
-        why_not_buy = "stale_quote"
-    elif not price or price <= 0:
-        why_not_buy = "invalid_price"
+    if quote_status["blocker"]:
+        why_not_buy = quote_status["blocker"].lower()
+    elif history_status["blocker"]:
+        why_not_buy = history_status["blocker"]
     ctx_quote_fresh = ctx.get("quote_fresh")
     return {
         "ticker": t,
         "history_source": ctx.get("history_source") or ("recorded" if ctx.get("source") == "recorded" else "missing"),
         "history_status": ctx.get("history_status"),
-        "history_warnings": ctx.get("history_warnings", []),
+        "history_warnings": history_status.get("history_warnings", ctx.get("history_warnings", [])),
         "history_rows": ctx.get("history_rows", 0),
+        "history_status_for_execution": history_status.get("history_status"),
         "history_last_date": ctx.get("history_last_date"),
         "stale_daily_cache_age_hours": ctx.get("stale_daily_cache_age_hours"),
         "provider_chain_debug": ctx.get("provider_chain_debug", []),
         "relative_strength_source": ctx.get("relative_strength_source"),
         "relative_strength_skipped_reason": ctx.get("relative_strength_skipped_reason"),
         "sector_etf_history_source": ctx.get("sector_etf_history_source"),
-        "quote_source": quote.get("source"),
+        "quote_source": quote_status.get("quote_source") or quote.get("source"),
+        "provider_attempts": quote.get("provider_attempts", []),
+        "provider_used": quote.get("provider_used") or quote.get("source"),
+        "provider_error_type": quote.get("provider_error_type"),
+        "cache_used": quote_status.get("cache_used"),
+        "quote_age_seconds": quote_status.get("quote_age_seconds"),
+        "execution_trusted": quote_status.get("execution_trusted"),
+        "execution_cache_max_age_sec": quote_status.get("execution_cache_max_age_sec"),
+        "stale_reason": quote_status.get("stale_reason"),
         "quote_price": price,
         "quote_pct": quote.get("pct"),
         "raw_class": rec.get("cls") or "hold",
         "display_signal_label": rec.get("display_signal_label"),
         "confidence": rec.get("confidence"),
+        "confidence_scale": rec.get("confidence_scale"),
         "confidence_before_floor": rec.get("confidence_before_floor"),
         "confidence_before_penalties": rec.get("confidence_before_penalties"),
         "confidence_after_penalties": rec.get("confidence_after_penalties"),
@@ -377,30 +663,26 @@ def _ticker_debug_row(t, payload, cfg, degraded_mode_active=False):
         "data_quality_actual_n": rec.get("data_quality_actual_n", rec.get("n_raw")),
         "data_quality_expected_n": rec.get("data_quality_expected_n", rec.get("expected_n")),
         "data_quality_missing_fields": rec.get("data_quality_missing_fields", []),
+        "data_quality_warning": rec.get("data_quality_warning"),
+        "missing_optional_signals": rec.get("missing_optional_signals", []),
+        "candidate_type": rec.get("candidate_type"),
+        "candidate_size_multiplier": rec.get("candidate_size_multiplier"),
         "execution_eligible": bool(execution_eligible),
         "why_not_buy": why_not_buy,
         "why_not_execution_eligible": why_not_execution,
         "live_bar_applied": bool(ctx.get("live_bar_applied", False)),
         "live_bar_reason": ctx.get("live_bar_reason"),
-        "quote_fresh": bool(quote_fresh if ctx_quote_fresh is None else ctx_quote_fresh),
+        "quote_fresh": bool(quote_status["execution_trusted"] if ctx_quote_fresh is None else ctx_quote_fresh),
     }
 
 
 def is_execution_candidate(rec, cfg, *, degraded_mode_active=False):
     """True only for signals allowed to reach execution sizing."""
-    rec = rec or {}
-    raw_cls = str(rec.get("cls") or "").lower()
-    display = rec.get("display_signal_label")
-    try:
-        conf = float(rec.get("confidence", 0) or 0)
-    except Exception:
-        conf = 0.0
-    min_conf = _execution_min_confidence(cfg, degraded_mode_active)
-    if raw_cls not in ("buy", "strong-buy"):
-        return False
-    if display not in ("BUY_CANDIDATE", "STRONG_BUY_CANDIDATE"):
-        return False
-    return conf >= min_conf
+    return bool(_execution_profile(
+        rec,
+        cfg,
+        degraded_mode_active=degraded_mode_active,
+    ).get("eligible"))
 
 
 def _new_no_buy_diag(now, b, force=False, user_forced=False):
@@ -490,6 +772,7 @@ def _new_no_buy_diag(now, b, force=False, user_forced=False):
         "display_buy_candidate_count": 0,
         "history_source_counts": {},
         "history_missing_count": 0,
+        "top_missing_history_symbols": [],
         "history_fmp_fallback_count": 0,
         "history_fmp_attempted_count": 0,
         "history_fmp_skipped_count": 0,
@@ -501,24 +784,98 @@ def _new_no_buy_diag(now, b, force=False, user_forced=False):
         "fmp_daily_rate_limited": False,
         "fmp_daily_cooldown_remaining_sec": 0,
         "fmp_daily_last_429_age_sec": None,
+        "finnhub_daily_global_circuit_status": None,
+        "finnhub_daily_forbidden": False,
+        "finnhub_daily_cooldown_remaining_sec": 0,
+        "max_history_fetches_per_tick": int(
+            DEFAULT_CONFIG.get("history", {}).get("max_history_fetches_per_tick", 1)
+        ),
         "ticker_signal_debug": [],
         "buyable_reject_counts": {},
         "top_buyable_rejects": [],
         "top_ranked_rejections": [],
+        "top_rejected_candidates": [],
         "candidate_pool_count": 0,
         "ranked_count": 0,
         "tradable_count": 0,
         "top_ranked": [],
         "skip_reason_counts": {},
         "scan_fresh": None,
+        "scan_buys_enabled": None,
+        "scan_data_max_age_sec": None,
+        "scan_min_confidence": None,
+        "scan_min_history_rows": None,
         "scan_age_sec": None,
         "scan_rows_count": None,
         "scan_fresh_rows_count": None,
         "scan_payload_misses": 0,
         "main_blocker": None,
+        "blocker_stage": None,
+        "blocker_code": None,
+        "blocker_detail": None,
         "tick_runtime_seconds": None,
     }
     return diag
+
+
+_CORE_DATA_BLOCKERS = ("MISSING_HISTORY", "INVALID_PRICE", "MISSING_QUOTE", "UNTRUSTED_QUOTE")
+
+
+def _history_provider_status_suffix():
+    """Short human summary of daily-history provider circuits, for the visible reason."""
+    parts = []
+    try:
+        if finnhub_daily_global_circuit_state().get("active"):
+            parts.append("Finnhub daily forbidden")
+    except Exception:
+        pass
+    try:
+        fmp = fmp_daily_global_circuit_state()
+        if fmp.get("active"):
+            rem = int(fmp.get("cooldown_remaining_sec") or 0)
+            parts.append(
+                f"FMP daily rate-limited ({rem // 60}m cooldown)" if rem else "FMP daily rate-limited"
+            )
+    except Exception:
+        pass
+    return ("History provider status: " + "; ".join(parts) + ".") if parts else ""
+
+
+def _core_data_blocker_reason(diag):
+    """Human-readable core-data blocker for the visible HOLD reason.
+
+    Runs in the reasoning block, which executes BEFORE _set_main_blocker (that
+    fires later inside _persist_no_buy_diag), so this derives its message from the
+    raw counters that are already populated (history_missing_count,
+    top_missing_history_symbols, buyable_reject_counts) rather than from
+    main_blocker/blocker_detail. Returns "" when there is no core-data blocker.
+    """
+    if not diag:
+        return ""
+    missing = int(diag.get("history_missing_count", 0) or 0)
+    reject_counts = diag.get("buyable_reject_counts") or {}
+    quote_problem = any(
+        int(reject_counts.get(code, 0) or 0) > 0
+        for code in ("INVALID_PRICE", "MISSING_QUOTE", "UNTRUSTED_QUOTE")
+    )
+    if missing <= 0 and not quote_problem:
+        return ""
+    top = ", ".join([s for s in (diag.get("top_missing_history_symbols") or []) if s][:3])
+    top_suffix = f" Top missing: {top}." if top else ""
+    if missing > 0 and quote_problem:
+        detail = (
+            "No trade: daily history missing AND quotes unavailable/invalid for "
+            "active candidates." + top_suffix
+        )
+    elif missing > 0:
+        detail = (
+            "No trade: daily history missing for active candidates. Quotes may be "
+            "fresh, but signal history is unavailable." + top_suffix
+        )
+    else:
+        detail = "No trade: candidate quotes are unavailable/invalid (price <= 0 or untrusted)."
+    prov = _history_provider_status_suffix()
+    return f"{detail} {prov}".strip() if prov else detail
 
 
 def _set_main_blocker(diag):
@@ -540,6 +897,31 @@ def _set_main_blocker(diag):
     elif (diag.get("cash_available_after_floor") is not None
           and diag.get("cash_available_after_floor", 0) < min_position_usd):
         blocker = "cash_below_min_position"
+    elif int(diag.get("history_missing_count", 0) or 0) > 0 and (
+            int(diag.get("candidate_pool_count", 0) or 0) <= 0
+            or int(diag.get("display_buy_candidate_count", 0) or 0) > 0
+            or diag.get("top_missing_history_symbols")):
+        blocker = "MISSING_HISTORY"
+        diag["blocker_stage"] = "HISTORY_QUALITY"
+        diag["blocker_code"] = "MISSING_HISTORY"
+        top = ", ".join(diag.get("top_missing_history_symbols") or [])
+        suffix = f" Top missing: {top}." if top else ""
+        _rc = diag.get("buyable_reject_counts") or {}
+        _quote_problem = any(
+            int(_rc.get(code, 0) or 0) > 0
+            for code in ("INVALID_PRICE", "MISSING_QUOTE", "UNTRUSTED_QUOTE")
+        )
+        if _quote_problem:
+            diag["blocker_detail"] = (
+                "No trade: daily history missing AND quotes unavailable/invalid "
+                "for active candidates." + suffix
+            )
+        else:
+            diag["blocker_detail"] = (
+                "No trade: daily history missing for active candidates. "
+                "Quotes may be fresh, but signal history is unavailable."
+                + suffix
+            )
     elif diag.get("candidate_pool_count", 0) <= 0:
         if int(diag.get("raw_buy_count", 0) or 0) > 0:
             if int(diag.get("display_buy_candidate_count", 0) or 0) <= 0:
@@ -547,6 +929,8 @@ def _set_main_blocker(diag):
             else:
                 blocker = "raw_buys_rejected_pre_candidate"
             diag["main_blocker"] = blocker
+            if not diag.get("blocker_code"):
+                diag["blocker_code"] = blocker
             return blocker
         counts = diag.get("buyable_reject_counts") or diag.get("signal_counts") or {}
         blocker = max(counts, key=counts.get) if counts else "no_buy_candidates"
@@ -555,7 +939,28 @@ def _set_main_blocker(diag):
         blocker = max(counts, key=counts.get) if counts else "ev_or_risk_gates"
     else:
         blocker = "no_order_selected"
+    if blocker in ("INVALID_PRICE", "MISSING_QUOTE", "UNTRUSTED_QUOTE"):
+        diag["blocker_stage"] = "QUOTE_QUALITY"
+        diag["blocker_code"] = blocker
+        _detail_map = {
+            "INVALID_PRICE": "No trade: candidate quotes are invalid (price <= 0).",
+            "MISSING_QUOTE": "No trade: no quote available for active candidates.",
+            "UNTRUSTED_QUOTE": "No trade: quotes are stale/untrusted for execution.",
+        }
+        _affected = ", ".join(
+            r.get("ticker") for r in (diag.get("top_buyable_rejects") or [])[:3] if r.get("ticker")
+        )
+        _asuffix = f" Affected: {_affected}." if _affected else ""
+        if int(diag.get("history_missing_count", 0) or 0) > 0:
+            diag["blocker_detail"] = (
+                _detail_map.get(blocker, "No trade: quote-quality blocker.")
+                + " Daily history is also missing for these candidates." + _asuffix
+            )
+        else:
+            diag["blocker_detail"] = _detail_map.get(blocker, "No trade: quote-quality blocker.") + _asuffix
     diag["main_blocker"] = blocker
+    if not diag.get("blocker_code"):
+        diag["blocker_code"] = blocker
     return blocker
 
 
@@ -577,16 +982,17 @@ def _market_data_mode(regime, vix_data, cfg):
     normal_min_confidence = float(signal_cfg.get("min_buy_confidence", 40))
     degraded_min_confidence = float(mode_cfg.get("degraded_min_confidence", normal_min_confidence))
     blocks = []
+    warnings = []
     if not spy_ok:
-        blocks.append("SPY_DATA_MISSING")
+        warnings.append("SPY_DATA_MISSING")
     if not vol_ok:
-        blocks.append("VOLATILITY_DATA_MISSING")
+        warnings.append("VOLATILITY_DATA_MISSING")
 
     if spy_ok and vol_ok and is_proxy and mode_cfg.get("allow_proxy_mode", True):
         mode = "PROXY_MODE"
         size_mult = float(mode_cfg.get("proxy_size_mult", 0.85))
         reason = "real VIX unavailable; using SPY realized-vol proxy"
-    elif spy_ok and vol_ok and not blocks:
+    elif not blocks:
         mode = "NORMAL_MODE"
         size_mult = float(mode_cfg.get("normal_size_mult", 1.0))
         reason = None
@@ -645,6 +1051,7 @@ def _market_data_mode(regime, vix_data, cfg):
         "normal_risk_caps_required": normal_risk_caps_required,
         "fresh_quote_required": fresh_quote_required,
         "data_health_blocks": blocks,
+        "data_health_warnings": warnings,
         "allow_buys": normal or proxy or degraded,
         "mode_size_mult": size_mult,
         "mode_size_reason": mode if size_mult < 1.0 else None,
@@ -673,11 +1080,26 @@ def _apply_paper_loss_lockouts(b, diag, risk_cfg, equity, peak_equity, now):
     today_open = float(b.get("today_open_equity") or equity or 0.0)
     daily_return = ((float(equity or 0.0) - today_open) / today_open) if today_open else 0.0
     drawdown_return = ((float(equity or 0.0) - float(peak_equity or 0.0)) / float(peak_equity or 1.0)) if peak_equity else 0.0
-    daily_limit = float(risk_cfg.get("daily_loss_limit_pct", -0.02))
-    drawdown_limit = float(risk_cfg.get("hard_drawdown_lockout_pct", -0.10))
+    daily_warning = float(risk_cfg.get("daily_loss_warning_pct", -0.10))
+    daily_limit = float(risk_cfg.get("daily_loss_hard_lockout_pct",
+                                     risk_cfg.get("daily_loss_limit_pct", -0.15)))
+    drawdown_warning = float(risk_cfg.get("drawdown_warning_pct", -0.20))
+    drawdown_limit = float(risk_cfg.get("drawdown_hard_lockout_pct",
+                                        risk_cfg.get("hard_drawdown_lockout_pct", -0.35)))
+    hard_blocks = bool(risk_cfg.get("hard_lockouts_block_new_buys", True))
     diag["daily_pnl_pct"] = round(daily_return, 4)
     diag["drawdown_return_pct"] = round(drawdown_return, 4)
-    if daily_limit < 0 and daily_return <= daily_limit:
+    diag["daily_loss_warning_pct"] = daily_warning
+    diag["daily_loss_hard_lockout_pct"] = daily_limit
+    diag["drawdown_warning_pct"] = drawdown_warning
+    diag["drawdown_hard_lockout_pct"] = drawdown_limit
+    warnings = diag.setdefault("loss_lockout_warnings", [])
+    if daily_warning < 0 and daily_return <= daily_warning:
+        warnings.append("DAILY_LOSS_WARNING")
+    if drawdown_warning < 0 and drawdown_return <= drawdown_warning:
+        warnings.append("DRAWDOWN_WARNING")
+    diag["loss_lockout_warnings"] = list(dict.fromkeys(warnings))
+    if hard_blocks and daily_limit < 0 and daily_return <= daily_limit:
         diag["paper_trading_locked"] = True
         diag["paper_lock_reason"] = "DAILY_LOSS_LIMIT"
         _log_bot_event(
@@ -689,7 +1111,7 @@ def _apply_paper_loss_lockouts(b, diag, risk_cfg, equity, peak_equity, now):
             ts=int(now),
         )
         return True
-    if drawdown_limit < 0 and drawdown_return <= drawdown_limit:
+    if hard_blocks and drawdown_limit < 0 and drawdown_return <= drawdown_limit:
         diag["paper_trading_locked"] = True
         diag["paper_lock_reason"] = "DRAWDOWN_LOCKOUT"
         _log_bot_event(
@@ -744,26 +1166,58 @@ def buyable_reason(t, s, recent_sells=None, regime_kind="neutral", holdings=None
     recent_sells = recent_sells or {}
     holdings = holdings or {}
     signal_cfg = (cfg or {}).get("signal", {})
-    hard_reject = float(signal_cfg.get("volume_hard_reject_ratio", 0.70))
+    risk_cfg = (cfg or {}).get("risk", {})
+    catalyst_cfg = (cfg or {}).get("catalyst", {})
+    hard_reject = float(signal_cfg.get(
+        "near_zero_volume_ratio_hard_block",
+        signal_cfg.get("volume_hard_reject_ratio", 0.10),
+    ))
     adx_gate = float(signal_cfg.get("neutral_gate_adx_threshold", 20))
-    if s.get("price", 0) <= 0:
-        return False, "INVALID_PRICE"
-    if s.get("stale"):
-        return False, "STALE_CANDIDATE_QUOTE"
+    quote_status = _quote_execution_status(s)
+    if quote_status["blocker"]:
+        return False, quote_status["blocker"]
+    history_status = _history_execution_status(s.get("ctx") or {})
+    if history_status["blocker"]:
+        return False, history_status["blocker"].upper()
     if t in recent_sells:
         rec_l = s.get("rec") or {}
+        display = rec_l.get("display_signal_label")
+        conf = float(rec_l.get("confidence", 0) or 0)
         recent_reason = (recent_sells.get(t) or {}).get("reason", "")
-        allow_bypass = (
-            recent_reason != "loss"
-            and rec_l.get("cls") == "strong-buy"
-            and rec_l.get("confidence", 0) >= 80
-        )
+        sell_ts = float((recent_sells.get(t) or {}).get("ts", 0) or 0)
+        age_min = (time.time() - sell_ts) / 60.0 if sell_ts else 0.0
+        reason_l = str(recent_reason or "").lower()
+        if reason_l in {"loss", "stop_loss", "trend_failure"}:
+            base_cd = float(risk_cfg.get("stop_loss_rebuy_cooldown_minutes", 30))
+        elif reason_l in {"trail", "trailing_stop"}:
+            base_cd = float(risk_cfg.get("trailing_stop_rebuy_cooldown_minutes", 15))
+        elif reason_l in {"manual", "manual_exit"}:
+            base_cd = float(risk_cfg.get("manual_sell_rebuy_cooldown_minutes", 10))
+        else:
+            base_cd = float(risk_cfg.get("take_profit_rebuy_cooldown_minutes", 5))
+        bypass_after = None
+        if rec_l.get("cls") == "strong-buy" or display == "STRONG_BUY_CANDIDATE":
+            bypass_after = float(risk_cfg.get("strong_buy_cooldown_bypass_after_minutes", 5))
+        elif display == "BUY_CANDIDATE":
+            bypass_after = float(risk_cfg.get("buy_candidate_cooldown_bypass_after_minutes", 10))
+        elif display == "BULLISH_LEAN":
+            bypass_after = float(risk_cfg.get("bullish_lean_cooldown_bypass_after_minutes", 15))
+        elif display == "HOLD" and risk_cfg.get("high_confidence_hold_cooldown_bypass_enabled", False):
+            bypass_after = base_cd
+        allow_bypass = bypass_after is not None and age_min >= bypass_after
+        if conf <= 0:
+            allow_bypass = False
         if not allow_bypass:
-            return False, f"RECENT_SELL_COOLDOWN:{recent_reason or 'unknown'}"
-    sec = get_sector(t)
-    if sec is None:
-        return False, "MISSING_SECTOR"
+            if age_min < base_cd:
+                return False, f"RECENT_SELL_COOLDOWN:{recent_reason or 'unknown'}"
     ctx_local = s.get("ctx") or {}
+    adv = float(ctx_local.get("avg_dollar_vol_20d", 0) or 0)
+    if 0 < adv < float(signal_cfg.get("min_avg_dollar_volume_hard_block", 250_000)):
+        return False, "LOW_LIQUIDITY_HARD_BLOCK"
+    atr_pct = float(ctx_local.get("atr_pct", 0) or 0)
+    if (bool(signal_cfg.get("atr_hard_block_enabled", True))
+            and atr_pct > float(signal_cfg.get("extreme_atr_hard_block_pct", 20.0))):
+        return False, "ATR_TOO_HIGH"
     if regime_kind == "bear":
         if not (ctx_local.get("rsi", 100) < 35 or ctx_local.get("is_dip")):
             return False, "BEAR_GATE_REQUIRES_DIP_OR_RSI_LT_35"
@@ -775,7 +1229,10 @@ def buyable_reason(t, s, recent_sells=None, regime_kind="neutral", holdings=None
     catalyst_type = catalyst.get("type")
     week_chg = ctx_local.get("week_chg_pct", 0) or 0
     dist_high = ctx_local.get("dist_from_high_pct", 0) or 0
-    if catalyst_type in KNIFE_CATALYST_TYPES and week_chg <= -3.0:
+    falling_threshold = float(catalyst_cfg.get("negative_catalyst_falling_threshold_pct", -5.0))
+    if (catalyst_type in KNIFE_CATALYST_TYPES
+            and bool(catalyst_cfg.get("negative_catalyst_hard_block_enabled", True))
+            and week_chg <= falling_threshold):
         return False, f"NEGATIVE_CATALYST_FALLING:{catalyst_type}"
     if week_chg <= -5.0 and dist_high <= -10.0:
         return False, "FALLING_KNIFE_WEEK_LT_-5_DIST_HIGH_LT_-10"
@@ -1272,6 +1729,8 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
     signal_cfg = (cfg or {}).get("signal", {})
     mode_cfg = (cfg or {}).get("market_data_modes", {})
     risk_cfg = (cfg or {}).get("risk", {}) if isinstance(cfg, dict) else {}
+    scan_cfg = (cfg or {}).get("scan", {}) if isinstance(cfg, dict) else {}
+    history_cfg = (cfg or {}).get("history", {}) if isinstance(cfg, dict) else {}
     min_position_usd = float(risk_cfg.get("min_trade_size", MIN_POSITION_USD))
     min_buy_confidence = float(signal_cfg.get("min_buy_confidence", 40))
     degraded_min_confidence = float(
@@ -1289,6 +1748,9 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
     no_buy_diag["normal_risk_caps_required"] = True
     no_buy_diag["fresh_quote_required"] = True
     no_buy_diag["min_trade_size_effective"] = min_position_usd
+    no_buy_diag["max_history_fetches_per_tick"] = int(
+        history_cfg.get("max_history_fetches_per_tick", 1)
+    )
     deadline_ts = (now + float(max_runtime_sec)) if max_runtime_sec else None
     collapse_diag = []
     stale_scan_skipped = False
@@ -1435,6 +1897,7 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
     fetch_workers = 2 if PYTHONANYWHERE_MODE else 8
     _raise_if_tick_deadline_exceeded(deadline_ts, b, no_buy_diag)
     fetch_list = list(all_to_check)
+    set_history_fetch_budget(no_buy_diag.get("max_history_fetches_per_tick", 1))
     executor = ThreadPoolExecutor(max_workers=fetch_workers)
     futures = {executor.submit(_fetch_one, t): t for t in fetch_list}
     try:
@@ -1484,6 +1947,7 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
                 _raise_if_tick_deadline_exceeded(deadline_ts, b, no_buy_diag)
     finally:
         executor.shutdown(wait=False, cancel_futures=True)
+        set_history_fetch_budget(None)
     gc.collect()
     for payload in sigs.values():
         rec = _annotate_signal(payload.get("rec") or {})
@@ -1528,6 +1992,14 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
                 no_buy_diag["history_fmp_rate_limited_count"] += 1
         if bucket == "missing":
             no_buy_diag["history_missing_count"] += 1
+            max_missing = int(
+                history_cfg.get(
+                    "top_missing_history_symbols_count",
+                    DEFAULT_CONFIG.get("history", {}).get("top_missing_history_symbols_count", 3),
+                )
+            )
+            if len(no_buy_diag.get("top_missing_history_symbols") or []) < max_missing:
+                no_buy_diag.setdefault("top_missing_history_symbols", []).append(t)
         elif bucket == "fmp_daily":
             no_buy_diag["history_fmp_fallback_count"] += 1
         elif bucket == "stale_cache":
@@ -1549,6 +2021,17 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
         no_buy_diag["data_health_warnings"] = list(dict.fromkeys(
             list(no_buy_diag.get("data_health_warnings") or [])
             + ["FMP_DAILY_RATE_LIMITED", "FMP_DAILY_GLOBAL_COOLDOWN"]
+        ))
+    finnhub_daily_state = finnhub_daily_global_circuit_state()
+    no_buy_diag["finnhub_daily_global_circuit_status"] = finnhub_daily_state.get("status")
+    no_buy_diag["finnhub_daily_forbidden"] = bool(finnhub_daily_state.get("active"))
+    no_buy_diag["finnhub_daily_cooldown_remaining_sec"] = int(
+        finnhub_daily_state.get("cooldown_remaining_sec") or 0
+    )
+    if finnhub_daily_state.get("active"):
+        no_buy_diag["data_health_warnings"] = list(dict.fromkeys(
+            list(no_buy_diag.get("data_health_warnings") or [])
+            + ["FINNHUB_DAILY_FORBIDDEN"]
         ))
     no_buy_diag["history_finnhub_daily_blocked_count"] = sum(
         1 for t in fetch_list
@@ -1617,6 +2100,7 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
     no_buy_diag["volatility_error"] = vix_data.get("data_error")
     no_buy_diag["data_health_warnings"] = list(dict.fromkeys(
         list(no_buy_diag.get("data_health_warnings") or [])
+        + list(mode_info.get("data_health_warnings") or [])
         + list(vix_data.get("data_health_warnings") or [])
     ))
     no_buy_diag["data_health_blocks"] = data_health_blocks
@@ -1701,13 +2185,12 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
         _log_bot_event("DEGRADED_MODE_DISABLED", blocks=data_health_blocks)
 
     max_positions = int(risk_cfg.get("max_positions", MAX_POSITIONS))
-    MAX_POS_PCT        = float(risk_cfg.get("max_position_pct", 0.08))
-    MAX_SECTOR_PCT     = float(risk_cfg.get("max_sector_pct", 0.25))
-    MAX_CORR_GROUP_PCT = float(risk_cfg.get("max_corr_group_pct", 0.25))
-    DRAWDOWN_PAUSE     = 12.0
-    MIN_CASH_RESERVE   = float(risk_cfg.get("min_cash_reserve_pct", 0.30))
+    MAX_POS_PCT        = float(risk_cfg.get("max_position_pct", 0.35))
+    MAX_SECTOR_PCT     = float(risk_cfg.get("max_sector_pct", 1.00))
+    MAX_CORR_GROUP_PCT = float(risk_cfg.get("max_corr_group_pct", 1.00))
+    MIN_CASH_RESERVE   = float(risk_cfg.get("min_cash_reserve_pct", 0.00))
     MIN_HOLDING_SEC    = 20 * 60
-    MAX_GROSS_EXPOSURE_PCT = float(risk_cfg.get("max_gross_exposure_pct", 0.70))
+    MAX_GROSS_EXPOSURE_PCT = float(risk_cfg.get("max_gross_exposure_pct", 1.00))
 
     outcomes = b.get("trade_outcomes", [])
     # Round-7 risk (bug 8 cleanup): the old `win_rate` var here was computed and
@@ -2032,7 +2515,7 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
         regime_allow_buys = False
         no_buy_diag["regime_allow_buys"] = False
         _log_bot_event("STALE_HELD_QUOTE", tickers=risk_unmanaged_positions[:10])
-    max_buys_today = int(risk_cfg.get("max_new_buys_per_day", 2))
+    max_buys_today = int(risk_cfg.get("max_new_buys_per_day", 30))
     try:
         from zoneinfo import ZoneInfo
         et_zone = ZoneInfo("America/New_York")
@@ -2046,8 +2529,10 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
     except Exception:
         buys_today = 0
         degraded_buys_today = 0
+        scan_buys_today = 0
     else:
         degraded_buys_today = 0
+        scan_buys_today = 0
         for e in b.get("history", []):
             try:
                 if (e.get("action") == "BUY"
@@ -2055,16 +2540,26 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
                         and e.get("ts")
                         and datetime.fromtimestamp(float(e.get("ts")), et_zone).strftime("%Y-%m-%d") == today_key):
                     degraded_buys_today += 1
+                if (e.get("action") == "BUY"
+                        and e.get("source") == "scan"
+                        and e.get("ts")
+                        and datetime.fromtimestamp(float(e.get("ts")), et_zone).strftime("%Y-%m-%d") == today_key):
+                    scan_buys_today += 1
             except Exception:
                 pass
-    degraded_max_buys_today = int(mode_cfg.get("degraded_max_new_buys_per_day", 1))
-    degraded_max_buys_per_tick = int(mode_cfg.get("degraded_max_new_buys_per_tick", 1))
+    degraded_max_buys_today = int(mode_cfg.get("degraded_max_new_buys_per_day", 30))
+    degraded_max_buys_per_tick = int(mode_cfg.get("degraded_max_new_buys_per_tick", 10))
+    max_scan_buys_today = int(scan_cfg.get("max_scan_buys_per_day", 30))
+    max_scan_buys_per_tick = int(scan_cfg.get("max_scan_buys_per_tick", BOT_SCAN_BUY))
     degraded_max_position_pct = float(mode_cfg.get("degraded_max_position_pct", 0.05))
     degraded_max_gross_exposure_pct = float(mode_cfg.get("degraded_max_gross_exposure_pct", 0.35))
     no_buy_diag["buys_today"] = int(buys_today)
     no_buy_diag["max_buys_today"] = max_buys_today
     no_buy_diag["degraded_buys_today"] = int(degraded_buys_today)
     no_buy_diag["degraded_max_buys_today"] = degraded_max_buys_today
+    no_buy_diag["scan_buys_today"] = int(scan_buys_today)
+    no_buy_diag["max_scan_buys_today"] = max_scan_buys_today
+    no_buy_diag["max_scan_buys_per_tick"] = max_scan_buys_per_tick
     no_buy_diag["degraded_size_mult"] = mode_cfg.get("degraded_size_mult", 0.90)
     no_buy_diag["effective_size_mult"] = mode_info["effective_size_mult"]
     no_buy_diag["effective_min_buy_confidence"] = mode_info["effective_min_buy_confidence"]
@@ -2098,7 +2593,7 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
     if lockout_active:
         regime_allow_buys = False
         no_buy_diag["regime_allow_buys"] = False
-    buys_paused = bool(lockout_active or drawdown_pct > DRAWDOWN_PAUSE)
+    buys_paused = bool(lockout_active)
 
     sector_value = {}
     corr_value = {}
@@ -2155,7 +2650,13 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
 
     def _candidate(t, s, source):
         rec = s.get("rec") or {}
+        _apply_execution_profile(
+            rec,
+            cfg,
+            degraded_mode_active=mode_info["degraded_mode_active"],
+        )
         ctx = s.get("ctx") or {}
+        quote_status = _quote_execution_status(s)
         cluster = entry_cluster(rec, ctx)
         regime_v3 = regime.get("regime_v3_effective") or regime.get("regime_v3")
         r_mult = regime_risk_mult(regime_v3, cfg)
@@ -2164,7 +2665,14 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
         return {
             "ticker": t, "source": source, "rec": rec, "ctx": ctx,
             "price": s.get("price", 0), "arts": s.get("arts") or [],
+            "earn": s.get("earn") or {},
             "cluster": cluster,
+            "candidate_type": rec.get("candidate_type"),
+            "candidate_size_multiplier": rec.get("candidate_size_multiplier", 1.0),
+            "execution_trusted": quote_status.get("execution_trusted"),
+            "quote_source": quote_status.get("quote_source"),
+            "cache_used": quote_status.get("cache_used"),
+            "quote_age_seconds": quote_status.get("quote_age_seconds"),
             "vol_regime": classify_vol_regime(ctx),
             "benchmark_prices": dict(benchmark_prices),
             "config_hash": cfg_hash,
@@ -2222,12 +2730,21 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
     candidate_pool = []
     scan_data_snapshot, scan_ts_snapshot = _scan_snapshot()
     scan_age = now - (scan_ts_snapshot or 0)
+    scan_enabled = bool(scan_cfg.get("scan_buys_enabled", True))
+    scan_freshness_sec = int(scan_cfg.get("scan_data_max_age_sec", SCAN_FRESHNESS_SEC))
+    scan_min_conf = float(scan_cfg.get("scan_buy_min_confidence", SCAN_BUY_MIN_CONF))
+    scan_min_history_rows = int(scan_cfg.get("scan_requires_min_history_rows", MIN_SIGNAL_HISTORY_ROWS) or 0)
+    scan_min_dvol_hard = float(signal_cfg.get("min_avg_dollar_volume_hard_block", 250_000))
     scan_rows_all = scan_data_snapshot or []
     fresh_scan_rows = [
         r for r in scan_rows_all
-        if now - float(r.get("ts") or scan_ts_snapshot or 0) < SCAN_FRESHNESS_SEC
+        if now - float(r.get("ts") or scan_ts_snapshot or 0) <= scan_freshness_sec
     ]
-    scan_fresh = bool(fresh_scan_rows)
+    scan_fresh = bool(scan_enabled and fresh_scan_rows)
+    no_buy_diag["scan_buys_enabled"] = bool(scan_enabled)
+    no_buy_diag["scan_data_max_age_sec"] = scan_freshness_sec
+    no_buy_diag["scan_min_confidence"] = scan_min_conf
+    no_buy_diag["scan_min_history_rows"] = scan_min_history_rows
     no_buy_diag["scan_fresh"] = bool(scan_fresh)
     no_buy_diag["scan_age_sec"] = int(scan_age) if scan_ts_snapshot else None
     no_buy_diag["scan_rows_count"] = len(scan_rows_all)
@@ -2251,16 +2768,23 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
 
     if not buys_paused and regime_allow_buys and tod_ok and daily_buy_room and exposure_room:
         for t, s in sigs.items():
+            rec = s.get("rec") or {}
+            _apply_execution_profile(
+                rec,
+                cfg,
+                degraded_mode_active=mode_info["degraded_mode_active"],
+            )
+            s["rec"] = rec
             if (t in tickers
                     and is_execution_candidate(
-                        s.get("rec"),
+                        rec,
                         cfg,
                         degraded_mode_active=mode_info["degraded_mode_active"],
                     )
                     and buyable(t, s)):
                 candidate_pool.append(_candidate(t, s, "watchlist"))
 
-        if scan_fresh and b["cash"] - cash_floor > min_position_usd:
+        if scan_enabled and scan_fresh and b["cash"] - cash_floor > min_position_usd:
             bullish = [r for r in fresh_scan_rows if r["direction"] > 0 and r["price"] > 0]
             by_conf = sorted(bullish, key=lambda r: (-r["confidence"], -r["score"]))[:10]
             by_gain = sorted(bullish, key=lambda r: -r["pct"])[:10]
@@ -2272,9 +2796,9 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
                 tk = r["ticker"]
                 if tk in tickers or tk in b["holdings"]:
                     continue
-                if r["confidence"] < SCAN_BUY_MIN_CONF:
+                if float(r.get("confidence", 0) or 0) < scan_min_conf:
                     continue
-                cached = cache_get(f"scan_payload_{tk}", max_age=SCAN_FRESHNESS_SEC)
+                cached = cache_get(f"scan_payload_{tk}", max_age=scan_freshness_sec)
                 if cached is None:
                     no_buy_diag["scan_payload_misses"] += 1
                     continue
@@ -2294,7 +2818,29 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
                 }
                 _finalize_signal_confidence(payload, cfg)
                 rec = payload["rec"]
-                if pr <= 0 or payload["stale"]:
+                ctx_o = payload.get("ctx") or ctx_o
+                _apply_execution_profile(
+                    rec,
+                    cfg,
+                    degraded_mode_active=mode_info["degraded_mode_active"],
+                )
+                quote_status = _quote_execution_status(payload)
+                if pr <= 0:
+                    continue
+                if (
+                    bool(scan_cfg.get("scan_requires_execution_trusted_quote", True))
+                    and not quote_status["execution_trusted"]
+                ):
+                    continue
+                if (
+                    rec.get("display_signal_label") == "BULLISH_LEAN"
+                    and not bool(scan_cfg.get("scan_allow_bullish_lean", True))
+                ):
+                    continue
+                if (
+                    rec.get("display_signal_label") == "HOLD"
+                    and not bool(scan_cfg.get("scan_allow_high_confidence_hold", False))
+                ):
                     continue
                 if not is_execution_candidate(
                     rec,
@@ -2302,15 +2848,16 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
                     degraded_mode_active=mode_info["degraded_mode_active"],
                 ):
                     continue
-                if pr < 5.0:
+                history_status = _history_execution_status(ctx_o)
+                if scan_min_history_rows and history_status["history_rows"] < scan_min_history_rows:
                     continue
                 dvol = ctx_o.get("avg_dollar_vol_20d", 0) or 0
-                if dvol > 0 and dvol < 5_000_000:
+                if dvol > 0 and dvol < scan_min_dvol_hard:
                     continue
                 sigs[tk] = payload
                 if buyable(tk, payload):
                     candidate_pool.append(_candidate(tk, payload, "scan"))
-        elif b["cash"] - cash_floor > min_position_usd and not scan_fresh:
+        elif scan_enabled and b["cash"] - cash_floor > min_position_usd and not scan_fresh:
             stale_scan_skipped = True
     no_buy_diag["candidate_pool_count"] = len(candidate_pool)
 
@@ -2325,24 +2872,19 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
     ) if candidate_pool else []
     no_buy_diag["ranked_count"] = len(ranked_candidates)
     no_buy_diag["tradable_count"] = sum(1 for c in ranked_candidates if c.get("tradable"))
-    variance_tickers = set(b.get("holdings", {}).keys()) | {
-        c["ticker"] for c in ranked_candidates
-    }
-    close_history = load_close_history(variance_tickers) if ranked_candidates else {}
-    ctx_by_ticker = {
-        tk: (snap.get("ctx") or {}) for tk, snap in sigs.items()
-        if tk in variance_tickers
-    }
-    price_by_ticker = {
-        tk: snap.get("price", 0) for tk, snap in sigs.items()
-        if tk in variance_tickers and snap.get("price", 0) > 0
-    }
     variance_checks = []
 
     def _ranking_rows():
         return [{
             "ticker": c["ticker"], "source": c["source"], "cluster": c["cluster"],
             "signal": c["rec"].get("signal"), "confidence": c["rec"].get("confidence"),
+            "confidence_scale": (c.get("risk") or {}).get("confidence_scale"),
+            "candidate_type": c.get("candidate_type") or c["rec"].get("candidate_type"),
+            "candidate_size_multiplier": c.get("candidate_size_multiplier"),
+            "quote_source": c.get("quote_source"),
+            "cache_used": c.get("cache_used"),
+            "quote_age_seconds": c.get("quote_age_seconds"),
+            "execution_trusted": c.get("execution_trusted"),
             "gross_edge_pct": c.get("gross_edge_pct"),
             "friction_pct": (c.get("friction") or {}).get("total_pct"),
             "net_edge_pct": c.get("net_edge_pct"), "ev_score": c.get("ev_score"),
@@ -2350,12 +2892,16 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
             "friction_diagnostics": c.get("friction_diagnostics"),
             "edge_diagnostics": c.get("edge_diagnostics"),
             "ev_diagnostics": c.get("ev_diagnostics"),
+            "expected_net_profit_usd": (c.get("ev_diagnostics") or {}).get("expected_net_profit_usd"),
+            "edge_to_required_ratio": (c.get("ev_diagnostics") or {}).get("edge_to_required_ratio"),
+            "ev_gate_passed": (c.get("ev_diagnostics") or {}).get("ev_gate_passed"),
+            "ev_blocker_code": (c.get("ev_diagnostics") or {}).get("ev_blocker_code"),
             "risk_pct": (c.get("risk") or {}).get("risk_pct"),
             "target_notional": (c.get("risk") or {}).get("target_notional"),
             "tradable": c.get("tradable"), "reason": c.get("rank_reason"),
             "edge_source": c.get("edge_source"), "edge_samples": c.get("edge_samples"),
             "required_edge_pct": c.get("required_edge_pct"),
-            "portfolio_variance": c.get("portfolio_variance"),
+            "portfolio_variance": None,
             "config_hash": c.get("config_hash"),
             "regime_v3": c.get("regime_v3"),
             "regime_reason": c.get("regime_reason"),
@@ -2397,7 +2943,7 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
 
     scan_taken = 0
     total_taken = 0
-    max_cycle_buys = int(risk_cfg.get("max_new_buys_per_tick", BOT_MAX_BUYS)) + BOT_SCAN_BUY
+    max_cycle_buys = int(risk_cfg.get("max_new_buys_per_tick", BOT_MAX_BUYS))
     max_cycle_buys = max(0, min(max_cycle_buys, max_buys_today - buys_today))
     if degraded_restricted_mode:
         degraded_day_room = max(0, degraded_max_buys_today - degraded_buys_today)
@@ -2452,17 +2998,26 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
 
     def _degraded_reject_reason(cand, s, taken_this_tick):
         rec = cand.get("rec") or {}
-        display = rec.get("display_signal_label")
         warnings = cand.get("warnings") or []
         risk_penalties = (cand.get("risk") or {}).get("size_penalties") or []
         mode_cfg_local = mode_cfg or {}
         if mode_info.get("degraded_standard_gates_active"):
             return None
-        if mode_cfg_local.get("degraded_require_fresh_quote", True) and s.get("stale"):
+        if (
+            mode_cfg_local.get("degraded_require_fresh_quote", True)
+            and not _quote_execution_status(s).get("execution_trusted")
+        ):
             return "DEGRADED_STALE_QUOTE_BLOCKED"
-        if mode_cfg_local.get("degraded_require_buy_candidate", True) and display not in ("BUY_CANDIDATE", "STRONG_BUY_CANDIDATE"):
+        if mode_cfg_local.get("degraded_require_buy_candidate", True) and not is_execution_candidate(
+            rec,
+            cfg,
+            degraded_mode_active=True,
+        ):
             return "DEGRADED_NOT_BUY_CANDIDATE"
-        if float(rec.get("confidence", 0) or 0) < degraded_min_confidence:
+        if (
+            rec.get("candidate_type") != "weak_paper_test_candidate"
+            and float(rec.get("confidence", 0) or 0) < degraded_min_confidence
+        ):
             return "DEGRADED_CONFIDENCE_BELOW_MIN_BUY"
         if mode_cfg_local.get("degraded_block_low_volume_penalty", False):
             if "LOW_VOLUME_PENALTY_ONLY" in warnings or "LOW_VOLUME_PENALTY_ONLY" in risk_penalties:
@@ -2498,11 +3053,21 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
             _record_candidate_observation(b, cand, "skipped", reason,
                                           now, regime_kind)
             continue
-        if cand["source"] == "scan" and scan_taken >= BOT_SCAN_BUY:
-            _bump(no_buy_diag["skip_reason_counts"], "MAX_SCAN_BUYS_PER_TICK")
-            _record_candidate_observation(b, cand, "skipped", "MAX_SCAN_BUYS_PER_TICK",
-                                          now, regime_kind)
-            continue
+        if cand["source"] == "scan":
+            if scan_taken >= max_scan_buys_per_tick:
+                reason = "MAX_SCAN_BUYS_PER_TICK"
+                _bump(no_buy_diag["skip_reason_counts"], reason)
+                _record_candidate_observation(b, cand, "skipped", reason,
+                                              now, regime_kind)
+                _collapse_skip(cand, reason, "scan_frequency")
+                continue
+            if scan_buys_today + scan_taken >= max_scan_buys_today:
+                reason = "MAX_SCAN_BUYS_PER_DAY"
+                _bump(no_buy_diag["skip_reason_counts"], reason)
+                _record_candidate_observation(b, cand, "skipped", reason,
+                                              now, regime_kind)
+                _collapse_skip(cand, reason, "scan_frequency")
+                continue
         require_normal_ev = (
             not mode_info["degraded_mode_active"]
             or mode_info["degraded_standard_gates_active"]
@@ -2540,12 +3105,48 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
                          if existing.get("avg_cost") else 0)
             last_buy = existing.get("last_buy_ts", existing.get("entry_ts", 0))
             since_last_min = (now - last_buy) / 60 if last_buy else 1e9
-            if not (exist_pnl >= 3 and since_last_min >= 60):
-                reason = f"Pyramid gate: need +3% winner and 60m cooldown (now {exist_pnl:+.1f}%, {since_last_min:.0f}m)"
+            pyramid_enabled = bool(risk_cfg.get("pyramiding_enabled", True))
+            pyramid_min_profit = float(risk_cfg.get("pyramiding_min_profit_pct", 1.0))
+            pyramid_min_gap = float(risk_cfg.get("pyramiding_min_minutes_between_adds", 10))
+            pyramid_max_loss = float(risk_cfg.get("pyramiding_max_loss_allowed_pct", -3.0))
+            display_signal = rec.get("display_signal_label")
+            strong_add = (
+                rec.get("cls") == "strong-buy"
+                or display_signal == "STRONG_BUY_CANDIDATE"
+                or cand.get("candidate_type") == "standard_buy_candidate"
+                   and display_signal == "STRONG_BUY_CANDIDATE"
+            )
+            allow_strong_flat = bool(risk_cfg.get("pyramiding_allow_flat_add_for_strong_buy", True))
+            allow_strong_losing = bool(risk_cfg.get("pyramiding_allow_losing_adds", True))
+            pyramid_allowed = False
+            pyramid_reason = None
+            if not pyramid_enabled:
+                pyramid_reason = "PYRAMIDING_DISABLED"
+            elif since_last_min < pyramid_min_gap:
+                pyramid_reason = (
+                    f"PYRAMIDING_COOLDOWN:{since_last_min:.0f}m_LT_{pyramid_min_gap:.0f}m"
+                )
+            elif exist_pnl >= pyramid_min_profit:
+                pyramid_allowed = True
+            elif strong_add and allow_strong_flat and exist_pnl >= 0:
+                pyramid_allowed = True
+            elif strong_add and allow_strong_losing and exist_pnl >= pyramid_max_loss:
+                pyramid_allowed = True
+            elif exist_pnl < 0:
+                pyramid_reason = (
+                    f"PYRAMIDING_AVERAGING_DOWN_BLOCKED:{exist_pnl:+.1f}%"
+                )
+            else:
+                pyramid_reason = (
+                    f"PYRAMIDING_PROFIT_BELOW_MIN:{exist_pnl:+.1f}%_LT_{pyramid_min_profit:.1f}%"
+                )
+            if not pyramid_allowed:
+                reason = pyramid_reason or "PYRAMIDING_BLOCKED"
                 _bump(no_buy_diag["skip_reason_counts"], reason)
                 _record_candidate_observation(b, cand, "skipped", reason, now, regime_kind)
+                _collapse_skip(cand, reason, "pyramiding")
                 continue
-            sizing_note = f"pyramid +{exist_pnl:.1f}% ({since_last_min:.0f}m since add)"
+            sizing_note = f"pyramid {exist_pnl:+.1f}% ({since_last_min:.0f}m since add)"
         else:
             if len(b["holdings"]) >= max_positions:
                 reason = "MAX_POSITIONS_REACHED"
@@ -2559,11 +3160,12 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
         existing_val = (b["holdings"].get(t, {}).get("shares", 0) *
                         cand["price"])
         spend = min(spend, max(0, pt * MAX_POS_PCT - existing_val))
+        gross_room = max(0, pt * MAX_GROSS_EXPOSURE_PCT - exposure_value)
+        spend = min(spend, gross_room)
         sec = get_sector(t)
-        if sec is None:
-            continue
-        sec_current = sector_value.get(sec, 0)
-        spend = min(spend, max(0, pt * MAX_SECTOR_PCT - sec_current))
+        sec_current = sector_value.get(sec, 0) if sec else 0
+        if sec:
+            spend = min(spend, max(0, pt * MAX_SECTOR_PCT - sec_current))
         grp = get_corr_group(t)
         if grp:
             grp_current = corr_value.get(grp, 0)
@@ -2592,26 +3194,6 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
                 _collapse_skip(cand, reason, "degraded_gross_exposure_cap")
                 continue
             spend = min(spend, degraded_gross_room)
-        variance_diag = candidate_variance_check(
-            b.get("holdings", {}), price_by_ticker, t, spend, pt,
-            close_history, ctx_by_ticker=ctx_by_ticker, regime=regime_kind,
-            gross_edge_pct=cand.get("gross_edge_pct", 0),
-            net_edge_pct=cand.get("net_edge_pct", 0),
-            paper_debug_override=bool(b.get("paper_debug_override", False)),
-            sector_lookup=get_sector, corr_group_lookup=get_corr_group,
-            config=cfg,
-        )
-        cand["portfolio_variance"] = variance_diag
-        variance_checks.append(variance_diag)
-        if variance_diag.get("risk_action") == "skip":
-            reason = variance_diag.get("skip_reason") or "PORTFOLIO_VARIANCE"
-            cand["rank_reason"] = f"{reason}: {variance_reason(variance_diag)}"
-            _bump(no_buy_diag["skip_reason_counts"], reason)
-            _record_candidate_observation(b, cand, "skipped", reason, now, regime_kind)
-            _collapse_skip(cand, cand["rank_reason"], "portfolio_variance", original_reason=reason)
-            continue
-        if variance_diag.get("size_mult", 1.0) < 1.0:
-            spend *= variance_diag.get("size_mult", 1.0)
         if spend < min_position_usd:
             original_reason = (f"Risk/cap spend ${spend:.0f} below ${min_position_usd:.0f} floor "
                                f"(target ${cand['risk']['target_notional']:.0f})")
@@ -2669,7 +3251,8 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
             "friction_pct": (cand.get("friction") or {}).get("total_pct"),
             "risk_pct": (cand.get("risk") or {}).get("risk_pct"),
             "source": cand.get("source"),
-            "portfolio_variance": cand.get("portfolio_variance"),
+            "portfolio_variance": None,
+            "portfolio_variance_mode": "disabled_for_paper_execution",
             "config_hash": cfg_hash,
             "regime_v3": cand.get("regime_v3"),
             "regime_v3_reason": cand.get("regime_reason"),
@@ -2705,7 +3288,8 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
             "entry_friction_pct": (cand.get("friction") or {}).get("total_pct"),
             "entry_risk_pct": (cand.get("risk") or {}).get("risk_pct"),
             "entry_source": cand.get("source"),
-            "portfolio_variance": cand.get("portfolio_variance"),
+            "portfolio_variance": None,
+            "portfolio_variance_mode": "disabled_for_paper_execution",
             "config_hash": cfg_hash,
             "regime_v3": cand.get("regime_v3"),
             "catalyst_type": cand.get("catalyst_type"),
@@ -2716,20 +3300,20 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
             "partial_taken":   prior.get("partial_taken", False),
             "degrade_trimmed": prior.get("degrade_trimmed", False),
         }
-        sector_value[sec] = sec_current + cost
+        if sec:
+            sector_value[sec] = sec_current + cost
         if grp:
             corr_value[grp] = corr_value.get(grp, 0) + cost
-        price_by_ticker[t] = cand["price"]
         buy_reason = (
             f"{'New position' if h['shares'] == 0 else 'Adding'} ({sizing_note}) - "
             f"{rec.get('signal')} @ {conf}% conf, EV {cand['net_edge_pct']:+.2f}% "
             f"after friction {(cand.get('friction') or {}).get('total_pct', 0):.2f}%, "
             f"risk {cand['risk']['risk_pct']:.2f}%/${cand['risk']['risk_dollars']:.0f}, "
             f"stop {cand['risk']['stop_distance_pct']:.1f}%, source={cand['source']}, "
-            f"cluster={cand['cluster']}, regime={regime_label}, VIX={vix_label}, sector {sec}. "
+            f"cluster={cand['cluster']}, regime={regime_label}, VIX={vix_label}, sector {sec or 'unknown'}. "
             f"V3={cand.get('regime_v3')} r×{cand.get('regime_risk_mult'):.2f}/c×{cand.get('cluster_regime_mult'):.2f}, "
             f"catalyst={cand.get('catalyst_type')} confirmed={cand.get('catalyst_confirmed')}, cfg={cfg_hash}. "
-            f"{variance_reason(cand.get('portfolio_variance'))}"
+            "Portfolio variance disabled for paper execution."
         )
         if mode_info["proxy_mode_active"]:
             buy_reason = (
@@ -2767,6 +3351,10 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
                 "degraded_gate_policy": mode_info["degraded_gate_policy"],
                 "effective_size_mult": mode_info["effective_size_mult"],
                 "effective_min_buy_confidence": mode_info["effective_min_buy_confidence"],
+                "source": cand.get("source"),
+                "candidate_type": cand.get("candidate_type"),
+                "final_spend": round(cost, 2),
+                "final_size_blocker_stage": None,
             })
         _record_candidate_observation(b, cand, "executed", buy_reason, now, regime_kind)
         traded = True
@@ -2788,8 +3376,48 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
         config=cfg,
         recent_sells=recent_sells,
     )
-    b["last_portfolio_variance_checks"] = variance_checks[-50:]
+    b["last_portfolio_variance_checks"] = []
     b["last_candidate_rankings"] = _ranking_rows()
+    top_rejected = []
+    for row in no_buy_diag.get("top_buyable_rejects") or []:
+        if len(top_rejected) >= 3:
+            break
+        top_rejected.append({
+            "symbol": row.get("ticker"),
+            "decision_stage": "pre_candidate",
+            "blocker_code": row.get("rejection_reason"),
+            "blocker_detail": row.get("rejection_reason"),
+            "display_signal": row.get("display_signal_label"),
+            "confidence": row.get("confidence"),
+        })
+    for row in no_buy_diag.get("top_ranked_rejections") or []:
+        if len(top_rejected) >= 3:
+            break
+        top_rejected.append({
+            "symbol": row.get("ticker"),
+            "decision_stage": "ev_or_size",
+            "blocker_code": row.get("rank_reason_code"),
+            "blocker_detail": row.get("rank_reason"),
+            "display_signal": row.get("display_signal_label"),
+            "confidence": row.get("confidence"),
+            "expected_net_profit_usd": (row.get("ev_diagnostics") or {}).get("expected_net_profit_usd"),
+            "net_edge_pct": row.get("net_edge_pct"),
+            "target_notional": row.get("target_notional"),
+        })
+    for row in collapse_diag:
+        if len(top_rejected) >= 3:
+            break
+        top_rejected.append({
+            "symbol": row.get("ticker"),
+            "decision_stage": row.get("skip_stage") or "final_execution",
+            "blocker_code": row.get("rank_reason_code") or row.get("reason"),
+            "blocker_detail": row.get("reason"),
+            "display_signal": row.get("display_signal"),
+            "confidence": row.get("confidence"),
+            "net_edge_pct": row.get("net_edge_pct"),
+            "target_notional": row.get("target_notional"),
+        })
+    no_buy_diag["top_rejected_candidates"] = top_rejected[:3]
 
     if rotation_actions:
         bought = rotation_actions + bought
@@ -2862,6 +3490,10 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
     if not traded and not collapse_diag:
         reasons = []
         has_buys = any(s["rec"]["cls"] in ("buy", "strong-buy") for s in sigs.values())
+        # Entry 027 — surface core-data blockers (missing daily history / invalid
+        # or missing quotes) in the visible reason instead of hiding them behind
+        # the generic "no BUY signals across watchlist" line.
+        core_blocker_reason = _core_data_blocker_reason(no_buy_diag)
         if mode_info["proxy_mode_active"]:
             reasons.append(
                 f"PROXY MODE: real VIX unavailable; using SPY realized-vol proxy "
@@ -2904,6 +3536,8 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
                 )
             else:
                 reasons.append(f"gross exposure cap reached ({no_buy_diag.get('gross_exposure_pct'):.0%})")
+        elif core_blocker_reason:
+            reasons.append(core_blocker_reason)
         elif not has_buys:
             reasons.append("no BUY signals across watchlist")
         elif b["cash"] - cash_floor < min_position_usd:
@@ -3136,6 +3770,9 @@ def _render_bot_page(read_only):
         "fmp_daily_rate_limited": no_buy.get("fmp_daily_rate_limited", False),
         "fmp_daily_cooldown_remaining_sec": no_buy.get("fmp_daily_cooldown_remaining_sec", 0),
         "fmp_daily_last_429_age_sec": no_buy.get("fmp_daily_last_429_age_sec"),
+        "finnhub_daily_global_circuit_status": no_buy.get("finnhub_daily_global_circuit_status"),
+        "finnhub_daily_forbidden": no_buy.get("finnhub_daily_forbidden", False),
+        "finnhub_daily_cooldown_remaining_sec": no_buy.get("finnhub_daily_cooldown_remaining_sec", 0),
         "ticker_signal_debug": (no_buy.get("ticker_signal_debug") or [])[:PA_TICKERS_PER_BOT_RUN],
         "stale_ticker_count": no_buy.get("stale_ticker_count", 0),
         "stale_tickers": no_buy.get("stale_tickers", []),
@@ -3149,10 +3786,18 @@ def _render_bot_page(read_only):
         "tradable_count": no_buy.get("tradable_count", 0),
         "top_ranked": (no_buy.get("top_ranked") or [])[:5],
         "top_ranked_rejections": (no_buy.get("top_ranked_rejections") or [])[:5],
+        "top_rejected_candidates": (no_buy.get("top_rejected_candidates") or [])[:3],
         "skip_reason_counts": no_buy.get("skip_reason_counts", {}),
         "buyable_reject_counts": no_buy.get("buyable_reject_counts", {}),
         "top_buyable_rejects": (no_buy.get("top_buyable_rejects") or [])[:5],
         "scan_payload_misses": no_buy.get("scan_payload_misses", 0),
+        "scan_buys_enabled": no_buy.get("scan_buys_enabled"),
+        "scan_data_max_age_sec": no_buy.get("scan_data_max_age_sec"),
+        "scan_min_confidence": no_buy.get("scan_min_confidence"),
+        "scan_min_history_rows": no_buy.get("scan_min_history_rows"),
+        "scan_buys_today": no_buy.get("scan_buys_today", 0),
+        "max_scan_buys_today": no_buy.get("max_scan_buys_today"),
+        "max_scan_buys_per_tick": no_buy.get("max_scan_buys_per_tick"),
         "scan_age_sec": no_buy.get("scan_age_sec"),
         "scan_rows_count": no_buy.get("scan_rows_count"),
         "scan_fresh_rows_count": no_buy.get("scan_fresh_rows_count"),
