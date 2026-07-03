@@ -9,12 +9,14 @@ from datetime import datetime
 from flask import render_template, request, redirect, url_for, flash, session, jsonify
 
 from app import app
+from market.history import warm_history
 from market.quotes import get_quote, is_valid_ticker
 from market.snapshots import signal_snapshot
 from trading.bot import (
     bot_state, _render_bot_page, STARTING_CASH, run_bot, warm_scan_if_due,
     BOT_TICK_MAX_RUNTIME_SEC,
 )
+from trading.config import DEFAULT_CONFIG
 from trading.risk import get_market_regime
 from trading.suggestion_store import record_suggestion_feedback
 from utils.auth import require_admin_token, require_machine_token
@@ -280,6 +282,9 @@ def bot_tick():
     runtime = round(time.time() - start, 3)
     diagnostics = {
         "main_blocker": diag.get("main_blocker"),
+        "blocker_stage": diag.get("blocker_stage"),
+        "blocker_code": diag.get("blocker_code"),
+        "blocker_detail": diag.get("blocker_detail"),
         "market_open": diag.get("market_open"),
         "tod_ok": diag.get("tod_ok"),
         "buy_window_open": diag.get("buy_window_open"),
@@ -330,6 +335,7 @@ def bot_tick():
         "display_buy_candidate_count": diag.get("display_buy_candidate_count", 0),
         "history_source_counts": diag.get("history_source_counts", {}),
         "history_missing_count": diag.get("history_missing_count", 0),
+        "top_missing_history_symbols": diag.get("top_missing_history_symbols", []),
         "history_fmp_fallback_count": diag.get("history_fmp_fallback_count", 0),
         "history_fmp_attempted_count": diag.get("history_fmp_attempted_count", 0),
         "history_fmp_skipped_count": diag.get("history_fmp_skipped_count", 0),
@@ -341,6 +347,10 @@ def bot_tick():
         "fmp_daily_rate_limited": diag.get("fmp_daily_rate_limited", False),
         "fmp_daily_cooldown_remaining_sec": diag.get("fmp_daily_cooldown_remaining_sec", 0),
         "fmp_daily_last_429_age_sec": diag.get("fmp_daily_last_429_age_sec"),
+        "finnhub_daily_global_circuit_status": diag.get("finnhub_daily_global_circuit_status"),
+        "finnhub_daily_forbidden": diag.get("finnhub_daily_forbidden", False),
+        "finnhub_daily_cooldown_remaining_sec": diag.get("finnhub_daily_cooldown_remaining_sec", 0),
+        "max_history_fetches_per_tick": diag.get("max_history_fetches_per_tick"),
         "api_circuit_breakers": diag.get("api_circuit_breakers", {}),
         "provider_health_status": diag.get("provider_health_status"),
         "rate_limit_recent": diag.get("rate_limit_recent", False),
@@ -380,6 +390,7 @@ def bot_tick():
         "max_runtime_seconds": BOT_TICK_MAX_RUNTIME_SEC,
         "history_source_counts": diag.get("history_source_counts", {}),
         "history_missing_count": diag.get("history_missing_count", 0),
+        "top_missing_history_symbols": diag.get("top_missing_history_symbols", []),
         "history_fmp_fallback_count": diag.get("history_fmp_fallback_count", 0),
         "history_fmp_attempted_count": diag.get("history_fmp_attempted_count", 0),
         "history_fmp_skipped_count": diag.get("history_fmp_skipped_count", 0),
@@ -391,6 +402,9 @@ def bot_tick():
         "fmp_daily_rate_limited": diag.get("fmp_daily_rate_limited", False),
         "fmp_daily_cooldown_remaining_sec": diag.get("fmp_daily_cooldown_remaining_sec", 0),
         "fmp_daily_last_429_age_sec": diag.get("fmp_daily_last_429_age_sec"),
+        "finnhub_daily_global_circuit_status": diag.get("finnhub_daily_global_circuit_status"),
+        "finnhub_daily_forbidden": diag.get("finnhub_daily_forbidden", False),
+        "finnhub_daily_cooldown_remaining_sec": diag.get("finnhub_daily_cooldown_remaining_sec", 0),
         "ticker_signal_debug": (diag.get("ticker_signal_debug") or [])[:PA_TICKERS_PER_BOT_RUN],
         "scan_warm_started": scan_warm_started,
         "scan_warm_error": scan_warm_error,
@@ -401,6 +415,75 @@ def bot_tick():
             "fmp_key_configured": bool(FMP_KEY),
         },
         "last_no_buy_diagnostics": diagnostics,
+    })
+
+
+def _warm_history_priority_symbols(limit):
+    limit = max(0, int(limit or 0))
+    if limit <= 0:
+        return []
+    symbols = []
+    try:
+        diag = (load_bot().get("last_no_buy_diagnostics") or {})
+    except Exception:
+        diag = {}
+    symbols.extend(diag.get("top_missing_history_symbols") or [])
+    for row in diag.get("top_buyable_rejects") or []:
+        if str((row or {}).get("rejection_reason") or "").upper() == "MISSING_HISTORY":
+            symbols.append((row or {}).get("ticker"))
+    for row in diag.get("top_rejected_candidates") or []:
+        code = str((row or {}).get("blocker_code") or (row or {}).get("blocker_detail") or "").upper()
+        if code == "MISSING_HISTORY":
+            symbols.append((row or {}).get("symbol") or (row or {}).get("ticker"))
+    symbols.extend(load_tickers()[:PA_TICKERS_PER_BOT_RUN])
+    out = []
+    for sym in symbols:
+        sym = str(sym or "").upper().strip()
+        if not re.match(r"^[A-Z][A-Z0-9.\-]{0,7}$", sym):
+            continue
+        if sym not in out:
+            out.append(sym)
+        if len(out) >= limit:
+            break
+    return out
+
+
+@app.route("/bot/warm-history", methods=["GET", "POST"])
+def bot_warm_history():
+    auth = require_machine_token()
+    if auth is not True:
+        return auth
+    cfg = DEFAULT_CONFIG.get("history", {})
+    max_symbols = int(cfg.get("warm_history_max_symbols_per_call", 3))
+    max_fetches = int(cfg.get("warm_history_max_fetches_per_call", 3))
+    raw_symbols = (request.values.get("symbols") or "").strip()
+    if raw_symbols:
+        requested = [
+            s.strip().upper()
+            for s in raw_symbols.split(",")
+            if re.match(r"^[A-Z][A-Z0-9.\-]{0,7}$", s.strip().upper())
+        ]
+    else:
+        requested = _warm_history_priority_symbols(max_symbols)
+    requested = list(dict.fromkeys(requested))
+    start = time.time()
+    result = warm_history(requested, max_symbols=max_symbols, max_fetches=max_fetches)
+    runtime = round(time.time() - start, 3)
+    return jsonify({
+        "ok": True,
+        "requested_symbols": result.get("requested_symbols", requested),
+        "attempted_symbols": result.get("attempted_symbols", []),
+        "warmed_symbols": result.get("warmed_symbols", []),
+        "skipped_symbols": result.get("skipped_symbols", []),
+        "failed_symbols": result.get("failed_symbols", []),
+        "cache_hit_symbols": result.get("cache_hit_symbols", []),
+        "provider_used_by_symbol": result.get("provider_used_by_symbol", {}),
+        "rows_by_symbol": result.get("rows_by_symbol", {}),
+        "errors_by_symbol": result.get("errors_by_symbol", {}),
+        "provider_circuits": result.get("provider_circuits", {}),
+        "runtime_seconds": runtime,
+        "max_symbols_per_call": max_symbols,
+        "max_fetches_per_call": max_fetches,
     })
 
 

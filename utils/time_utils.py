@@ -4,7 +4,7 @@ NYSE hours: 09:30-16:00 ET (half-days close 13:00 ET). is_market_open() handles
 DST automatically via zoneinfo, respects full + half-day holiday tables.
 Conservative fallback: if zoneinfo is unavailable, assume closed.
 """
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # NYSE holidays maintained manually (NYSE publishes annually)
 NYSE_HOLIDAYS_FULL = {
@@ -46,6 +46,44 @@ def is_market_open():
     return open_mins <= cur <= close_mins
 
 
+def is_trading_day(d):
+    return d.weekday() < 5 and d.strftime("%Y-%m-%d") not in NYSE_HOLIDAYS_FULL
+
+
+def previous_trading_day(d):
+    cur = d - timedelta(days=1)
+    while not is_trading_day(cur):
+        cur -= timedelta(days=1)
+    return cur
+
+
+def latest_completed_trading_day():
+    try:
+        from zoneinfo import ZoneInfo
+        et = datetime.now(ZoneInfo("America/New_York"))
+    except Exception:
+        return previous_trading_day(datetime.utcnow().date())
+    today = et.date()
+    close_mins = 13 * 60 if today.strftime("%Y-%m-%d") in NYSE_HOLIDAYS_HALF else 16 * 60
+    cur = et.hour * 60 + et.minute
+    if is_trading_day(today) and cur >= close_mins:
+        return today
+    return previous_trading_day(today)
+
+
+def completed_trading_days_since(d):
+    latest = latest_completed_trading_day()
+    if d is None or d >= latest:
+        return 0
+    cur = d + timedelta(days=1)
+    days = 0
+    while cur <= latest:
+        if is_trading_day(cur):
+            days += 1
+        cur += timedelta(days=1)
+    return days
+
+
 def in_new_buy_window():
     """#3 Round-5: True only inside the calmer mid-session window for NEW buys.
     Skips the volatile first 15 min (09:30-09:45) and last 30 min (15:30-16:00).
@@ -62,11 +100,11 @@ def in_new_buy_window():
     if date_str in NYSE_HOLIDAYS_FULL:
         return False
     cur = et.hour * 60 + et.minute
-    start = 9 * 60 + 45                                   # 09:45 ET
+    start = 9 * 60 + 30                                   # 09:30 ET
     if date_str in NYSE_HOLIDAYS_HALF:
-        end = 13 * 60 - 30                               # 12:30 ET (half-day close 13:00 − 30 min)
+        end = 13 * 60                                    # 13:00 ET half-day close
     else:
-        end = 16 * 60 - 30                               # 15:30 ET (close 16:00 − 30 min)
+        end = 16 * 60                                    # 16:00 ET close
     return start <= cur <= end
 
 

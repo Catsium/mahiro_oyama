@@ -24,6 +24,12 @@ SLIPPAGE_IMPACT_K  = 10.0
 
 # Flat per-trade commission — the ONLY live trading cost now.
 COMMISSION_PER_TRADE = 0.99
+KNIFE_CATALYST_TYPES = {
+    "earnings_miss",
+    "guidance_cut",
+    "regulatory_risk",
+    "lawsuit_investigation",
+}
 
 # Partial profit-taking (#2.4) — enabled Round-5
 PARTIAL_TAKE_ENABLED  = True
@@ -111,16 +117,16 @@ def confidence_scale(confidence):
     if c < 40:
         return 0.0
     if c < 45:
-        return 0.35
+        return 0.70
     if c < 50:
-        return 0.50
-    if c < 55:
-        return 0.65
-    if c < 65:
         return 0.85
-    if c < 70:
+    if c < 55:
         return 1.00
-    return 1.10
+    if c < 65:
+        return 1.10
+    if c < 70:
+        return 1.25
+    return 1.60
 
 
 def stop_distance_pct(ctx, regime_stop_pct):
@@ -183,6 +189,20 @@ def apply_size_mult(risk, mult, reason):
     if mult >= 1.0:
         return risk
     risk.setdefault("size_penalties", []).append(reason)
+    risk["risk_pct"] = round(risk["risk_pct"] * mult, 4)
+    risk["risk_dollars"] = round(risk["risk_dollars"] * mult, 2)
+    risk["target_notional"] = round(risk["target_notional"] * mult, 2)
+    risk["size_mult"] = round(float(risk.get("size_mult", 1.0)) * mult, 4)
+    return risk
+
+
+def apply_size_factor(risk, mult, reason):
+    """Apply a candidate sizing factor; paper confidence buckets may exceed 1.0."""
+    mult = _clamp(float(mult or 1.0), 0.0, 2.0)
+    if mult == 1.0:
+        return risk
+    if reason:
+        risk.setdefault("size_penalties", []).append(reason)
     risk["risk_pct"] = round(risk["risk_pct"] * mult, 4)
     risk["risk_dollars"] = round(risk["risk_dollars"] * mult, 2)
     risk["target_notional"] = round(risk["target_notional"] * mult, 2)
@@ -342,12 +362,13 @@ def build_edge_diagnostics(edge, rec, friction, attr_edge=None):
 
 
 def rank_reason_code_for(*, risk_sized, gross, required_edge, net,
-                         min_net_edge, warmup_watchlist, ev_pass):
+                         min_net_edge, warmup_watchlist, ev_pass,
+                         require_net_positive=False):
     if not risk_sized:
         return "FINAL_SIZE_TOO_SMALL"
     if gross <= required_edge:
         return "EDGE_TOO_LOW"
-    if net < min_net_edge:
+    if net < min_net_edge or (require_net_positive and net <= 0):
         return "NET_EDGE_TOO_LOW_AFTER_COSTS"
     if warmup_watchlist:
         return "WARMUP_CONFIDENCE_PRIOR_ALLOWED"
@@ -391,11 +412,81 @@ def evaluate_candidate(candidate, total_equity, regime_stop_pct, regime_kind,
     risk = risk_target_notional(total_equity, ctx, regime_stop_pct, regime_kind,
                                 vix_mult, streak_mult, kelly_mult,
                                 size_confidence, source, config=cfg)
+    candidate_size_mult = float(candidate.get("candidate_size_multiplier", 1.0) or 1.0)
+    if candidate_size_mult != 1.0:
+        risk["pre_candidate_size_target_notional"] = risk.get("target_notional")
+        apply_size_factor(
+            risk,
+            candidate_size_mult,
+            candidate.get("candidate_type") or "candidate_size_multiplier",
+        )
     warnings = []
+    catalyst_cfg = cfg.get("catalyst", {}) if isinstance(cfg, dict) else DEFAULT_CONFIG.get("catalyst", {})
+    avg_dvol = float(ctx.get("avg_dollar_vol_20d", 0) or 0)
+    if 0 < avg_dvol < float(signal_cfg.get("low_avg_dollar_volume_warning", 1_000_000)):
+        warnings.append("LOW_AVG_DOLLAR_VOLUME_WARNING")
     vol_ratio = float(ctx.get("vol_ratio", 1.0) or 1.0)
-    if not bool(ctx.get("is_dip")) and 0.70 <= vol_ratio < 1.20:
-        warnings.append("LOW_VOLUME_PENALTY_ONLY")
-        apply_size_mult(risk, 0.75, "LOW_VOLUME_PENALTY_ONLY")
+    if not bool(ctx.get("is_dip")):
+        very_low_ratio = float(signal_cfg.get("very_low_volume_ratio_size_penalty", 0.30))
+        low_ratio = float(signal_cfg.get("low_volume_warning_ratio", 0.70))
+        if 0 < vol_ratio < very_low_ratio:
+            warnings.append("VERY_LOW_VOLUME_SIZE_PENALTY")
+            apply_size_mult(
+                risk,
+                float(signal_cfg.get("very_low_volume_size_multiplier", 0.75)),
+                "VERY_LOW_VOLUME_SIZE_PENALTY",
+            )
+        elif vol_ratio < low_ratio:
+            warnings.append("LOW_VOLUME_PENALTY_ONLY")
+            apply_size_mult(
+                risk,
+                float(signal_cfg.get("low_volume_size_multiplier", 0.90)),
+                "LOW_VOLUME_PENALTY_ONLY",
+            )
+    atr_pct = float(ctx.get("atr_pct", 0) or 0)
+    if atr_pct > float(signal_cfg.get("high_atr_warning_pct", 10.0)):
+        hard_atr = float(signal_cfg.get("extreme_atr_hard_block_pct", 20.0))
+        if atr_pct > hard_atr:
+            warnings.append("EXTREME_ATR_SIZE_PENALTY")
+            apply_size_mult(
+                risk,
+                float(signal_cfg.get("extreme_atr_size_multiplier", 0.65)),
+                "EXTREME_ATR_SIZE_PENALTY",
+            )
+        else:
+            warnings.append("HIGH_ATR_SIZE_PENALTY")
+            apply_size_mult(
+                risk,
+                float(signal_cfg.get("high_atr_size_multiplier", 0.85)),
+                "HIGH_ATR_SIZE_PENALTY",
+            )
+    earnings_risk = (candidate.get("earn") or rec.get("earnings_risk") or {})
+    if earnings_risk and earnings_risk.get("soon"):
+        days = earnings_risk.get("days_until")
+        try:
+            days = int(days)
+        except Exception:
+            days = None
+        if days is not None and days <= 1:
+            mult_key = "earnings_same_day_size_multiplier" if days <= 0 else "earnings_tomorrow_size_multiplier"
+            warnings.append("EARNINGS_RISK_SIZE_PENALTY")
+            apply_size_mult(
+                risk,
+                float(catalyst_cfg.get(mult_key, 0.90)),
+                "EARNINGS_RISK_SIZE_PENALTY",
+            )
+        elif days is not None and days <= 3:
+            warnings.append("EARNINGS_RISK_WARNING")
+    catalyst = rec.get("catalyst") or {}
+    catalyst_type = catalyst.get("type")
+    week_chg = float(ctx.get("week_chg_pct", 0) or 0)
+    if catalyst_type in KNIFE_CATALYST_TYPES and week_chg > float(catalyst_cfg.get("negative_catalyst_falling_threshold_pct", -5.0)):
+        warnings.append("NEGATIVE_CATALYST_SIZE_PENALTY")
+        apply_size_mult(
+            risk,
+            float(catalyst_cfg.get("negative_catalyst_size_multiplier", 0.90)),
+            "NEGATIVE_CATALYST_SIZE_PENALTY",
+        )
     regime_mult = float(candidate.get("regime_risk_mult", 1.0) or 1.0)
     cluster_mult = float(candidate.get("cluster_regime_mult", 1.0) or 1.0)
     combined_regime_mult = max(0.0, min(1.25, regime_mult * cluster_mult))
@@ -449,17 +540,48 @@ def evaluate_candidate(candidate, total_equity, regime_stop_pct, regime_kind,
         edge.get("required_edge_pct", friction["total_pct"]),
         float(signal_cfg.get("min_expected_edge_pct", 0.0) or 0.0),
     )
-    min_net_edge = float(signal_cfg.get("min_net_edge_pct", -999.0) or -999.0)
+    min_net_edge = float(signal_cfg.get("min_net_edge_pct", -999.0))
+    require_net_positive = bool(signal_cfg.get("require_net_edge_positive", False))
     risk_sized = risk["target_notional"] >= min_position_usd
-    ev_pass = gross > required_edge and net >= min_net_edge
+    ev_pass = gross > required_edge and net >= min_net_edge and (not require_net_positive or net > 0)
+    expected_net_profit_usd = max(risk["target_notional"], 0.0) * net / 100.0
+    edge_to_required_ratio = (
+        gross / required_edge
+        if required_edge and required_edge > 0
+        else (1.0 if gross > 0 else 0.0)
+    )
+    quote_execution_trusted = bool(candidate.get("execution_trusted", True))
+    relaxed_ev_enabled = bool(signal_cfg.get("paper_ev_relaxation_enabled", False))
+    display_signal = rec.get("display_signal_label")
+    candidate_type = candidate.get("candidate_type") or rec.get("candidate_type")
+    if display_signal == "STRONG_BUY_CANDIDATE":
+        min_expected_net_profit = float(signal_cfg.get("strong_buy_min_expected_net_profit_usd", 0.10))
+    elif display_signal == "BUY_CANDIDATE":
+        min_expected_net_profit = float(signal_cfg.get("buy_candidate_min_expected_net_profit_usd", 0.25))
+    elif display_signal == "BULLISH_LEAN" or candidate_type == "weak_paper_test_candidate":
+        min_expected_net_profit = float(signal_cfg.get("bullish_lean_min_expected_net_profit_usd", 0.50))
+    elif display_signal == "HOLD" or candidate_type == "experimental_near_buy_candidate":
+        min_expected_net_profit = float(signal_cfg.get("high_confidence_hold_min_expected_net_profit_usd", 0.75))
+    else:
+        min_expected_net_profit = float(signal_cfg.get(
+            "default_min_expected_net_profit_usd",
+            signal_cfg.get("min_expected_net_profit_usd", 0.25),
+        ))
+    relaxed_ev_pass = bool(
+        relaxed_ev_enabled
+        and risk_sized
+        and quote_execution_trusted
+        and expected_net_profit_usd >= min_expected_net_profit
+        and net > 0
+    )
     warmup_watchlist = (
         source == "watchlist"
         and edge.get("edge_source") == "confidence_prior"
         and rec.get("cls") in ("buy", "strong-buy")
         and rec.get("confidence", 0) >= float(signal_cfg.get("min_buy_confidence", 40))
-        and net >= 0
+        and net > 0
     )
-    tradable = risk_sized and (ev_pass or warmup_watchlist)
+    tradable = risk_sized and (ev_pass or relaxed_ev_pass or warmup_watchlist)
     rank_reason_code = rank_reason_code_for(
         risk_sized=risk_sized,
         gross=gross,
@@ -467,19 +589,24 @@ def evaluate_candidate(candidate, total_equity, regime_stop_pct, regime_kind,
         net=net,
         min_net_edge=min_net_edge,
         warmup_watchlist=warmup_watchlist,
-        ev_pass=ev_pass,
+        ev_pass=ev_pass or relaxed_ev_pass,
+        require_net_positive=require_net_positive,
     )
     if not risk_sized:
         reason = (f"Risk budget target ${risk['target_notional']:.0f} below "
                   f"${float(min_position_usd):.0f} floor")
     elif ev_pass:
         reason = "EV/risk pass"
+    elif relaxed_ev_pass:
+        reason = "relaxed paper EV pass"
     elif warmup_watchlist:
         reason = "warm-up confidence prior allowed"
     elif gross <= required_edge:
         reason = (f"EV gate: edge {gross:.2f}% <= friction "
                   f"{friction['total_pct']:.2f}%"
                   + (f" / required {required_edge:.2f}%" if required_edge != friction["total_pct"] else ""))
+    elif require_net_positive and net <= 0:
+        reason = f"EV gate: net edge {net:.2f}% must be positive"
     elif net < min_net_edge:
         reason = f"EV gate: net edge {net:.2f}% < min {min_net_edge:.2f}%"
     else:
@@ -498,12 +625,24 @@ def evaluate_candidate(candidate, total_equity, regime_stop_pct, regime_kind,
         "net_edge_pct": round(net, 4),
         "min_expected_edge_pct": float(signal_cfg.get("min_expected_edge_pct", 0.40)),
         "min_net_edge_pct": min_net_edge,
+        "require_net_edge_positive": require_net_positive,
+        "paper_ev_relaxation_enabled": relaxed_ev_enabled,
+        "expected_net_profit_usd": round(expected_net_profit_usd, 4),
+        "min_expected_net_profit_usd": min_expected_net_profit,
+        "min_required_expected_net_profit_usd": min_expected_net_profit,
+        "edge_to_required_ratio": round(edge_to_required_ratio, 6),
         "edge_gap_to_required_pct": round(gross - required_edge, 4),
         "net_gap_to_min_pct": round(net - min_net_edge, 4),
         "ev_score": round(ev_score, 6),
         "stop_distance_pct": stop_pct,
         "risk_sized": bool(risk_sized),
         "ev_pass": bool(ev_pass),
+        "relaxed_ev_pass": bool(relaxed_ev_pass),
+        "ev_gate_passed": bool(ev_pass or relaxed_ev_pass),
+        "ev_blocker_code": None if (ev_pass or relaxed_ev_pass) else (
+            "EDGE_TOO_LOW" if gross <= required_edge else "NET_EDGE_TOO_LOW_AFTER_COSTS"
+        ),
+        "quote_execution_trusted": quote_execution_trusted,
         "warmup_watchlist": bool(warmup_watchlist),
         "tradable": bool(tradable),
         "rank_reason": reason,
@@ -531,6 +670,8 @@ def evaluate_candidate(candidate, total_equity, regime_stop_pct, regime_kind,
         "edge_horizon": edge["edge_horizon"],
         "required_edge_pct": round(required_edge, 4),
         "sizing_confidence": size_confidence,
+        "candidate_type": candidate.get("candidate_type"),
+        "candidate_size_multiplier": candidate_size_mult,
         "warnings": warnings,
     })
     return out

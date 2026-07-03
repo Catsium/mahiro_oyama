@@ -152,7 +152,7 @@ def get_vix():
                     r["data_health_warnings"] = warnings
                 r["vix_display"] = "SPY_REALIZED_VOL_PROXY"
                 if   rv > 28: r["regime"] = "PANIC";     r["mult"] = 0.0
-                elif rv > 18: r["regime"] = "HIGH_RISK"; r["mult"] = 0.5
+                elif rv > 18: r["regime"] = "HIGH_RISK"; r["mult"] = 0.75
                 else:         r["regime"] = "NORMAL";    r["mult"] = 1.0
             else:
                 r["data_status"] = "insufficient_spy_returns"

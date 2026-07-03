@@ -116,16 +116,22 @@ def get_recommendation(sent, ctx, regime=None, earnings=None, analyst=None, insi
     """
     cfg = config or DEFAULT_CONFIG
     signal_cfg = cfg.get("signal", {})
-    # Earnings hold — binary risk, override everything
+    catalyst_cfg = cfg.get("catalyst", {})
+    earnings_risk = None
     if earnings and earnings.get("soon"):
-        return _with_confidence_metadata({"signal": "HOLD", "cls": "hold", "confidence": 55,
-                "score": 0, "max_score": 1, "categories": {},
-                "cats_pos": 0, "cats_neg": 0,
-                "reasons": [f"⚠️ Earnings within 5 days ({earnings.get('date', 'soon')}) — binary event risk, holding"],
-                "data_quality": 1.0, "force_hold": True, "is_dip": False,
-                "data_quality_actual_n": 0, "data_quality_expected_n": 0,
-                "data_quality_missing_fields": [], "penalty": 0,
-                "penalty_notes": [], "thresholds": {}})
+        days_until = None
+        try:
+            ed = datetime.strptime(str(earnings.get("date")), "%Y-%m-%d").date()
+            days_until = (ed - datetime.now().date()).days
+        except Exception:
+            pass
+        earnings_risk = {
+            "soon": True,
+            "date": earnings.get("date"),
+            "days_until": days_until,
+            "policy": "warning_and_mild_size_penalty" if days_until is None or days_until <= 1 else "warning_only",
+            "hard_block_enabled": bool(catalyst_cfg.get("earnings_hard_block_enabled", False)),
+        }
 
     # `weights` lets the backtest pass frozen/trained weights (or {} for defaults)
     # without touching the live bot_state.json; live callers leave it None.
@@ -166,6 +172,10 @@ def get_recommendation(sent, ctx, regime=None, earnings=None, analyst=None, insi
         analyst = None; insider = None
 
     reasons = []
+    if earnings_risk:
+        reasons.append(
+            f"Earnings risk {earnings_risk.get('date') or 'soon'} - warning only for paper testing"
+        )
     cat_signals = {"trend": [], "momentum": [], "volume": [], "dip": [],
                    "news": [], "analyst": [], "insider": [],
                    "rel_str": [], "regime": []}
@@ -506,21 +516,14 @@ def get_recommendation(sent, ctx, regime=None, earnings=None, analyst=None, insi
         if ctx:
             adv = ctx.get("avg_dollar_vol_20d", 0) or 0
             atr = ctx.get("atr_pct", 0) or 0
-            if 0 < adv < 5_000_000:
-                penalty += 10
-                penalty_notes.append(f"low liquidity ADV ${adv/1e6:.1f}M −10")
-                confidence_penalties.append("low_liquidity")
-            # ATR penalty absorbs the old `vol_adj` size multiplier (removed from the
-            # sizing stack): high-ATR names now lose confidence → lose size via weight,
-            # instead of being cut by a separate independent multiplier.
-            if atr > 6:
-                penalty += 12
-                penalty_notes.append(f"high ATR {atr:.1f}% −12")
-                confidence_penalties.append("high_atr")
-            elif atr > 3.5:
-                penalty += 6
-                penalty_notes.append(f"elevated ATR {atr:.1f}% −6")
-                confidence_penalties.append("elevated_atr")
+            low_adv_warning = float(signal_cfg.get("low_avg_dollar_volume_warning", 1_000_000))
+            high_atr_warning = float(signal_cfg.get("high_atr_warning_pct", 10.0))
+            if 0 < adv < low_adv_warning:
+                penalty_notes.append(f"low liquidity ADV ${adv/1e6:.1f}M warning")
+                confidence_penalties.append("low_liquidity_warning")
+            if atr > high_atr_warning:
+                penalty_notes.append(f"high ATR {atr:.1f}% warning")
+                confidence_penalties.append("high_atr_warning")
             # Higher-timeframe conflict: daily bullish but weekly bearish
             if tot > 0 and ctx.get("weekly_trend_up") is False:
                 penalty += 15
@@ -586,6 +589,7 @@ def get_recommendation(sent, ctx, regime=None, earnings=None, analyst=None, insi
             else (floor_blockers[0] if floor_blockers else None)
         ),
         "confidence_floor_blockers": floor_blockers,
+        "earnings_risk": earnings_risk or {},
         "confidence_penalties": confidence_penalties,
         "thresholds": {"regime": rk, "strong_buy_tot": sb_t, "buy_tot": b_t,
                        "strong_buy_cats": sb_c, "buy_cats": b_c,

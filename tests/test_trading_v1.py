@@ -231,7 +231,7 @@ class TradingV1SizingTests(unittest.TestCase):
         self.assertEqual(diag["components_sum_check_pct"], diag["total_pct"])
 
     def test_ev_diagnostics_are_observational_and_canonical(self):
-        cfg = merge_config(DEFAULT_CONFIG, {
+        cfg = merge_config({
             "signal": {
                 "min_expected_edge_pct": 0.40,
                 "min_net_edge_pct": 0.20,
@@ -258,6 +258,54 @@ class TradingV1SizingTests(unittest.TestCase):
         self.assertIn("friction_diagnostics", cand)
         self.assertGreater(cand["friction_diagnostics"]["total_pct"], cand["gross_edge_pct"])
 
+    def test_relaxed_paper_ev_is_alternative_pass_path(self):
+        cfg = merge_config({
+            "signal": {
+                "min_expected_edge_pct": 0.40,
+                "min_net_edge_pct": 1.00,
+                "paper_ev_relaxation_enabled": True,
+                "default_min_expected_net_profit_usd": 1.00,
+            }
+        })
+        cand = evaluate_candidate(
+            self._candidate("RELAX", 80, "trend", score=8),
+            total_equity=10_000,
+            regime_stop_pct=-6,
+            regime_kind="neutral",
+            vix_mult=1,
+            streak_mult=1,
+            kelly_mult=1,
+            edge_stats={"neutral:trend": {"5d": {"n": 10, "avg_return_pct": 1.0}}},
+            min_position_usd=100,
+            config=cfg,
+        )
+        ev = cand["ev_diagnostics"]
+        self.assertFalse(ev["ev_pass"])
+        self.assertTrue(ev["relaxed_ev_pass"])
+        self.assertTrue(ev["ev_gate_passed"])
+        self.assertTrue(cand["tradable"])
+        self.assertGreaterEqual(ev["expected_net_profit_usd"], 1.00)
+        self.assertGreater(ev["net_edge_pct"], 0)
+        self.assertIn("edge_to_required_ratio", ev)
+        self.assertNotIn("reward_to_risk", ev)
+
+        untrusted = dict(self._candidate("NOQUOTE", 80, "trend", score=8))
+        untrusted["execution_trusted"] = False
+        blocked = evaluate_candidate(
+            untrusted,
+            total_equity=10_000,
+            regime_stop_pct=-6,
+            regime_kind="neutral",
+            vix_mult=1,
+            streak_mult=1,
+            kelly_mult=1,
+            edge_stats={"neutral:trend": {"5d": {"n": 10, "avg_return_pct": 1.0}}},
+            min_position_usd=100,
+            config=cfg,
+        )
+        self.assertFalse(blocked["ev_diagnostics"]["relaxed_ev_pass"])
+        self.assertFalse(blocked["tradable"])
+
     def test_amzn_style_weak_edge_after_friction_stays_blocked(self):
         candidate = self._candidate("AMZN", 40, "trend", score=2)
         candidate["ctx"]["vol_ratio"] = 1.2
@@ -272,10 +320,10 @@ class TradingV1SizingTests(unittest.TestCase):
             edge_stats={"neutral:trend": {"5d": {"n": 8, "avg_return_pct": 0.08}}},
             min_position_usd=100,
         )
-        self.assertEqual(cand["risk"]["target_notional"], 252.0)
+        self.assertEqual(cand["risk"]["target_notional"], 504.0)
         self.assertEqual(cand["gross_edge_pct"], 0.08)
-        self.assertAlmostEqual(cand["friction"]["total_pct"], 0.92, places=2)
-        self.assertAlmostEqual(cand["net_edge_pct"], -0.84, places=2)
+        self.assertAlmostEqual(cand["friction"]["total_pct"], 0.53, places=2)
+        self.assertAlmostEqual(cand["net_edge_pct"], -0.45, places=2)
         self.assertFalse(cand["tradable"])
         self.assertEqual(cand["rank_reason_code"], "EDGE_TOO_LOW")
 
@@ -315,16 +363,23 @@ class TradingV1SizingTests(unittest.TestCase):
         kelly = DEFAULT_CONFIG["kelly"]
         signal = DEFAULT_CONFIG["signal"]
         modes = DEFAULT_CONFIG["market_data_modes"]
+        scan = DEFAULT_CONFIG["scan"]
         self.assertEqual(signal["min_buy_confidence"], 40)
-        self.assertEqual(risk["min_trade_size"], 100.0)
-        self.assertEqual(risk["max_new_buys_per_tick"], 1)
-        self.assertEqual(risk["max_new_buys_per_day"], 2)
-        self.assertEqual(risk["max_positions"], 8)
-        self.assertEqual(risk["max_position_pct"], 0.08)
-        self.assertEqual(risk["max_gross_exposure_pct"], 0.70)
-        self.assertEqual(risk["min_cash_reserve_pct"], 0.30)
-        self.assertEqual(risk["daily_loss_limit_pct"], -0.02)
-        self.assertEqual(risk["hard_drawdown_lockout_pct"], -0.10)
+        self.assertEqual(risk["min_trade_size"], 10.0)
+        self.assertEqual(risk["max_new_buys_per_tick"], 10)
+        self.assertEqual(risk["max_new_buys_per_day"], 30)
+        self.assertEqual(risk["max_positions"], 24)
+        self.assertEqual(risk["max_position_pct"], 0.35)
+        self.assertEqual(risk["max_sector_pct"], 1.00)
+        self.assertEqual(risk["max_corr_group_pct"], 1.00)
+        self.assertEqual(risk["max_gross_exposure_pct"], 1.00)
+        self.assertEqual(risk["min_cash_reserve_pct"], 0.00)
+        self.assertEqual(risk["daily_loss_warning_pct"], -0.10)
+        self.assertEqual(risk["daily_loss_hard_lockout_pct"], -0.15)
+        self.assertEqual(risk["daily_loss_limit_pct"], -0.15)
+        self.assertEqual(risk["drawdown_warning_pct"], -0.20)
+        self.assertEqual(risk["drawdown_hard_lockout_pct"], -0.35)
+        self.assertEqual(risk["hard_drawdown_lockout_pct"], -0.35)
         self.assertFalse(kelly["enabled"])
         self.assertEqual(kelly["min_samples"], 100)
         self.assertEqual(kelly["max_mult"], 1.0)
@@ -332,8 +387,13 @@ class TradingV1SizingTests(unittest.TestCase):
         self.assertEqual(modes["degraded_size_mult"], 0.90)
         self.assertTrue(modes["degraded_use_standard_gates_for_testing"])
         self.assertEqual(modes["degraded_min_confidence"], 40)
-        self.assertEqual(modes["degraded_max_new_buys_per_tick"], 1)
-        self.assertEqual(modes["degraded_max_new_buys_per_day"], 1)
+        self.assertEqual(modes["degraded_max_new_buys_per_tick"], 10)
+        self.assertEqual(modes["degraded_max_new_buys_per_day"], 30)
+        self.assertTrue(scan["scan_buys_enabled"])
+        self.assertEqual(scan["scan_buy_min_confidence"], 45)
+        self.assertEqual(scan["scan_data_max_age_sec"], 300)
+        self.assertEqual(scan["max_scan_buys_per_tick"], 10)
+        self.assertEqual(scan["max_scan_buys_per_day"], 30)
         self.assertEqual(modes["degraded_max_position_pct"], 0.05)
         self.assertEqual(modes["degraded_max_gross_exposure_pct"], 0.35)
         self.assertTrue(modes["degraded_require_buy_candidate"])
@@ -345,7 +405,7 @@ class TradingV1SizingTests(unittest.TestCase):
         self.assertFalse(modes["degraded_block_low_volume_penalty"])
         self.assertFalse(modes["degraded_block_pyramiding"])
 
-    def test_degraded_mode_uses_standard_gates_by_default(self):
+    def test_missing_spy_is_neutral_warning_not_degraded(self):
         import trading.bot as bot
 
         mode = bot._market_data_mode(
@@ -354,44 +414,44 @@ class TradingV1SizingTests(unittest.TestCase):
              "volatility_source": "spy_realized_vol_proxy"},
             DEFAULT_CONFIG,
         )
-        self.assertEqual(mode["trading_mode"], "DEGRADED_MODE")
-        self.assertTrue(mode["degraded_mode_active"])
-        self.assertTrue(mode["degraded_standard_gates_active"])
-        self.assertEqual(mode["degraded_gate_policy"], "standard_gates_for_testing")
+        self.assertEqual(mode["trading_mode"], "NORMAL_MODE")
+        self.assertFalse(mode["degraded_mode_active"])
+        self.assertFalse(mode["degraded_standard_gates_active"])
+        self.assertIsNone(mode["degraded_gate_policy"])
         self.assertEqual(mode["mode_size_mult"], 1.0)
         self.assertIsNone(mode["mode_size_reason"])
         self.assertEqual(mode["effective_min_buy_confidence"], 40)
         self.assertTrue(mode["normal_ev_gates_required"])
         self.assertTrue(mode["normal_risk_caps_required"])
         self.assertTrue(mode["fresh_quote_required"])
+        self.assertEqual(mode["data_health_blocks"], [])
+        self.assertEqual(mode["data_health_warnings"], ["SPY_DATA_MISSING"])
 
-    def test_degraded_mode_restricted_profile_is_available_when_flag_disabled(self):
+    def test_missing_volatility_is_neutral_warning_not_degraded(self):
         import trading.bot as bot
 
-        cfg = merge_config({
-            "market_data_modes": {"degraded_use_standard_gates_for_testing": False}
-        })
         mode = bot._market_data_mode(
-            {"spy_data_ok": False},
-            {"data_ok": True, "source": "spy_realized_vol_proxy",
-             "volatility_source": "spy_realized_vol_proxy"},
-            cfg,
+            {"spy_data_ok": True},
+            {"data_ok": False, "source": None, "volatility_source": None},
+            DEFAULT_CONFIG,
         )
-        self.assertEqual(mode["trading_mode"], "DEGRADED_MODE")
+        self.assertEqual(mode["trading_mode"], "NORMAL_MODE")
+        self.assertFalse(mode["degraded_mode_active"])
         self.assertFalse(mode["degraded_standard_gates_active"])
-        self.assertEqual(mode["degraded_gate_policy"], "restricted_degraded_gates")
-        self.assertEqual(mode["mode_size_mult"], 0.90)
-        self.assertEqual(mode["mode_size_reason"], "DEGRADED_MODE")
+        self.assertEqual(mode["mode_size_mult"], 1.0)
+        self.assertIsNone(mode["mode_size_reason"])
+        self.assertEqual(mode["data_health_blocks"], [])
+        self.assertEqual(mode["data_health_warnings"], ["VOLATILITY_DATA_MISSING"])
 
     def test_confidence_scale_uses_40_percent_entry_buckets(self):
         self.assertEqual(confidence_scale(39), 0.0)
-        self.assertEqual(confidence_scale(40), 0.35)
-        self.assertEqual(confidence_scale(44), 0.35)
-        self.assertEqual(confidence_scale(45), 0.50)
-        self.assertEqual(confidence_scale(50), 0.65)
-        self.assertEqual(confidence_scale(55), 0.85)
-        self.assertEqual(confidence_scale(65), 1.00)
-        self.assertEqual(confidence_scale(70), 1.10)
+        self.assertEqual(confidence_scale(40), 0.70)
+        self.assertEqual(confidence_scale(44), 0.70)
+        self.assertEqual(confidence_scale(45), 0.85)
+        self.assertEqual(confidence_scale(50), 1.00)
+        self.assertEqual(confidence_scale(55), 1.10)
+        self.assertEqual(confidence_scale(65), 1.25)
+        self.assertEqual(confidence_scale(70), 1.60)
 
     def test_scan_source_gets_smaller_risk_budget(self):
         base = self._candidate("BASE", 75, "trend")
@@ -407,7 +467,7 @@ class TradingV1SizingTests(unittest.TestCase):
         hi = self._candidate("HI", 80, "trend")
         lo = self._candidate("LO", 80, "trend")
         hi["ctx"]["vol_ratio"] = 1.5
-        lo["ctx"]["vol_ratio"] = 1.0
+        lo["ctx"]["vol_ratio"] = 0.5
         hi_eval = evaluate_candidate(hi, 10_000, -6, "neutral", 1, 1, 1, {},
                                      min_position_usd=100)
         lo_eval = evaluate_candidate(lo, 10_000, -6, "neutral", 1, 1, 1, {},
@@ -430,15 +490,15 @@ class TradingV1SizingTests(unittest.TestCase):
         import trading.bot as bot
 
         cfg = DEFAULT_CONFIG
-        self.assertFalse(bot.is_execution_candidate({
+        self.assertTrue(bot.is_execution_candidate({
             "cls": "hold", "signal": "HOLD",
             "display_signal_label": "BUY_CANDIDATE", "confidence": 80,
         }, cfg))
-        self.assertFalse(bot.is_execution_candidate({
+        self.assertTrue(bot.is_execution_candidate({
             "cls": "hold", "signal": "HOLD",
             "display_signal_label": "HOLD", "confidence": 64,
         }, cfg))
-        self.assertFalse(bot.is_execution_candidate({
+        self.assertTrue(bot.is_execution_candidate({
             "cls": "hold", "signal": "HOLD",
             "display_signal_label": "HOLD", "confidence": 74,
         }, cfg))
@@ -446,18 +506,38 @@ class TradingV1SizingTests(unittest.TestCase):
             "cls": "sell", "signal": "SELL",
             "display_signal_label": "SELL", "confidence": 50,
         }, cfg))
-        self.assertFalse(bot.is_execution_candidate({
+        self.assertTrue(bot.is_execution_candidate({
+            "cls": "buy", "signal": "BUY",
+            "display_signal_label": "BUY_CANDIDATE", "confidence": 70,
+            "catalyst": {"type": "guidance_cut"},
+        }, cfg))
+        self.assertTrue(bot.is_execution_candidate({
             "cls": "buy", "signal": "BUY",
             "display_signal_label": "BULLISH_LEAN", "confidence": 39,
         }, cfg))
-        self.assertFalse(bot.is_execution_candidate({
+        self.assertTrue(bot.is_execution_candidate({
             "cls": "buy", "signal": "BUY",
             "display_signal_label": "WATCH_OR_LEAN", "confidence": 54,
         }, cfg))
-        self.assertFalse(bot.is_execution_candidate({
+        self.assertTrue(bot.is_execution_candidate({
             "cls": "buy", "signal": "BUY",
             "display_signal_label": "BUY_CANDIDATE", "confidence": 39,
         }, cfg))
+        self.assertFalse(bot.is_execution_candidate({
+            "cls": "hold", "signal": "HOLD",
+            "display_signal_label": "HOLD", "confidence": 54,
+        }, cfg))
+        weak = {"cls": "buy", "signal": "BUY",
+                "display_signal_label": "BULLISH_LEAN", "confidence": 39}
+        weak_profile = bot._execution_profile(weak, cfg)
+        self.assertEqual(weak_profile["candidate_type"], "weak_paper_test_candidate")
+        self.assertEqual(weak_profile["candidate_size_multiplier"], 0.85)
+        hold_profile = bot._execution_profile({
+            "cls": "hold", "signal": "HOLD",
+            "display_signal_label": "HOLD", "confidence": 55,
+        }, cfg)
+        self.assertEqual(hold_profile["candidate_type"], "experimental_near_buy_candidate")
+        self.assertEqual(hold_profile["candidate_size_multiplier"], 0.65)
         self.assertTrue(bot.is_execution_candidate({
             "cls": "buy", "signal": "BUY",
             "display_signal_label": "BUY_CANDIDATE", "confidence": 40,
@@ -1219,10 +1299,11 @@ class TradingV1SignalTests(unittest.TestCase):
 
         self.assertEqual(rec["confidence_final"], 20)
         self.assertFalse(rec["confidence_floor_applied"])
-        self.assertEqual(rec["confidence_floor_reason"], "low_data_quality")
-        self.assertIn("low_data_quality", rec["confidence_floor_blockers"])
+        self.assertIsNone(rec.get("confidence_floor_reason"))
+        self.assertNotIn("low_data_quality", rec["confidence_floor_blockers"])
         self.assertEqual(rec["display_signal_label"], "BULLISH_LEAN")
-        self.assertFalse(bot.is_execution_candidate(rec, DEFAULT_CONFIG))
+        self.assertTrue(bot.is_execution_candidate(rec, DEFAULT_CONFIG))
+        self.assertEqual(rec["candidate_type"], "weak_paper_test_candidate")
 
     def test_raw_buy_stale_quote_blocks_floor(self):
         import trading.bot as bot
@@ -1234,6 +1315,33 @@ class TradingV1SignalTests(unittest.TestCase):
         self.assertFalse(rec["confidence_floor_applied"])
         self.assertEqual(rec["confidence_floor_reason"], "stale_quote")
         self.assertEqual(rec["display_signal_label"], "BULLISH_LEAN")
+
+    def test_cached_quote_within_execution_window_allows_floor(self):
+        import trading.bot as bot
+
+        payload = self._raw_buy_payload(quote_stale=True)
+        payload["quote"]["cache_used"] = True
+        payload["quote"]["quote_age_seconds"] = 120
+        payload["quote"]["execution_trusted"] = True
+        rec = bot._finalize_signal_confidence(payload, DEFAULT_CONFIG)
+
+        self.assertEqual(rec["confidence"], 40)
+        self.assertTrue(rec["confidence_floor_applied"])
+        self.assertEqual(rec["confidence_floor_reason"], "valid_raw_buy_floor")
+        self.assertFalse(payload["stale"])
+        self.assertTrue(payload["execution_trusted"])
+
+    def test_cached_quote_beyond_execution_window_blocks_floor(self):
+        import trading.bot as bot
+
+        payload = self._raw_buy_payload(quote_stale=True)
+        payload["quote"]["cache_used"] = True
+        payload["quote"]["quote_age_seconds"] = 301
+        rec = bot._finalize_signal_confidence(payload, DEFAULT_CONFIG)
+
+        self.assertEqual(rec["confidence_final"], 20)
+        self.assertFalse(rec["confidence_floor_applied"])
+        self.assertEqual(rec["confidence_floor_reason"], "stale_quote")
 
     def test_raw_buy_floor_is_idempotent_for_cached_scan_payload(self):
         import trading.bot as bot
@@ -1259,6 +1367,7 @@ class TradingV1SignalTests(unittest.TestCase):
             history_source="stale_cache:fmp_daily",
             history_status="stale_cache",
         )
+        payload["ctx"]["history_last_date"] = "2020-01-01"
         rec = bot._finalize_signal_confidence(payload, DEFAULT_CONFIG)
 
         self.assertEqual(rec["confidence_final"], 20)
@@ -1266,24 +1375,56 @@ class TradingV1SignalTests(unittest.TestCase):
         self.assertEqual(rec["confidence_floor_reason"], "stale_history")
         self.assertEqual(rec["display_signal_label"], "BULLISH_LEAN")
 
-    def test_earnings_hold_has_confidence_diagnostics(self):
+    def test_recent_stale_history_and_25_rows_are_allowed_with_warning(self):
+        import trading.bot as bot
+
+        payload = self._raw_buy_payload(
+            history_source="stale_cache:fmp_daily",
+            history_status="stale_cache",
+            history_rows=25,
+        )
+        payload["ctx"]["history_last_date"] = str(bot._latest_completed_trading_day())
+        rec = bot._finalize_signal_confidence(payload, DEFAULT_CONFIG)
+
+        self.assertEqual(rec["confidence"], 40)
+        self.assertTrue(rec["confidence_floor_applied"])
+        self.assertEqual(rec["confidence_floor_reason"], "valid_raw_buy_floor")
+        self.assertIn("INSUFFICIENT_HISTORY_WARNING", payload["ctx"]["history_warnings"])
+
+    def test_fewer_than_25_history_rows_blocks_buy_floor(self):
+        import trading.bot as bot
+
+        payload = self._raw_buy_payload(history_rows=24)
+        rec = bot._finalize_signal_confidence(payload, DEFAULT_CONFIG)
+
+        self.assertEqual(rec["confidence_final"], 20)
+        self.assertFalse(rec["confidence_floor_applied"])
+        self.assertEqual(rec["confidence_floor_reason"], "insufficient_history")
+
+    def test_earnings_warning_has_confidence_diagnostics_without_forced_hold(self):
+        ctx = {
+            "current": 100, "ma30": 95, "ma7": 99, "mom_30d_pct": 3,
+            "rsi": 55, "macd_hist": 0.2, "macd_hist_prev": 0.1,
+            "bb_pos": 0.55, "stoch_k": 60, "vol_ratio": 1.3,
+            "avg_dollar_vol_20d": 100_000_000, "atr_pct": 2,
+            "consec_up_days": 1, "recent_high": 105,
+            "dist_from_high_pct": -2, "week_chg_pct": 1,
+        }
         rec = get_recommendation(
-            0.0,
-            {"current": 100},
+            1.0,
+            ctx,
             earnings={"soon": True, "date": "2026-07-01"},
             allow_live_risk=False,
         )
 
-        self.assertEqual(rec["cls"], "hold")
-        self.assertEqual(rec["display_signal_label"]
-                         if "display_signal_label" in rec else classify_display_signal(rec["cls"], rec["confidence"]),
-                         "HOLD")
+        self.assertFalse(rec.get("force_hold", False))
+        self.assertTrue(rec["earnings_risk"]["soon"])
+        self.assertIn("warning", rec["earnings_risk"]["policy"])
         self.assertIn("confidence_before_penalties", rec)
         self.assertIn("confidence_after_penalties", rec)
         self.assertIn("confidence_before_floor", rec)
         self.assertIn("confidence_final", rec)
         self.assertIn("confidence_floor_blockers", rec)
-        self.assertEqual(rec["confidence_floor_reason"], "raw_class_hold")
 
     def test_signal_marks_low_data_quality_raw_buy_as_floor_blocked(self):
         ctx = {
@@ -1686,15 +1827,29 @@ class PythonAnywhereHardeningTests(unittest.TestCase):
                 "stale": False,
                 "rec": {"cls": "buy", "confidence": 70, "catalyst": {}},
                 "ctx": {"adx": 30, "rsi": 50, "week_chg_pct": 0,
-                        "dist_from_high_pct": 0, "vol_ratio": 1.5},
+                        "dist_from_high_pct": 0, "vol_ratio": 1.5,
+                        "history_rows": 80, "history_source": "finnhub_daily",
+                        "history_status": "ok"},
             }
             self.assertEqual(bot.buyable_reason("X", {"price": 0})[1], "INVALID_PRICE")
             self.assertEqual(bot.buyable_reason("X", {"price": 1, "stale": True})[1], "STALE_CANDIDATE_QUOTE")
+            cache_ok = dict(base)
+            cache_ok["quote"] = {
+                "price": 10,
+                "stale": True,
+                "cache_used": True,
+                "quote_age_seconds": 300,
+            }
+            cache_ok["stale"] = True
+            self.assertEqual(bot.buyable_reason("X", cache_ok, {}, "bull", {})[1], "buyable")
+            cache_old = dict(cache_ok)
+            cache_old["quote"] = dict(cache_ok["quote"], quote_age_seconds=301)
+            self.assertEqual(bot.buyable_reason("X", cache_old, {}, "bull", {})[1], "STALE_CANDIDATE_QUOTE")
             self.assertEqual(
                 bot.buyable_reason("X", base, {"X": {"reason": "loss"}}, "bull", {})[1],
                 "RECENT_SELL_COOLDOWN:loss",
             )
-            self.assertEqual(bot.buyable_reason("NOSEC", base, {}, "bull", {})[1], "MISSING_SECTOR")
+            self.assertEqual(bot.buyable_reason("NOSEC", base, {}, "bull", {})[1], "buyable")
             bear = dict(base)
             bear["ctx"] = dict(base["ctx"], rsi=45, is_dip=False)
             self.assertEqual(bot.buyable_reason("X", bear, {}, "bear", {})[1],
@@ -1707,18 +1862,52 @@ class PythonAnywhereHardeningTests(unittest.TestCase):
             knife["rec"] = {"cls": "buy", "confidence": 70,
                             "catalyst": {"type": "guidance_cut"}}
             knife["ctx"] = dict(base["ctx"], week_chg_pct=-4)
+            self.assertEqual(bot.buyable_reason("X", knife, {}, "bull", {})[1], "buyable")
+            knife["ctx"] = dict(base["ctx"], week_chg_pct=-5)
             self.assertTrue(bot.buyable_reason("X", knife, {}, "bull", {})[1].startswith("NEGATIVE_CATALYST_FALLING"))
             low_vol = dict(base)
             low_vol["ctx"] = dict(base["ctx"], is_dip=False, vol_ratio=1.0)
             self.assertEqual(bot.buyable_reason("X", low_vol, {}, "bull", {})[1], "buyable")
             very_low_vol = dict(base)
-            very_low_vol["ctx"] = dict(base["ctx"], is_dip=False, vol_ratio=0.5)
+            very_low_vol["ctx"] = dict(base["ctx"], is_dip=False, vol_ratio=0.05)
             self.assertEqual(
                 bot.buyable_reason("X", very_low_vol, {}, "bull", {})[1],
                 "VERY_LOW_VOLUME_CONFIRMATION",
             )
+            low_liq_warning = dict(base)
+            low_liq_warning["ctx"] = dict(base["ctx"], avg_dollar_vol_20d=750_000)
+            self.assertEqual(bot.buyable_reason("X", low_liq_warning, {}, "bull", {})[1], "buyable")
+            low_liq_hard = dict(base)
+            low_liq_hard["ctx"] = dict(base["ctx"], avg_dollar_vol_20d=200_000)
+            self.assertEqual(bot.buyable_reason("X", low_liq_hard, {}, "bull", {})[1],
+                             "LOW_LIQUIDITY_HARD_BLOCK")
+            high_atr_warning = dict(base)
+            high_atr_warning["ctx"] = dict(base["ctx"], atr_pct=15)
+            self.assertEqual(bot.buyable_reason("X", high_atr_warning, {}, "bull", {})[1], "buyable")
+            extreme_atr = dict(base)
+            extreme_atr["ctx"] = dict(base["ctx"], atr_pct=21)
+            self.assertEqual(bot.buyable_reason("X", extreme_atr, {}, "bull", {})[1], "ATR_TOO_HIGH")
         finally:
             bot.get_sector = old_sector
+
+    def test_cached_untrusted_recorded_quote_stays_untrusted(self):
+        import market.quotes as quotes
+
+        stale = quotes._annotate_quote_for_execution(
+            {
+                "price": 10,
+                "source": "recorded_price",
+                "stale": True,
+                "stale_age_sec": 301,
+                "execution_trusted": False,
+            },
+            cache_used=True,
+            age_sec=1,
+        )
+
+        self.assertFalse(stale["execution_trusted"])
+        self.assertTrue(stale["stale"])
+        self.assertEqual(stale["quote_age_seconds"], 301)
 
     def test_no_buy_main_blocker_reducer(self):
         import trading.bot as bot
@@ -1863,6 +2052,15 @@ class PythonAnywhereHardeningTests(unittest.TestCase):
         self.assertNotIn("raw_cls not in", body)
         self.assertNotIn('s.get("rec", {}).get("cls"', body)
 
+    def test_live_buy_path_does_not_call_portfolio_variance(self):
+        source = Path("trading/bot.py").read_text(encoding="utf-8")
+        start = source.index("ranked_candidates = rank_candidates")
+        end = source.index("build_extra_ticker_suggestions", start)
+        body = source[start:end]
+        self.assertNotIn("candidate_variance_check(", body)
+        self.assertNotIn("load_close_history(", body)
+        self.assertNotIn("variance_reason(", body)
+
     def test_paper_loss_lockout_sets_daily_loss_reason(self):
         import trading.bot as bot
 
@@ -1886,6 +2084,24 @@ class PythonAnywhereHardeningTests(unittest.TestCase):
         self.assertTrue(diag["paper_trading_locked"])
         self.assertEqual(diag["paper_lock_reason"], "DAILY_LOSS_LIMIT")
         self.assertEqual(events[0][0], "DAILY_LOSS_LIMIT")
+
+    def test_paper_loss_warning_does_not_lock_new_buys(self):
+        import trading.bot as bot
+
+        state = {"today_open_equity": 10_000.0}
+        diag = bot._new_no_buy_diag(int(time.time()), {"cash": 1000}, False, False)
+        locked = bot._apply_paper_loss_lockouts(
+            state,
+            diag,
+            DEFAULT_CONFIG["risk"],
+            8_900.0,
+            10_000.0,
+            time.time(),
+        )
+
+        self.assertFalse(locked)
+        self.assertFalse(diag["paper_trading_locked"])
+        self.assertIn("DAILY_LOSS_WARNING", diag["loss_lockout_warnings"])
 
     def test_provider_failure_snapshot_marks_rate_limit_recent(self):
         import utils.cache as cache
@@ -2343,6 +2559,386 @@ class PythonAnywhereHardeningTests(unittest.TestCase):
         self.assertEqual(calls, [("finnhub", "AAPL"), ("fmp", "AAPL")])
         self.assertEqual(failures[0][1]["status"], "blocked_or_forbidden")
 
+    # ---- Entry 027: global Finnhub daily forbidden circuit --------------------
+
+    def _run_finnhub_daily_with_error(self, error, symbol="AAPL"):
+        """Call _finnhub_daily(symbol) with fh.stock_candles raising `error`,
+        under a cleared/restored provider-health store. Returns the snapshot."""
+        import market.quotes as quotes
+        import utils.cache as cache
+        import types as _types
+
+        old_fh = quotes.fh
+        old_save = cache._save_provider_health
+        old_failures = dict(cache._api_failures)
+        try:
+            cache._api_failures.clear()
+            cache._save_provider_health = lambda: True
+            quotes.fh = _types.SimpleNamespace(
+                stock_candles=lambda *_a, **_k: (_ for _ in ()).throw(error)
+            )
+            result = quotes._finnhub_daily(symbol, use_cache=False)
+            snap = dict(cache.api_failure_snapshot())
+            state = quotes.finnhub_daily_global_circuit_state()
+            return result, snap, state
+        finally:
+            quotes.fh = old_fh
+            cache._save_provider_health = old_save
+            cache._api_failures.clear()
+            cache._api_failures.update(old_failures)
+
+    def test_finnhub_daily_403_via_status_code_opens_global_circuit(self):
+        import market.quotes as quotes
+
+        class FinnhubForbidden(Exception):
+            status_code = 403
+
+            def __str__(self):
+                return "FinnhubAPIException(status_code: 403): You don't have access to this resource."
+
+        result, snap, state = self._run_finnhub_daily_with_error(FinnhubForbidden())
+        self.assertIsNone(result)
+        self.assertIn(quotes.FINNHUB_DAILY_GLOBAL_ENDPOINT, snap)
+        gsnap = snap[quotes.FINNHUB_DAILY_GLOBAL_ENDPOINT]
+        self.assertEqual(gsnap["status"], "blocked_or_forbidden")
+        self.assertEqual(gsnap["cooldown_sec"], quotes.FINNHUB_DAILY_FORBIDDEN_COOLDOWN_SEC)
+        self.assertEqual(gsnap["cooldown_sec"], 21_600)
+        self.assertTrue(state["active"])
+        # Per-symbol entry now uses the 6h forbidden cooldown, not 900s.
+        self.assertEqual(snap["finnhub_daily:AAPL:0"]["cooldown_sec"], 21_600)
+
+    def test_finnhub_daily_403_via_message_text_only_opens_global_circuit(self):
+        import market.quotes as quotes
+
+        # No .status_code attribute at all — the 403 is only in the message text,
+        # exactly like the live log. Must still classify as forbidden (21600s),
+        # not the 900s provider-error default.
+        err = RuntimeError(
+            "FinnhubAPIException(status_code: 403): You don't have access to this resource."
+        )
+        result, snap, state = self._run_finnhub_daily_with_error(err)
+        self.assertIsNone(result)
+        self.assertEqual(snap["finnhub_daily:AAPL:0"]["cooldown_sec"], 21_600)
+        self.assertEqual(
+            snap[quotes.FINNHUB_DAILY_GLOBAL_ENDPOINT]["cooldown_sec"], 21_600
+        )
+        self.assertTrue(state["active"])
+
+    def test_finnhub_daily_generic_error_uses_900s_and_no_global_circuit(self):
+        import market.quotes as quotes
+
+        result, snap, state = self._run_finnhub_daily_with_error(
+            RuntimeError("connection timed out")
+        )
+        self.assertIsNone(result)
+        self.assertEqual(snap["finnhub_daily:AAPL:0"]["cooldown_sec"], 900)
+        self.assertNotIn(quotes.FINNHUB_DAILY_GLOBAL_ENDPOINT, snap)
+        self.assertFalse(state["active"])
+
+    def test_finnhub_daily_rate_limit_uses_1800s_and_no_global_circuit(self):
+        import market.quotes as quotes
+
+        class FinnhubRateLimited(Exception):
+            status_code = 429
+
+            def __str__(self):
+                return "FinnhubAPIException(status_code: 429): API limit reached."
+
+        result, snap, state = self._run_finnhub_daily_with_error(FinnhubRateLimited())
+        self.assertIsNone(result)
+        self.assertEqual(snap["finnhub_daily:AAPL:0"]["cooldown_sec"], 1_800)
+        self.assertNotIn(quotes.FINNHUB_DAILY_GLOBAL_ENDPOINT, snap)
+        self.assertFalse(state["active"])
+
+    def test_finnhub_daily_global_circuit_skips_other_symbols_without_network(self):
+        import market.quotes as quotes
+        import utils.cache as cache
+        import types as _types
+
+        old_fh = quotes.fh
+        old_save = cache._save_provider_health
+        old_failures = dict(cache._api_failures)
+        try:
+            cache._api_failures.clear()
+            cache._save_provider_health = lambda: True
+            # Open the global circuit directly.
+            cache.record_api_failure(
+                quotes.FINNHUB_DAILY_GLOBAL_ENDPOINT,
+                "403 forbidden",
+                status="blocked_or_forbidden",
+                cooldown_sec=quotes.FINNHUB_DAILY_FORBIDDEN_COOLDOWN_SEC,
+            )
+
+            def should_not_call(*_a, **_k):
+                raise AssertionError("global Finnhub daily circuit should skip network")
+
+            quotes.fh = _types.SimpleNamespace(stock_candles=should_not_call)
+            # A *different* symbol, no cache — must return None without a call.
+            self.assertIsNone(quotes._finnhub_daily("MSFT", use_cache=False))
+            self.assertTrue(quotes.finnhub_daily_global_circuit_state()["active"])
+        finally:
+            quotes.fh = old_fh
+            cache._save_provider_health = old_save
+            cache._api_failures.clear()
+            cache._api_failures.update(old_failures)
+
+    def test_finnhub_daily_global_circuit_does_not_disable_quotes(self):
+        import market.quotes as quotes
+        import utils.cache as cache
+
+        old_save = cache._save_provider_health
+        old_failures = dict(cache._api_failures)
+        try:
+            cache._api_failures.clear()
+            cache._save_provider_health = lambda: True
+            cache.record_api_failure(
+                quotes.FINNHUB_DAILY_GLOBAL_ENDPOINT,
+                "403 forbidden",
+                status="blocked_or_forbidden",
+                cooldown_sec=quotes.FINNHUB_DAILY_FORBIDDEN_COOLDOWN_SEC,
+            )
+            state = quotes.finnhub_daily_global_circuit_state()
+            self.assertTrue(state["active"])
+            self.assertTrue(state["quote_endpoint_still_enabled"])
+            # The Finnhub quote endpoint circuit is a separate key and must be untouched.
+            self.assertFalse(quotes.should_skip_api("quote:AAPL", cooldown_sec=120))
+            self.assertNotIn("quote:AAPL", cache.api_failure_snapshot())
+        finally:
+            cache._save_provider_health = old_save
+            cache._api_failures.clear()
+            cache._api_failures.update(old_failures)
+
+    def test_finnhub_daily_global_circuit_still_reaches_fmp(self):
+        import pandas as pd
+        import market.quotes as quotes
+        import utils.cache as cache
+        import types as _types
+
+        idx = pd.date_range("2026-01-01", periods=80, freq="B")
+        fmp_df = pd.DataFrame({
+            "Open": range(80), "High": range(80), "Low": range(80),
+            "Close": range(80), "Volume": [100] * 80,
+        }, index=idx)
+        fmp_df.attrs["source"] = "fmp_daily"
+        fmp_df.attrs["status"] = "ok"
+
+        old = {
+            "PYTHONANYWHERE_MODE": quotes.PYTHONANYWHERE_MODE,
+            "fh": quotes.fh,
+            "_fmp_daily": quotes._fmp_daily,
+            "cache_get_stale": quotes.cache_get_stale,
+        }
+        old_save = cache._save_provider_health
+        old_failures = dict(cache._api_failures)
+        calls = []
+        try:
+            cache._api_failures.clear()
+            cache._save_provider_health = lambda: True
+            cache.record_api_failure(
+                quotes.FINNHUB_DAILY_GLOBAL_ENDPOINT,
+                "403 forbidden",
+                status="blocked_or_forbidden",
+                cooldown_sec=quotes.FINNHUB_DAILY_FORBIDDEN_COOLDOWN_SEC,
+            )
+            quotes.PYTHONANYWHERE_MODE = True
+            quotes.fh = _types.SimpleNamespace(
+                stock_candles=lambda *_a, **_k: (_ for _ in ()).throw(
+                    AssertionError("Finnhub network must be skipped while global circuit is open")
+                )
+            )
+            quotes._fmp_daily = lambda tk, *_a, **_k: calls.append(("fmp", tk)) or fmp_df
+            quotes.cache_get_stale = lambda *_a, **_k: (quotes.CACHE_MISS, None)
+            out = quotes._raw_daily("AAPL")
+        finally:
+            for name, value in old.items():
+                setattr(quotes, name, value)
+            cache._save_provider_health = old_save
+            cache._api_failures.clear()
+            cache._api_failures.update(old_failures)
+        self.assertIsNotNone(out)
+        self.assertEqual(out.attrs["source"], "fmp_daily")
+        self.assertEqual(calls, [("fmp", "AAPL")])
+
+    # ---- Entry 027: visible MISSING_HISTORY / quote reasoning ------------------
+
+    def test_core_data_blocker_reason_surfaces_missing_history(self):
+        import trading.bot as bot
+
+        diag = bot._new_no_buy_diag(int(time.time()), {"cash": 1000}, False, False)
+        diag["history_missing_count"] = 6
+        diag["top_missing_history_symbols"] = ["ORCL", "SPOT", "TSLA"]
+        reason = bot._core_data_blocker_reason(diag)
+        self.assertIn("daily history missing", reason.lower())
+        self.assertIn("ORCL", reason)
+        self.assertNotEqual(reason, "no BUY signals across watchlist")
+
+    def test_core_data_blocker_reason_empty_when_no_core_blocker(self):
+        import trading.bot as bot
+
+        diag = bot._new_no_buy_diag(int(time.time()), {"cash": 1000}, False, False)
+        self.assertEqual(bot._core_data_blocker_reason(diag), "")
+
+    def test_core_data_blocker_reason_mentions_history_and_quote(self):
+        import trading.bot as bot
+
+        diag = bot._new_no_buy_diag(int(time.time()), {"cash": 1000}, False, False)
+        diag["history_missing_count"] = 6
+        diag["buyable_reject_counts"] = {"INVALID_PRICE": 6}
+        reason = bot._core_data_blocker_reason(diag).lower()
+        self.assertIn("history", reason)
+        self.assertIn("quote", reason)
+
+    def test_set_main_blocker_missing_history_detail_mentions_quote(self):
+        import trading.bot as bot
+
+        diag = bot._new_no_buy_diag(int(time.time()), {"cash": 1000}, False, False)
+        diag["market_open"] = True
+        diag["tod_ok"] = True
+        diag["regime_allow_buys"] = True
+        diag["history_missing_count"] = 6
+        diag["candidate_pool_count"] = 0
+        diag["top_missing_history_symbols"] = ["ORCL", "SPOT"]
+        diag["buyable_reject_counts"] = {"INVALID_PRICE": 6}
+        bot._set_main_blocker(diag)
+        self.assertEqual(diag["main_blocker"], "MISSING_HISTORY")
+        self.assertEqual(diag["blocker_stage"], "HISTORY_QUALITY")
+        self.assertIn("history missing", diag["blocker_detail"].lower())
+        self.assertIn("quote", diag["blocker_detail"].lower())
+
+    def test_set_main_blocker_invalid_price_quote_quality_detail(self):
+        import trading.bot as bot
+
+        diag = bot._new_no_buy_diag(int(time.time()), {"cash": 1000}, False, False)
+        diag["market_open"] = True
+        diag["tod_ok"] = True
+        diag["regime_allow_buys"] = True
+        diag["candidate_pool_count"] = 0
+        diag["buyable_reject_counts"] = {"INVALID_PRICE": 4}
+        diag["top_buyable_rejects"] = [{"ticker": "TSLA"}, {"ticker": "META"}]
+        bot._set_main_blocker(diag)
+        self.assertEqual(diag["main_blocker"], "INVALID_PRICE")
+        self.assertEqual(diag["blocker_stage"], "QUOTE_QUALITY")
+        self.assertIn("price", diag["blocker_detail"].lower())
+
+    def test_raw_daily_uses_valid_cached_history_before_provider_fetch(self):
+        import pandas as pd
+        import market.quotes as quotes
+
+        idx = pd.date_range("2026-01-01", periods=80, freq="B")
+        cached = pd.DataFrame({
+            "Open": range(80),
+            "High": range(80),
+            "Low": range(80),
+            "Close": range(80),
+            "Volume": [100] * 80,
+        }, index=idx)
+        old = {
+            "PYTHONANYWHERE_MODE": quotes.PYTHONANYWHERE_MODE,
+            "_finnhub_daily": quotes._finnhub_daily,
+            "_fmp_daily": quotes._fmp_daily,
+            "cache_get_stale": quotes.cache_get_stale,
+            "completed_trading_days_since": quotes.completed_trading_days_since,
+        }
+        seen = []
+        try:
+            quotes.PYTHONANYWHERE_MODE = True
+            quotes.completed_trading_days_since = lambda _d: 0
+            quotes._finnhub_daily = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("provider should not be called when valid cache exists")
+            )
+            quotes._fmp_daily = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("provider should not be called when valid cache exists")
+            )
+
+            def fake_cache(key, *_args, **_kwargs):
+                seen.append(key)
+                if key == "fh_daily_AAPL":
+                    return cached, 300
+                return quotes.CACHE_MISS, None
+
+            quotes.cache_get_stale = fake_cache
+            out = quotes._raw_daily("AAPL")
+        finally:
+            for name, value in old.items():
+                setattr(quotes, name, value)
+        self.assertEqual(out.attrs["source"], "finnhub_daily_cache")
+        self.assertTrue(out.attrs["history_cache_used"])
+        self.assertIn("fh_daily_AAPL", seen)
+
+    def test_raw_daily_respects_shared_history_fetch_budget(self):
+        import pandas as pd
+        import market.quotes as quotes
+
+        idx = pd.date_range("2026-01-01", periods=80, freq="B")
+        fmp = pd.DataFrame({
+            "Open": range(80),
+            "High": range(80),
+            "Low": range(80),
+            "Close": range(80),
+            "Volume": [100] * 80,
+        }, index=idx)
+        fmp.attrs.update({"source": "fmp_daily", "provider": "fmp", "status": "ok"})
+        old = {
+            "PYTHONANYWHERE_MODE": quotes.PYTHONANYWHERE_MODE,
+            "_finnhub_daily": quotes._finnhub_daily,
+            "_fmp_daily": quotes._fmp_daily,
+            "cache_get_stale": quotes.cache_get_stale,
+        }
+        calls = []
+        try:
+            quotes.PYTHONANYWHERE_MODE = True
+            quotes.cache_get_stale = lambda *_args, **_kwargs: (quotes.CACHE_MISS, None)
+            quotes._finnhub_daily = lambda tk, *_args, **_kwargs: calls.append(("finnhub", tk)) or None
+            quotes._fmp_daily = lambda tk, *_args, **_kwargs: calls.append(("fmp", tk)) or fmp
+            quotes.set_history_fetch_budget(1)
+            first = quotes._raw_daily("AAPL")
+            second = quotes._raw_daily("MSFT")
+        finally:
+            quotes.set_history_fetch_budget(None)
+            for name, value in old.items():
+                setattr(quotes, name, value)
+        self.assertEqual(first.attrs["source"], "fmp_daily")
+        self.assertIsNone(second)
+        self.assertEqual(calls, [("finnhub", "AAPL"), ("fmp", "AAPL")])
+
+    def test_finnhub_daily_403_opens_daily_circuit_only(self):
+        import market.quotes as quotes
+        import utils.cache as cache
+
+        class Forbidden(RuntimeError):
+            code = 403
+
+        old_quotes = {
+            "fh": quotes.fh,
+            "cache_get": quotes.cache_get,
+        }
+        old_failures = dict(cache._api_failures)
+        old_save = cache._save_provider_health
+        try:
+            cache._api_failures.clear()
+            cache._save_provider_health = lambda: True
+            quotes.cache_get = lambda *_args, **_kwargs: quotes.CACHE_MISS
+            quotes.fh = types.SimpleNamespace(
+                stock_candles=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                    Forbidden("HTTP 403 Forbidden")
+                )
+            )
+            self.assertIsNone(quotes._finnhub_daily("AAPL"))
+            state = quotes.finnhub_daily_circuit_state("AAPL")
+            snap = cache.api_failure_snapshot()
+        finally:
+            quotes.fh = old_quotes["fh"]
+            quotes.cache_get = old_quotes["cache_get"]
+            cache._api_failures.clear()
+            cache._api_failures.update(old_failures)
+            cache._save_provider_health = old_save
+        self.assertTrue(state["active"])
+        self.assertEqual(state["status"], "blocked_or_forbidden")
+        self.assertEqual(state["cooldown_sec"], 21600)
+        self.assertTrue(state["quote_endpoint_still_enabled"])
+        self.assertIn("finnhub_daily:AAPL:0", snap)
+        self.assertNotIn("quote:AAPL", snap)
+
     def test_pythonanywhere_normal_daily_fmp_fallback_is_not_spy_only(self):
         import pandas as pd
         import market.quotes as quotes
@@ -2537,13 +3133,14 @@ class PythonAnywhereHardeningTests(unittest.TestCase):
         import utils.time_utils as time_utils
 
         today = pd.Timestamp.now().normalize()
+        idx = pd.date_range(end=today, periods=25, freq="D")
         df = pd.DataFrame({
-            "Open": [10.0],
-            "High": [12.0],
-            "Low": [9.0],
-            "Close": [11.0],
-            "Volume": [1234.0],
-        }, index=[today])
+            "Open": [10.0] * 25,
+            "High": [12.0] * 25,
+            "Low": [9.0] * 25,
+            "Close": [11.0] * 25,
+            "Volume": [1234.0] * 25,
+        }, index=idx)
         old = {
             "get_quote": quotes.get_quote,
             "is_market_open": time_utils.is_market_open,
@@ -2552,7 +3149,7 @@ class PythonAnywhereHardeningTests(unittest.TestCase):
             time_utils.is_market_open = lambda: True
             quotes.get_quote = lambda _tk: {
                 "price": 13.0, "high": 13.5, "low": 8.5,
-                "open": 10.5, "stale": False,
+                "open": 10.5, "stale": False, "execution_trusted": True,
             }
             out = quotes._append_live_bar(df.copy(), "AAPL")
         finally:
@@ -2574,17 +3171,18 @@ class PythonAnywhereHardeningTests(unittest.TestCase):
         import market.quotes as quotes
         import utils.time_utils as time_utils
 
+        idx = pd.date_range(end=pd.Timestamp("2026-06-26"), periods=25, freq="D")
         df = pd.DataFrame({
-            "Open": [10.0], "High": [12.0], "Low": [9.0],
-            "Close": [11.0], "Volume": [1234.0],
-        }, index=[pd.Timestamp("2026-06-26")])
+            "Open": [10.0] * 25, "High": [12.0] * 25, "Low": [9.0] * 25,
+            "Close": [11.0] * 25, "Volume": [1234.0] * 25,
+        }, index=idx)
         old = {
             "get_quote": quotes.get_quote,
             "is_market_open": time_utils.is_market_open,
         }
         try:
             time_utils.is_market_open = lambda: True
-            quotes.get_quote = lambda _tk: {"price": 13.0, "stale": True}
+            quotes.get_quote = lambda _tk: {"price": 13.0, "stale": True, "execution_trusted": False}
             out = quotes._append_live_bar(df.copy(), "AAPL")
         finally:
             for name, value in old.items():
@@ -2592,7 +3190,7 @@ class PythonAnywhereHardeningTests(unittest.TestCase):
                     quotes.get_quote = value
                 else:
                     time_utils.is_market_open = value
-        self.assertEqual(len(out), 1)
+        self.assertEqual(len(out), 25)
         self.assertFalse(out.attrs["live_bar_applied"])
         self.assertEqual(out.attrs["live_bar_reason"], "quote_stale_or_missing")
         self.assertFalse(out.attrs["quote_fresh"])
@@ -2668,7 +3266,9 @@ class PythonAnywhereHardeningTests(unittest.TestCase):
         finally:
             for name, value in old.items():
                 setattr(hist, name, value)
-        self.assertEqual(out, {})
+        self.assertEqual(out["history_status"], "missing")
+        self.assertEqual(out["history_rows"], 0)
+        self.assertIn("MISSING_HISTORY", out["history_warnings"])
         self.assertEqual(saved, [])
 
     def test_sector_relative_strength_exposes_missing_history_diagnostics(self):
@@ -2905,9 +3505,10 @@ class PythonAnywhereHardeningTests(unittest.TestCase):
                 calls["run_kwargs"] = kwargs
                 return {"last_no_buy_diagnostics": {
                     "main_blocker": "weak_raw_buys_only",
-                    "trading_mode": "DEGRADED_MODE",
-                    "degraded_mode_active": True,
-                    "data_health_blocks": ["SPY_DATA_MISSING"],
+                    "trading_mode": "NORMAL_MODE",
+                    "degraded_mode_active": False,
+                    "data_health_blocks": [],
+                    "data_health_warnings": ["SPY_DATA_MISSING"],
                     "raw_buy_count": 2,
                     "display_buy_candidate_count": 0,
                     "candidate_pool_count": 0,
@@ -2918,8 +3519,8 @@ class PythonAnywhereHardeningTests(unittest.TestCase):
                     "min_buy_confidence": 40,
                     "degraded_size_mult": 0.90,
                     "degraded_use_standard_gates_for_testing": True,
-                    "degraded_standard_gates_active": True,
-                    "degraded_gate_policy": "standard_gates_for_testing",
+                    "degraded_standard_gates_active": False,
+                    "degraded_gate_policy": None,
                     "effective_size_mult": 1.0,
                     "effective_min_buy_confidence": 40,
                     "normal_ev_gates_required": True,
@@ -2956,15 +3557,15 @@ class PythonAnywhereHardeningTests(unittest.TestCase):
         self.assertEqual(payload["status"], "weak_raw_buys_only")
         self.assertTrue(payload["scan_warm_started"])
         self.assertIn("environment", payload)
-        self.assertEqual(diag["trading_mode"], "DEGRADED_MODE")
+        self.assertEqual(diag["trading_mode"], "NORMAL_MODE")
         self.assertEqual(diag["display_buy_candidate_count"], 0)
         self.assertEqual(diag["scan_fresh_rows_count"], 3)
         self.assertEqual(diag["min_buy_confidence"], 40)
         self.assertEqual(diag["degraded_min_confidence"], 40)
         self.assertEqual(diag["degraded_size_mult"], 0.90)
         self.assertTrue(diag["degraded_use_standard_gates_for_testing"])
-        self.assertTrue(diag["degraded_standard_gates_active"])
-        self.assertEqual(diag["degraded_gate_policy"], "standard_gates_for_testing")
+        self.assertFalse(diag["degraded_standard_gates_active"])
+        self.assertIsNone(diag["degraded_gate_policy"])
         self.assertEqual(diag["effective_size_mult"], 1.0)
         self.assertEqual(diag["effective_min_buy_confidence"], 40)
         self.assertTrue(diag["normal_ev_gates_required"])
@@ -2976,6 +3577,62 @@ class PythonAnywhereHardeningTests(unittest.TestCase):
         self.assertEqual(payload["history_finnhub_daily_blocked_count"], 2)
         self.assertEqual(diag["history_source_counts"], {"fmp_daily": 6})
         self.assertEqual(diag["ticker_signal_debug"][0]["history_source"], "fmp_daily")
+
+    def test_bot_warm_history_requires_machine_auth_and_caps_default_batch(self):
+        import routes.portfolio as portfolio
+
+        calls = {}
+        old = {
+            "require_machine_token": portfolio.require_machine_token,
+            "request": portfolio.request,
+            "jsonify": portfolio.jsonify,
+            "warm_history": portfolio.warm_history,
+            "load_bot": portfolio.load_bot,
+            "load_tickers": portfolio.load_tickers,
+        }
+        try:
+            portfolio.require_machine_token = lambda: ("forbidden", 403)
+            self.assertEqual(portfolio.bot_warm_history(), ("forbidden", 403))
+
+            portfolio.require_machine_token = lambda: True
+            portfolio.request = types.SimpleNamespace(values={})
+            portfolio.jsonify = lambda obj=None, **kwargs: obj if obj is not None else kwargs
+            portfolio.load_bot = lambda: {
+                "last_no_buy_diagnostics": {
+                    "top_missing_history_symbols": ["AAPL", "MSFT", "MU", "CAT"],
+                }
+            }
+            portfolio.load_tickers = lambda: ["XOM", "NVDA"]
+
+            def fake_warm(symbols, max_symbols=None, max_fetches=None):
+                calls["symbols"] = symbols
+                calls["max_symbols"] = max_symbols
+                calls["max_fetches"] = max_fetches
+                return {
+                    "requested_symbols": symbols,
+                    "attempted_symbols": symbols[:max_symbols],
+                    "warmed_symbols": symbols[:1],
+                    "skipped_symbols": [{"symbol": symbols[-1], "reason": "max_symbols_per_warm_call"}],
+                    "failed_symbols": [],
+                    "cache_hit_symbols": [],
+                    "provider_used_by_symbol": {"AAPL": "fmp_daily"},
+                    "rows_by_symbol": {"AAPL": 80},
+                    "errors_by_symbol": {},
+                    "provider_circuits": {},
+                }
+
+            portfolio.warm_history = fake_warm
+            payload = portfolio.bot_warm_history()
+        finally:
+            for name, value in old.items():
+                setattr(portfolio, name, value)
+        self.assertEqual(calls["symbols"], ["AAPL", "MSFT", "MU"])
+        self.assertEqual(calls["max_symbols"], 3)
+        self.assertEqual(calls["max_fetches"], 3)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["attempted_symbols"], ["AAPL", "MSFT", "MU"])
+        self.assertEqual(payload["max_symbols_per_call"], 3)
+        self.assertEqual(payload["max_fetches_per_call"], 3)
 
     def test_ticker_signal_debug_row_exposes_history_and_execution_reason(self):
         import trading.bot as bot
@@ -3042,7 +3699,7 @@ class PythonAnywhereHardeningTests(unittest.TestCase):
         self.assertIn("sell_score_threshold", row)
         self.assertIn("cats_required_for_buy", row)
         self.assertFalse(row["execution_eligible"])
-        self.assertEqual(row["why_not_buy"], "stale_quote")
+        self.assertEqual(row["why_not_buy"], "stale_candidate_quote")
         self.assertEqual(row["why_not_execution_eligible"], "raw_class_hold")
         self.assertFalse(row["quote_fresh"])
 
@@ -3233,7 +3890,7 @@ class PythonAnywhereHardeningTests(unittest.TestCase):
         self.assertEqual(diag["main_blocker"], "interval_cooldown")
         self.assertEqual(diag["min_buy_confidence"], 40)
         self.assertEqual(diag["degraded_min_confidence"], 40)
-        self.assertEqual(diag["min_trade_size_effective"], 100.0)
+        self.assertEqual(diag["min_trade_size_effective"], 10.0)
         self.assertEqual(saved[-1]["last_cache_prune"], {"removed": 0, "kept": 0})
 
     def test_bot_no_trade_run_persists_no_buy_diagnostics(self):
@@ -3369,7 +4026,8 @@ class PythonAnywhereHardeningTests(unittest.TestCase):
             bot.get_history = lambda _tk: {
                 "adx": 30, "rsi": 55, "week_chg_pct": 0,
                 "dist_from_high_pct": 0, "avg_dollar_vol_20d": 100_000_000,
-                "vol_ratio": 1.5,
+                "vol_ratio": 1.5, "history_rows": 80,
+                "history_source": "finnhub_daily", "history_status": "ok",
             }
             bot.get_intraday_context = lambda _tk: {}
             bot.get_earnings_soon = lambda _tk: {}
@@ -3406,17 +4064,18 @@ class PythonAnywhereHardeningTests(unittest.TestCase):
         self.assertIsNone(captured["mode_size_reason"])
         diag = out_state["last_no_buy_diagnostics"]
         self.assertTrue(diag["regime_allow_buys"])
-        self.assertEqual(diag["trading_mode"], "DEGRADED_MODE")
-        self.assertTrue(diag["degraded_mode_active"])
+        self.assertEqual(diag["trading_mode"], "NORMAL_MODE")
+        self.assertFalse(diag["degraded_mode_active"])
         self.assertTrue(diag["degraded_use_standard_gates_for_testing"])
-        self.assertTrue(diag["degraded_standard_gates_active"])
-        self.assertEqual(diag["degraded_gate_policy"], "standard_gates_for_testing")
+        self.assertFalse(diag["degraded_standard_gates_active"])
+        self.assertIsNone(diag["degraded_gate_policy"])
         self.assertEqual(diag["effective_size_mult"], 1.0)
         self.assertEqual(diag["effective_min_buy_confidence"], 40)
         self.assertTrue(diag["normal_ev_gates_required"])
         self.assertTrue(diag["normal_risk_caps_required"])
         self.assertTrue(diag["fresh_quote_required"])
-        self.assertIn("SPY_DATA_MISSING", diag["data_health_blocks"])
+        self.assertEqual(diag["data_health_blocks"], [])
+        self.assertIn("SPY_DATA_MISSING", diag["data_health_warnings"])
         self.assertTrue(diag["regime_data_fallback"])
         self.assertEqual(diag["regime_data_size_mult"], 1.0)
 
@@ -3441,6 +4100,9 @@ class PythonAnywhereHardeningTests(unittest.TestCase):
                 "dist_from_high_pct": 0,
                 "avg_dollar_vol_20d": 100_000_000,
                 "vol_ratio": 1.5,
+                "history_rows": 80,
+                "history_source": "finnhub_daily",
+                "history_status": "ok",
             },
             "earn": {},
             "analyst": {},
@@ -3581,15 +4243,16 @@ class PythonAnywhereHardeningTests(unittest.TestCase):
                     "fmp_daily_rate_limited": True,
                     "fmp_daily_cooldown_remaining_sec": 120,
                     "fmp_daily_last_429_age_sec": 15,
-                    "data_health_blocks": ["SPY_DATA_MISSING"],
-                    "trading_mode": "DEGRADED_MODE",
-                    "degraded_mode_active": True,
-                    "degraded_mode_reason": "SPY_DATA_MISSING",
+                    "data_health_blocks": [],
+                    "data_health_warnings": ["SPY_DATA_MISSING"],
+                    "trading_mode": "NORMAL_MODE",
+                    "degraded_mode_active": False,
+                    "degraded_mode_reason": None,
                     "min_buy_confidence": 40,
                     "degraded_size_mult": 0.90,
                     "degraded_use_standard_gates_for_testing": True,
-                    "degraded_standard_gates_active": True,
-                    "degraded_gate_policy": "standard_gates_for_testing",
+                    "degraded_standard_gates_active": False,
+                    "degraded_gate_policy": None,
                     "effective_size_mult": 1.0,
                     "effective_min_buy_confidence": 40,
                     "normal_ev_gates_required": True,
@@ -3599,7 +4262,7 @@ class PythonAnywhereHardeningTests(unittest.TestCase):
                     "min_trade_size_effective": 100,
                     "degraded_reject_counts": {"DEGRADED_CONFIDENCE_BELOW_MIN": 1},
                     "volatility_value": 14.2,
-                    "regime_source": "degraded_fallback",
+                    "regime_source": "neutral_missing_spy",
                     "top_buyable_rejects": [
                         {"ticker": "AAA", "rejection_reason": "VERY_LOW_VOLUME_CONFIRMATION"}
                     ],
@@ -3624,17 +4287,18 @@ class PythonAnywhereHardeningTests(unittest.TestCase):
         self.assertEqual(out["last_no_buy_diagnostics"]["main_blocker"],
                          "no_buy_candidates")
         self.assertEqual(out["last_no_buy_diagnostics"]["raw_buy_count"], 1)
-        self.assertEqual(out["last_no_buy_diagnostics"]["data_health_blocks"],
+        self.assertEqual(out["last_no_buy_diagnostics"]["data_health_blocks"], [])
+        self.assertEqual(out["last_no_buy_diagnostics"]["data_health_warnings"],
                          ["SPY_DATA_MISSING"])
         self.assertEqual(out["last_no_buy_diagnostics"]["trading_mode"],
-                         "DEGRADED_MODE")
-        self.assertTrue(out["last_no_buy_diagnostics"]["degraded_mode_active"])
+                         "NORMAL_MODE")
+        self.assertFalse(out["last_no_buy_diagnostics"]["degraded_mode_active"])
         self.assertEqual(out["last_no_buy_diagnostics"]["min_buy_confidence"], 40)
         self.assertEqual(out["last_no_buy_diagnostics"]["degraded_min_confidence"], 40)
         self.assertTrue(out["last_no_buy_diagnostics"]["degraded_use_standard_gates_for_testing"])
-        self.assertTrue(out["last_no_buy_diagnostics"]["degraded_standard_gates_active"])
+        self.assertFalse(out["last_no_buy_diagnostics"]["degraded_standard_gates_active"])
         self.assertEqual(out["last_no_buy_diagnostics"]["degraded_gate_policy"],
-                         "standard_gates_for_testing")
+                         None)
         self.assertEqual(out["last_no_buy_diagnostics"]["effective_size_mult"], 1.0)
         self.assertEqual(out["last_no_buy_diagnostics"]["effective_min_buy_confidence"], 40)
         self.assertTrue(out["last_no_buy_diagnostics"]["normal_ev_gates_required"])
@@ -3643,7 +4307,7 @@ class PythonAnywhereHardeningTests(unittest.TestCase):
         self.assertEqual(out["last_no_buy_diagnostics"]["min_trade_size_effective"], 100)
         self.assertEqual(out["last_no_buy_diagnostics"]["volatility_value"], 14.2)
         self.assertEqual(out["last_no_buy_diagnostics"]["regime_source"],
-                         "degraded_fallback")
+                         "neutral_missing_spy")
         self.assertEqual(out["last_no_buy_diagnostics"]["tick_runtime_seconds"], 0.25)
         self.assertEqual(out["last_no_buy_diagnostics"]["history_fmp_attempted_count"], 3)
         self.assertEqual(out["last_no_buy_diagnostics"]["history_fmp_skipped_count"], 2)
@@ -3785,9 +4449,7 @@ class PythonAnywhereHardeningTests(unittest.TestCase):
             quotes._fmp_daily = lambda *_args, **_kwargs: (_ for _ in ()).throw(
                 AssertionError("FMP should not be called after valid Finnhub daily bars")
             )
-            quotes.cache_get_stale = lambda *_args, **_kwargs: (_ for _ in ()).throw(
-                AssertionError("stale cache should not be called after valid Finnhub daily bars")
-            )
+            quotes.cache_get_stale = lambda *_args, **_kwargs: (quotes.CACHE_MISS, None)
             out = quotes._stooq_daily("AAA", full=True)
         finally:
             quotes.PYTHONANYWHERE_MODE = old_pa
