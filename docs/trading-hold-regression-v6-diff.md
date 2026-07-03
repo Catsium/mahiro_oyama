@@ -16,7 +16,7 @@ This patch compared the current trading paths against the supplied V6 archive:
 ## Implemented Rules
 
 - Missing SPY regime data, missing volatility data, or stale held quotes block new buys and appear in `data_health_blocks`.
-- Raw buy labels below executable strength display as `BULLISH_LEAN`, `WATCH_OR_LEAN`, or `BUY_CANDIDATE`.
+- Raw buy labels below 40% display as `BULLISH_LEAN`; 40-69% displays as `BUY_CANDIDATE`; 70%+ displays as `STRONG_BUY_CANDIDATE`.
 - Non-dip `vol_ratio < 0.70` hard rejects with `VERY_LOW_VOLUME_CONFIRMATION`.
 - Non-dip `0.70 <= vol_ratio < 1.20` applies `LOW_VOLUME_PENALTY_ONLY` with size multiplier `0.75`.
 - `/api/bot/status` exposes raw/display counts, rejection counts, top pre-candidate rejects, top ranked rejects, provider health, stale/risk-unmanaged positions, buy caps, exposure, and tick runtime.

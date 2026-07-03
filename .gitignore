@@ -46,6 +46,8 @@ data/provider_health.json
 data/bot_events.jsonl
 data/tick_log.jsonl
 data/*.lock
+data/*.sqlite3
+data/*.db
 
 # Keep if tickers.json is your normal watchlist config.
 # If it is generated automatically, uncomment this:
@@ -60,22 +62,18 @@ Thumbs.db
 .vscode/
 .idea/
 
+# Local AI / planning artifacts
 AGENTS.md
 CLAUDE.md
 DECISIONS.md
-.planning/phases/01-site-review-fixes/PLAN.md
-.planning/STATE.md
-.planning/ROADMAP.md
-.planning/REQUIREMENTS.md
-.planning/PROJECT.md
-.planning/config.json
-tests/test_stabilization.py
-.codex/environments/environment.toml
-docs/superpowers/plans/2026-06-25-paper-trading-hardening-freeze.md
-README.md
-rules/IMPORTANT_AGENT_WARNING_updated.md
-rules/Handoff.md
-docs/superpowers/reviews/2026-06-26-paper-trading-threshold-policy-review.md
-docs/superpowers/plans/2026-06-30-pythonanywhere-fmp-ticker-history-diagnostics.md
-docs/superpowers/plans/2026-06-26-paper-trading-threshold-policy.md
 PRODUCT.md
+.planning/
+.codex/environments/environment.toml
+docs/superpowers/
+rules/
+
+# Local scratch notes
+docs/deferred-bug-finds.md
+
+# Temporary/local test files
+tests/test_stabilization.py
