@@ -191,12 +191,44 @@ def _bump(counts, reason):
     counts[key] = counts.get(key, 0) + 1
 
 
+JSONL_ROTATE_MAX_LINES = 8000
+JSONL_ROTATE_KEEP_LINES = 5000
+_jsonl_appends_since_check = {}
+
+
+def _rotate_jsonl_if_needed(path, filename):
+    """Audit P5-25: cap JSONL logs on the 512MB free-tier disk quota.
+    # ponytail: amortized check (every 50 appends or >2MB); exact-per-append
+    # only matters if losing a few over-cap lines ever matters."""
+    count = _jsonl_appends_since_check.get(filename, 0) + 1
+    _jsonl_appends_since_check[filename] = count
+    try:
+        oversized = os.path.getsize(path) > 2 * 1024 * 1024
+    except Exception:
+        oversized = False
+    if count < 50 and not oversized:
+        return
+    _jsonl_appends_since_check[filename] = 0
+    try:
+        with open(path, encoding="utf-8") as f:
+            lines = f.readlines()
+        if len(lines) <= JSONL_ROTATE_MAX_LINES:
+            return
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.writelines(lines[-JSONL_ROTATE_KEEP_LINES:])
+        os.replace(tmp, path)
+    except Exception:
+        pass
+
+
 def _append_jsonl(filename, event):
     try:
         os.makedirs(DATA_DIR, exist_ok=True)
         path = os.path.join(DATA_DIR, filename)
         with open(path, "a", encoding="utf-8") as f:
             f.write(json.dumps(event, sort_keys=True, default=str) + "\n")
+        _rotate_jsonl_if_needed(path, filename)
     except Exception:
         try:
             _BOT_STATUS["last_log_error"] = f"{filename}:write_failed"
@@ -1826,10 +1858,11 @@ def run_bot(force=False, user_forced=False, max_runtime_sec=None):
     are dropped rather than queued. Returns (b, traded, last_action).
 
     A3: `force` = bypass the interval cooldown (used by the after-close auto-resume and
-    the scheduler). `user_forced` = a human clicked "run now" on /bot/run — only THIS
-    relaxes the 09:45–15:30 calm-window gate and the "buy at least one name" fallback.
-    The auto-resume must NOT churn a marginal buy in the volatile first minutes of the
-    session, which is what conflating the two flags used to cause."""
+    the scheduler). `user_forced` = a human clicked "run now" (/bot/run or
+    /bot/tick?manual=1) — only THIS relaxes the in_new_buy_window gate
+    (09:30–16:00 ET regular session; audit P0-4 kept the full-session window
+    per Rule 2 buy-lean) and the "buy at least one name" fallback. Machine
+    pings (UptimeRobot) pass user_forced=False."""
     if not BOT_ENABLED:
         b = load_bot()
         _BOT_STATUS.update({"last_run_ts": int(time.time()), "last_action": "bot_disabled",
@@ -2801,7 +2834,8 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
                 })
         return ok
 
-    # #3 TOD gate: no NEW buys outside 09:45-15:30 ET unless a human forces it.
+    # #3 TOD gate: no NEW buys outside the 09:30-16:00 ET regular session
+    # unless a human forces it (weekends/holidays/half-day closes included).
     tod_ok = user_forced or in_new_buy_window()
     no_buy_diag["tod_ok"] = bool(tod_ok)
     no_buy_diag["buy_window_open"] = bool(in_new_buy_window())

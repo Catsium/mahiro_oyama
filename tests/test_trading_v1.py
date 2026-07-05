@@ -3990,6 +3990,24 @@ class PythonAnywhereHardeningTests(unittest.TestCase):
         self.assertEqual(out["spy_data_source"], "fmp_daily")
         self.assertEqual(out["vix_display"], "SPY_REALIZED_VOL_PROXY")
 
+    def test_jsonl_rotation_keeps_newest_lines(self):
+        # Audit P5-25: >8000 lines -> keep newest 5000 (free-tier disk quota).
+        import tempfile, os
+        import trading.bot as bot
+
+        tmp = tempfile.mkdtemp()
+        path = os.path.join(tmp, "tick_log.jsonl")
+        with open(path, "w", encoding="utf-8") as f:
+            for i in range(8100):
+                f.write(f'{{"i": {i}}}\n')
+        bot._jsonl_appends_since_check["tick_log.jsonl"] = 49
+        bot._rotate_jsonl_if_needed(path, "tick_log.jsonl")
+        with open(path, encoding="utf-8") as f:
+            lines = f.readlines()
+        self.assertEqual(len(lines), bot.JSONL_ROTATE_KEEP_LINES)
+        self.assertEqual(lines[-1].strip(), '{"i": 8099}')
+        self.assertEqual(lines[0].strip(), f'{{"i": {8100 - bot.JSONL_ROTATE_KEEP_LINES}}}')
+
     def test_provider_support_registry_marks_and_reprobes(self):
         # Audit P0-5: 402 symbols are skipped for a week, then re-probed.
         import tempfile, os
