@@ -1037,6 +1037,40 @@ class TradingV2AttributionTests(unittest.TestCase):
         self.assertEqual(bucket["neutral"], 1)
         self.assertEqual(bucket["ema_net_ret_pct"], 0.2)
 
+    def test_skipped_candidates_fill_edge_buckets_with_per_tick_cap(self):
+        # Audit P0-2: top skipped candidates are recorded (decision="skipped")
+        # so forward-return buckets fill without trading; cap 5 per tick.
+        import trading.bot as bot
+        state = {}
+        bot._SKIPS_RECORDED_THIS_TICK = 0
+        recorded = 0
+        for i in range(7):
+            cand = _entry_candidate(f"SKP{i:02d}", confidence=55, cluster="trend")
+            ok = bot._record_candidate_observation(
+                state, cand, "skipped", "EDGE_TOO_LOW", 1_700_000_000, "neutral")
+            recorded += 1 if ok else 0
+        self.assertEqual(recorded, 5)  # TRACK_TOP_SKIPS_PER_CYCLE
+        events = state["attribution_events"]
+        self.assertEqual(len(events), 5)
+        self.assertTrue(all(e["decision"] == "skipped" for e in events))
+        self.assertTrue(all(e["skip_reason"] == "EDGE_TOO_LOW" for e in events))
+
+        updated = update_forward_outcomes(
+            state, lambda tk: 105.0, ts=1_700_000_000 + 6 * 86400)
+        self.assertGreater(updated, 0)
+        self.assertTrue(all(e["forward_returns"].get("5d") == 5.0
+                            for e in state["attribution_events"]))
+        bucket = state["attribution_buckets"]["neutral:trend:trend"]
+        self.assertEqual(bucket["skipped_n"], 5)
+        self.assertEqual(bucket["executed_n"], 0)
+
+        # executed events are never blocked by the skip cap
+        bot._SKIPS_RECORDED_THIS_TICK = bot.TRACK_TOP_SKIPS_PER_CYCLE
+        execd = bot._record_candidate_observation(
+            state, _entry_candidate("EXEC1"), "executed", "buy",
+            1_700_100_000, "neutral")
+        self.assertTrue(execd)
+
     def test_negative_votes_fall_back_to_global_bucket(self):
         state = {}
         cand = _entry_candidate("NEG", cluster="mixed")
@@ -1153,7 +1187,9 @@ class TradingV2AttributionTests(unittest.TestCase):
         finally:
             dc.PYTHONANYWHERE_MODE = old_pa
 
-    def test_record_entry_event_ignores_skipped_candidates(self):
+    def test_record_entry_event_accepts_skipped_rejects_others(self):
+        # Reversed by audit P0-2: skipped candidates ARE recorded now so edge
+        # buckets can fill without trading. Other decisions stay ignored.
         state = {}
         event = record_entry_event(
             state,
@@ -1163,8 +1199,19 @@ class TradingV2AttributionTests(unittest.TestCase):
             ts=123,
             regime="neutral",
         )
-        self.assertIsNone(event)
-        self.assertEqual(state.get("attribution_events"), [])
+        self.assertIsNotNone(event)
+        self.assertEqual(event["decision"], "skipped")
+        self.assertEqual(event["skip_reason"], "EV gate")
+        other = record_entry_event(
+            state,
+            _entry_candidate("IGN", cluster="trend"),
+            "blocked",
+            "whatever",
+            ts=123,
+            regime="neutral",
+        )
+        self.assertIsNone(other)
+        self.assertEqual(len(state["attribution_events"]), 1)
 
 
 class TradingV2IntegrationTests(unittest.TestCase):

@@ -36,8 +36,9 @@ from trading.risk import (
 )
 from trading.signals import classify_display_signal, get_recommendation
 from trading.attribution import (
-    ensure_attribution_state, exit_profile, record_entry_event,
-    record_exit_event, update_exit_post_outcomes, update_forward_outcomes,
+    TRACK_TOP_SKIPS_PER_CYCLE, ensure_attribution_state, exit_profile,
+    record_entry_event, record_exit_event, update_exit_post_outcomes,
+    update_forward_outcomes,
 )
 from trading.catalysts import classify_catalyst
 from trading.config import DEFAULT_CONFIG, active_config, config_hash
@@ -171,6 +172,8 @@ REQUIRED_TICK_LOG_FIELDS = (
     "candidate_pool_count",
     "ranked_count",
     "tradable_count",
+    "ev_near_miss_count",
+    "rotation_skipped_unsupported",
     "top_rejection_reasons",
     "degraded_reject_counts",
     "buys_executed",
@@ -1614,11 +1617,24 @@ def _persist_no_buy_diag(b, diag, blocker=None, traded=False):
     return b
 
 
+# Per-tick budget for recording skipped candidates (audit P0-2). Buy loop
+# processes candidates in ranked order, so the first N skips are the top-N.
+_SKIPS_RECORDED_THIS_TICK = 0
+
+
 def _record_candidate_observation(b, cand, decision, reason, now, regime_kind):
-    """Persist one candidate for forward-return attribution."""
-    if decision != "executed":
+    """Persist one candidate (executed or top-ranked skip) for forward-return attribution."""
+    global _SKIPS_RECORDED_THIS_TICK
+    if decision == "skipped":
+        if _SKIPS_RECORDED_THIS_TICK >= TRACK_TOP_SKIPS_PER_CYCLE:
+            return False
+        if float(cand.get("price") or 0) <= 0:
+            return False
+    elif decision != "executed":
         return False
     event = record_entry_event(b, cand, decision, reason, ts=now, regime=regime_kind)
+    if event is not None and decision == "skipped":
+        _SKIPS_RECORDED_THIS_TICK += 1
     return bool(event)
 
 
@@ -1744,6 +1760,8 @@ def run_bot(force=False, user_forced=False, max_runtime_sec=None):
 
 
 def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
+    global _SKIPS_RECORDED_THIS_TICK
+    _SKIPS_RECORDED_THIS_TICK = 0  # ticks are single-flight (_bot_run_lock)
     b = load_bot()
     _ensure_v1_state(b)
     _memory_guard(b)
@@ -2897,6 +2915,16 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
     ) if candidate_pool else []
     no_buy_diag["ranked_count"] = len(ranked_candidates)
     no_buy_diag["tradable_count"] = sum(1 for c in ranked_candidates if c.get("tradable"))
+    # candidates whose gross edge is within 0.2pp of required — tells us if
+    # EV gates are marginally mistuned without re-auditing (audit P5-24)
+    ev_near_miss = 0
+    for c in ranked_candidates:
+        if c.get("tradable"):
+            continue
+        gap = (c.get("ev_diagnostics") or {}).get("edge_gap_to_required_pct")
+        if gap is not None and -0.2 <= float(gap) < 0:
+            ev_near_miss += 1
+    no_buy_diag["ev_near_miss_count"] = ev_near_miss
     variance_checks = []
 
     def _ranking_rows():
