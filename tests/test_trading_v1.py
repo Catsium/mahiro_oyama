@@ -406,7 +406,10 @@ class TradingV1SizingTests(unittest.TestCase):
         self.assertFalse(modes["degraded_block_low_volume_penalty"])
         self.assertFalse(modes["degraded_block_pyramiding"])
 
-    def test_missing_spy_is_neutral_warning_not_degraded(self):
+    def test_missing_spy_is_degraded_label_with_normal_gates(self):
+        # Audit P1-6 reverses the warning-only pin: missing SPY now reports
+        # DEGRADED_MODE truthfully, while standard-gates parity (Rule 1) keeps
+        # every effective gate identical to NORMAL.
         import trading.bot as bot
 
         mode = bot._market_data_mode(
@@ -415,20 +418,21 @@ class TradingV1SizingTests(unittest.TestCase):
              "volatility_source": "spy_realized_vol_proxy"},
             DEFAULT_CONFIG,
         )
-        self.assertEqual(mode["trading_mode"], "NORMAL_MODE")
-        self.assertFalse(mode["degraded_mode_active"])
-        self.assertFalse(mode["degraded_standard_gates_active"])
-        self.assertIsNone(mode["degraded_gate_policy"])
+        self.assertEqual(mode["trading_mode"], "DEGRADED_MODE")
+        self.assertTrue(mode["degraded_mode_active"])
+        self.assertTrue(mode["degraded_standard_gates_active"])
+        self.assertEqual(mode["degraded_gate_policy"], "standard_gates_for_testing")
         self.assertEqual(mode["mode_size_mult"], 1.0)
         self.assertIsNone(mode["mode_size_reason"])
         self.assertEqual(mode["effective_min_buy_confidence"], 40)
         self.assertTrue(mode["normal_ev_gates_required"])
         self.assertTrue(mode["normal_risk_caps_required"])
         self.assertTrue(mode["fresh_quote_required"])
-        self.assertEqual(mode["data_health_blocks"], [])
+        self.assertTrue(mode["allow_buys"])
+        self.assertEqual(mode["data_health_blocks"], ["SPY_DATA_MISSING"])
         self.assertEqual(mode["data_health_warnings"], ["SPY_DATA_MISSING"])
 
-    def test_missing_volatility_is_neutral_warning_not_degraded(self):
+    def test_missing_volatility_is_degraded_label_with_normal_gates(self):
         import trading.bot as bot
 
         mode = bot._market_data_mode(
@@ -436,13 +440,52 @@ class TradingV1SizingTests(unittest.TestCase):
             {"data_ok": False, "source": None, "volatility_source": None},
             DEFAULT_CONFIG,
         )
-        self.assertEqual(mode["trading_mode"], "NORMAL_MODE")
-        self.assertFalse(mode["degraded_mode_active"])
-        self.assertFalse(mode["degraded_standard_gates_active"])
+        self.assertEqual(mode["trading_mode"], "DEGRADED_MODE")
+        self.assertTrue(mode["degraded_mode_active"])
+        self.assertTrue(mode["degraded_standard_gates_active"])
         self.assertEqual(mode["mode_size_mult"], 1.0)
         self.assertIsNone(mode["mode_size_reason"])
-        self.assertEqual(mode["data_health_blocks"], [])
+        self.assertTrue(mode["allow_buys"])
+        self.assertEqual(mode["data_health_blocks"], ["VOLATILITY_DATA_MISSING"])
         self.assertEqual(mode["data_health_warnings"], ["VOLATILITY_DATA_MISSING"])
+
+    def test_degraded_parity_identical_decisions_and_sizes(self):
+        # Rule 1 regression: the same candidate pool ranked under NORMAL and
+        # DEGRADED(standard gates) mode_info must produce identical decisions.
+        import trading.bot as bot
+
+        normal = bot._market_data_mode(
+            {"spy_data_ok": True},
+            {"data_ok": True, "source": "vix", "volatility_source": "vix"},
+            DEFAULT_CONFIG,
+        )
+        degraded = bot._market_data_mode(
+            {"spy_data_ok": False},
+            {"data_ok": False, "source": None, "volatility_source": None},
+            DEFAULT_CONFIG,
+        )
+        self.assertEqual(normal["trading_mode"], "NORMAL_MODE")
+        self.assertEqual(degraded["trading_mode"], "DEGRADED_MODE")
+        pool = [
+            _entry_candidate("PAR1", confidence=55, cluster="trend"),
+            _entry_candidate("PAR2", confidence=42, cluster="mixed", score=0),
+            _entry_candidate("PAR3", confidence=75, cluster="dip", score=6),
+        ]
+        results = {}
+        for label, mode in (("normal", normal), ("degraded", degraded)):
+            ranked = rank_candidates(
+                [dict(c, ctx=dict(c["ctx"]), rec=dict(c["rec"])) for c in pool],
+                10_000, -6, "neutral", 1, 1, 1, {},
+                min_position_usd=150,
+                mode_size_mult=mode["mode_size_mult"],
+                mode_size_reason=mode["mode_size_reason"],
+            )
+            results[label] = [
+                (c["ticker"], c["tradable"], c["rank_reason_code"],
+                 c["risk"]["target_notional"])
+                for c in ranked
+            ]
+        self.assertEqual(results["normal"], results["degraded"])
 
     def test_confidence_scale_uses_40_percent_entry_buckets(self):
         self.assertEqual(confidence_scale(39), 0.0)
@@ -3943,6 +3986,109 @@ class PythonAnywhereHardeningTests(unittest.TestCase):
         self.assertEqual(out["spy_data_source"], "fmp_daily")
         self.assertEqual(out["vix_display"], "SPY_REALIZED_VOL_PROXY")
 
+    def _run_stale_holding_tick(self, snapshot_price, snapshot_age_sec,
+                                peak=None, avg_cost=100.0):
+        # Audit P1-14 harness: one holding, stale live quote, recorded snapshot.
+        import trading.bot as bot
+
+        now = time.time()
+        state = {
+            "cash": 1000.0,
+            "starting": 1000.0,
+            "holdings": {"STALE1": {
+                "shares": 5.0,
+                "avg_cost": avg_cost,
+                "entry_ts": now - 48 * 3600,
+                "peak": peak if peak is not None else avg_cost,
+                "trough": avg_cost,
+                "peak_pnl_pct": (((peak or avg_cost) - avg_cost) / avg_cost * 100.0),
+            }},
+            "history": [],
+            "last_trade": 0,
+            "stopped": False,
+        }
+        hold_rec = {"cls": "hold", "signal": "HOLD", "confidence": 50,
+                    "score": 0, "categories": {}, "reasons": []}
+        names = [
+            "load_bot", "save_bot", "is_market_open", "in_new_buy_window",
+            "load_tickers", "get_market_regime", "get_vix", "get_news",
+            "get_history", "get_intraday_context", "get_earnings_soon",
+            "get_analyst_rec", "get_insider_sentiment", "get_recommendation",
+            "classify_catalyst", "get_quote", "get_sector", "get_corr_group",
+            "_scan_snapshot", "load_feedback_stats", "load_recent_suggestions",
+            "log_suggestion_run", "prune_suggestion_store", "prune_cache_dir",
+            "build_extra_ticker_suggestions", "load_price_hist",
+        ]
+        old = {n: getattr(bot, n) for n in names}
+        try:
+            bot.load_bot = lambda: state
+            bot.save_bot = lambda _b: None
+            bot.is_market_open = lambda: True
+            bot.in_new_buy_window = lambda: True
+            bot.load_tickers = lambda: []
+            bot.get_market_regime = lambda _cfg=None: {
+                "regime": "neutral", "regime_effective": "neutral",
+                "regime_v3": "normal", "regime_v3_effective": "normal",
+                "regime_v3_raw": "normal", "spy_data_ok": True,
+                "regime_data_status": "ok", "top_sectors": [],
+            }
+            bot.get_vix = lambda: {"regime": "NORMAL", "mult": 1.0, "vix": 12.0,
+                                   "data_ok": True, "data_status": "ok"}
+            bot.get_news = lambda _t: ([], 0.0)
+            bot.get_history = lambda _t: {}
+            bot.get_intraday_context = lambda _t: {}
+            bot.get_earnings_soon = lambda _t: {}
+            bot.get_analyst_rec = lambda _t: {}
+            bot.get_insider_sentiment = lambda _t: {}
+            bot.get_recommendation = lambda *_a, **_k: dict(hold_rec)
+            bot.classify_catalyst = lambda *_a, **_k: {}
+            bot.get_quote = lambda _t: {"price": 0, "stale": True}
+            bot.get_sector = lambda _t: "tech"
+            bot.get_corr_group = lambda _t: None
+            bot._scan_snapshot = lambda: ([], 0)
+            bot.load_feedback_stats = lambda *_a, **_k: {}
+            bot.load_recent_suggestions = lambda *_a, **_k: {}
+            bot.log_suggestion_run = lambda *_a, **_k: None
+            bot.prune_suggestion_store = lambda *_a, **_k: None
+            bot.prune_cache_dir = lambda **_k: {"removed": 0, "kept": 0}
+            bot.build_extra_ticker_suggestions = lambda *_a, **_k: []
+            bot.load_price_hist = lambda: {
+                "STALE1": [[int(now - snapshot_age_sec), float(snapshot_price)]]
+            }
+            out_state, traded, _action = bot._run_bot_locked(force=True)
+        finally:
+            for name, value in old.items():
+                setattr(bot, name, value)
+        return out_state, traded
+
+    def test_stale_quote_protective_stop_fires_only_hard_stop(self):
+        # Deep loss vs fresh snapshot → ONLY the hard stop fires
+        out, traded = self._run_stale_holding_tick(80.0, 20 * 60)
+        self.assertTrue(traded)
+        self.assertNotIn("STALE1", out["holdings"])
+        outcome = out["trade_outcomes"][-1]
+        self.assertEqual(outcome["exit_reason"], "stop_loss_stale_quote")
+
+    def test_stale_quote_small_loss_does_not_exit_even_when_aging_due(self):
+        # −1%, held 48h (> neutral aging 12h): live aging would exit; stale must not
+        out, traded = self._run_stale_holding_tick(99.0, 20 * 60)
+        self.assertFalse(traded)
+        self.assertIn("STALE1", out["holdings"])
+
+    def test_stale_quote_old_snapshot_halts_completely(self):
+        # Snapshot 90 min old (> 60 min freshness) → halt exactly as before
+        out, traded = self._run_stale_holding_tick(80.0, 90 * 60)
+        self.assertFalse(traded)
+        self.assertIn("STALE1", out["holdings"])
+        # and no peak/trough mutation happened off the recorded price
+        self.assertEqual(out["holdings"]["STALE1"]["peak"], 100.0)
+
+    def test_stale_quote_trail_never_fires(self):
+        # +20% with peak +40% → live trail would exit; stale must hold
+        out, traded = self._run_stale_holding_tick(120.0, 20 * 60, peak=140.0)
+        self.assertFalse(traded)
+        self.assertIn("STALE1", out["holdings"])
+
     def test_record_hold_uses_display_signal_labels(self):
         import trading.bot as bot
 
@@ -4162,22 +4308,24 @@ class PythonAnywhereHardeningTests(unittest.TestCase):
         finally:
             for name, value in old.items():
                 setattr(bot, name, value)
+        # Audit P1-6: missing SPY now truthfully reports DEGRADED_MODE, and the
+        # standard-gates parity path keeps every effective gate/size at NORMAL.
         self.assertEqual(captured["vix_mult"], 1.0)
         self.assertEqual(captured["mode_size_mult"], 1.0)
         self.assertIsNone(captured["mode_size_reason"])
         diag = out_state["last_no_buy_diagnostics"]
         self.assertTrue(diag["regime_allow_buys"])
-        self.assertEqual(diag["trading_mode"], "NORMAL_MODE")
-        self.assertFalse(diag["degraded_mode_active"])
+        self.assertEqual(diag["trading_mode"], "DEGRADED_MODE")
+        self.assertTrue(diag["degraded_mode_active"])
         self.assertTrue(diag["degraded_use_standard_gates_for_testing"])
-        self.assertFalse(diag["degraded_standard_gates_active"])
-        self.assertIsNone(diag["degraded_gate_policy"])
+        self.assertTrue(diag["degraded_standard_gates_active"])
+        self.assertEqual(diag["degraded_gate_policy"], "standard_gates_for_testing")
         self.assertEqual(diag["effective_size_mult"], 1.0)
         self.assertEqual(diag["effective_min_buy_confidence"], 40)
         self.assertTrue(diag["normal_ev_gates_required"])
         self.assertTrue(diag["normal_risk_caps_required"])
         self.assertTrue(diag["fresh_quote_required"])
-        self.assertEqual(diag["data_health_blocks"], [])
+        self.assertEqual(diag["data_health_blocks"], ["SPY_DATA_MISSING"])
         self.assertIn("SPY_DATA_MISSING", diag["data_health_warnings"])
         self.assertTrue(diag["regime_data_fallback"])
         self.assertEqual(diag["regime_data_size_mult"], 1.0)

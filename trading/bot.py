@@ -72,8 +72,8 @@ from utils.deploy_config import (
 )
 from utils.config import BOT_ENABLED
 from utils.storage import (
-    acquire_bot_file_lock, load_bot, save_bot, load_tickers, SUGGESTION_DB_FILE,
-    DATA_DIR, storage_debug_info,
+    acquire_bot_file_lock, load_bot, save_bot, load_tickers, load_price_hist,
+    SUGGESTION_DB_FILE, DATA_DIR, storage_debug_info,
 )
 from utils.threading_utils import _bot_run_lock, _BOT_STATUS, BOT_INTERVAL
 from utils.time_utils import (
@@ -984,19 +984,20 @@ def _market_data_mode(regime, vix_data, cfg):
     standard_gates_config = _degraded_standard_gates_enabled(mode_cfg)
     normal_min_confidence = float(signal_cfg.get("min_buy_confidence", 40))
     degraded_min_confidence = float(mode_cfg.get("degraded_min_confidence", normal_min_confidence))
-    # DELIBERATE (pinned by test_missing_spy_is_neutral_warning_not_degraded and its
-    # volatility variant): missing SPY/vol data is recorded as a *warning*, never a
-    # *block*, so `blocks` stays empty and mode falls through to NORMAL_MODE rather than
-    # DEGRADED_MODE — the buy-lean bot keeps trading through data gaps. Two known
-    # consequences are left as-is ON PURPOSE (do not "fix" without updating those tests):
-    #   1. DEGRADED_MODE is unreachable in the live path — its whole engine is dead code.
-    #   2. On PA the healthy mode is PROXY_MODE (size x0.85); losing SPY/vol data flips to
-    #      NORMAL_MODE (size x1.0), i.e. degraded data yields LARGER size + no vol gate.
+    # Audit P1-6 (reverses the earlier warning-only decision): missing SPY/vol
+    # now BLOCKS into DEGRADED_MODE so the label/diagnostics are truthful. Rule 1
+    # (degraded == normal) is enforced by degraded_use_standard_gates_for_testing
+    # (default True): size mult 1.0, normal min-conf/EV/risk/quote gates — identical
+    # decisions, honest label. The restricted degraded_* keys remain a rollback
+    # profile behind that flag only. Known quirk kept on purpose: PROXY_MODE sizes
+    # x0.85 while DEGRADED sizes x1.0 — that is exactly what Rule 1 prescribes.
     blocks = []
     warnings = []
     if not spy_ok:
+        blocks.append("SPY_DATA_MISSING")
         warnings.append("SPY_DATA_MISSING")
     if not vol_ok:
+        blocks.append("VOLATILITY_DATA_MISSING")
         warnings.append("VOLATILITY_DATA_MISSING")
 
     if spy_ok and vol_ok and is_proxy and mode_cfg.get("allow_proxy_mode", True):
@@ -1198,7 +1199,7 @@ def buyable_reason(t, s, recent_sells=None, regime_kind="neutral", holdings=None
         sell_ts = float((recent_sells.get(t) or {}).get("ts", 0) or 0)
         age_min = (time.time() - sell_ts) / 60.0 if sell_ts else 0.0
         reason_l = str(recent_reason or "").lower()
-        if reason_l in {"loss", "stop_loss", "trend_failure"}:
+        if reason_l in {"loss", "stop_loss", "stop_loss_stale_quote", "trend_failure"}:
             base_cd = float(risk_cfg.get("stop_loss_rebuy_cooldown_minutes", 30))
         elif reason_l in {"trail", "trailing_stop"}:
             base_cd = float(risk_cfg.get("trailing_stop_rebuy_cooldown_minutes", 15))
@@ -1620,6 +1621,23 @@ def _persist_no_buy_diag(b, diag, blocker=None, traded=False):
 # Per-tick budget for recording skipped candidates (audit P0-2). Buy loop
 # processes candidates in ranked order, so the first N skips are the top-N.
 _SKIPS_RECORDED_THIS_TICK = 0
+
+
+def _recorded_price_within(t, max_age_sec=3600):
+    """Latest recorded snapshot price for `t` if fresh enough → (price, age_sec).
+
+    Used by the SELL pass to run the protective hard stop when the live quote
+    is stale (audit P1-14). Returns (None, None) when no usable snapshot.
+    """
+    try:
+        pts = (load_price_hist() or {}).get(t) or []
+        ts, price = pts[-1]
+        age = time.time() - float(ts)
+        if 0 <= age <= max_age_sec and float(price) > 0:
+            return float(price), age
+    except Exception:
+        pass
+    return None, None
 
 
 def _record_candidate_observation(b, cand, decision, reason, now, regime_kind):
@@ -2245,20 +2263,34 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
     for t in list(b["holdings"].keys()):
         if t not in sigs: continue
         s = sigs[t]; pr = s["price"]
-        # Round-4 Bug Fix #1: halt trading on stale-quote tickers. We do NOT
-        # trail-exit, signal-flip, or age-out a position based on a price that
-        # may be hours/days old. Stop-loss is also disabled here — if the API
-        # is down we don't have a valid current price to compare against.
+        # Round-4 Bug Fix #1 + audit P1-14: on a stale quote we do NOT
+        # trail-exit, signal-flip, or age-out — those need live data. But if a
+        # recorded snapshot ≤60 min old exists, we still evaluate ONLY the hard
+        # stop-loss against it so losses don't run unmanaged through an outage.
+        stale_stop_only = False
+        snap_age = None
         if s.get("stale"):
-            try: print(f"[run_bot] {t}: stale quote (no live data), halting trade decisions")
+            snap_pr, snap_age = _recorded_price_within(t)
+            if snap_pr is None:
+                try: print(f"[run_bot] {t}: stale quote (no live data), halting trade decisions")
+                except Exception: pass
+                continue
+            pr = snap_pr
+            stale_stop_only = True
+            try: print(f"[run_bot] {t}: stale quote — protective stop only, "
+                       f"recorded snapshot {snap_age/60.0:.0f}min old")
             except Exception: pass
-            continue
         if pr <= 0: continue
         h = b["holdings"][t]
-        peak = max(h.get("peak", h["avg_cost"]), pr)
-        h["peak"] = round(peak, 4)
-        trough = min(h.get("trough", h["avg_cost"]), pr)
-        h["trough"] = round(trough, 4)
+        if stale_stop_only:
+            # don't ratchet peaks/troughs off recorded prices
+            peak = h.get("peak", h["avg_cost"])
+            trough = h.get("trough", h["avg_cost"])
+        else:
+            peak = max(h.get("peak", h["avg_cost"]), pr)
+            h["peak"] = round(peak, 4)
+            trough = min(h.get("trough", h["avg_cost"]), pr)
+            h["trough"] = round(trough, 4)
         # Round-5 cost model: no bps slippage. pnl measured at raw price; the
         # flat $0.99 is applied to cash at execution, not baked into price.
         pnl_pct = (pr - h["avg_cost"]) / h["avg_cost"] * 100 if h["avg_cost"] else 0
@@ -2315,7 +2347,7 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
             AGING_HOURS, held_secs, MIN_HOLDING_SEC, eff_atr_for_stop,
             intra_atr=intra_atr, vwma_dist=vwma_dist,
         )
-        if shadow_old_exit.get("would_exit") and not h.get("shadow_old_exit"):
+        if shadow_old_exit.get("would_exit") and not h.get("shadow_old_exit") and not stale_stop_only:
             h["shadow_old_exit"] = shadow_old_exit
         dyn_trail_pct, trail_source = dynamic_trail_width(intra_atr, atr_pct, TRAIL_STOP_PCT)
         dyn_trail_pct = round(dyn_trail_pct * exit_ladder.get("trail_mult", 1.0), 3)
@@ -2333,14 +2365,18 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
         vwma_protects = (vwma_dist > 1.0) and (trail_pct > -3.0)
         trail_active = trail_triggered and not vwma_protects
 
-        peak_pnl_pct = max(h.get("peak_pnl_pct", 0), pnl_pct)
-        h["peak_pnl_pct"] = round(peak_pnl_pct, 3)
+        if stale_stop_only:
+            peak_pnl_pct = h.get("peak_pnl_pct", 0)
+        else:
+            peak_pnl_pct = max(h.get("peak_pnl_pct", 0), pnl_pct)
+            h["peak_pnl_pct"] = round(peak_pnl_pct, 3)
 
         # #4.3 signal-degradation partial exit
         DEGRADE_LADDER = {"strong-buy": 3, "buy": 2, "hold": 1, "sell": 0, "strong-sell": 0}
         DEGRADE_MIN_GAP = 2
         entry_cls = h.get("entry_signal_cls")
         if (entry_cls and held_secs >= MIN_HOLDING_SEC
+                and not stale_stop_only
                 and not h.get("degrade_trimmed", False)):
             entry_rank = DEGRADE_LADDER.get(entry_cls, 1)
             cur_rank   = DEGRADE_LADDER.get(cls, 1)
@@ -2361,6 +2397,7 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
             "partial_take_pct", PARTIAL_TAKE_PCT / 100.0
         ) * 100.0
         if (PARTIAL_TAKE_ENABLED and peak_pnl_pct >= ladder_partial_take_pct
+                and not stale_stop_only
                 and not h.get("partial_taken", False)
                 and held_secs >= MIN_HOLDING_SEC):
             partial_reason = (f"Partial take: peak hit +{peak_pnl_pct:.1f}%, "
@@ -2400,7 +2437,15 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
             stop_label = f"{effective_stop:.1f}%, regime={regime_label}{atr_note}; {exit_ladder_note}"
 
         sell_reason = None; exit_reason_key = ""
-        if pnl_pct <= effective_stop:
+        if stale_stop_only:
+            # Audit P1-14: pure hard stop only — no ratchet lock, no time-decay,
+            # no trail/aging/flip on a recorded (non-live) price.
+            if pnl_pct <= dynamic_stop:
+                sell_reason = (f"Stop-loss on stale quote: down {pnl_pct:.1f}% vs recorded "
+                               f"snapshot {(snap_age or 0)/60.0:.0f}min old "
+                               f"(threshold {dynamic_stop:.1f}%)")
+                exit_reason_key = "stop_loss_stale_quote"
+        elif pnl_pct <= effective_stop:
             if effective_stop > 0:
                 # Cost-aware ratchet exit — locking in a NET-positive gain, not a loss.
                 # Tag it distinctly so it gets the short (non-loss) cooldown and isn't
