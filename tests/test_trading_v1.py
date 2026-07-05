@@ -1586,10 +1586,14 @@ class TradingV1SignalTests(unittest.TestCase):
             allow_live_risk=False,
         )
 
+        # Audit P1-11 reverses the old pin: core daily history is present and
+        # only optional categories (mfi/weekly/rel_str) are missing, so the
+        # 0.70 floor applies and low_data_quality no longer blocks the floor.
         self.assertEqual(rec["cls"], "buy")
-        self.assertLess(rec["data_quality"], 0.60)
-        self.assertFalse(rec["confidence_floor_candidate"])
-        self.assertIn("low_data_quality", rec["confidence_floor_blockers"])
+        self.assertLess(rec["data_quality_raw"], 0.60)
+        self.assertGreaterEqual(rec["data_quality"], 0.70)
+        self.assertTrue(rec["data_quality_floor_applied"])
+        self.assertNotIn("low_data_quality", rec["confidence_floor_blockers"])
 
     def test_vote_positive_buy_labels_survive_confidence_penalties(self):
         ctx = {
@@ -3985,6 +3989,139 @@ class PythonAnywhereHardeningTests(unittest.TestCase):
         self.assertTrue(out["data_ok"])
         self.assertEqual(out["spy_data_source"], "fmp_daily")
         self.assertEqual(out["vix_display"], "SPY_REALIZED_VOL_PROXY")
+
+    def test_get_history_synthetic_recorded_trust_boundary(self):
+        # Audit P1-7: ≥25 recorded closes with a fresh newest point → trusted
+        # synthetic ctx; fewer or old points stay an untrusted fallback.
+        import market.history as history
+        import trading.indicators as indicators
+        import trading.risk as risk
+
+        now = int(time.time())
+        fresh_pts = [[now - (30 - i) * 3600, 100.0 + i * 0.1] for i in range(30)]
+        old_pts = [[now - 12 * 86400 - (30 - i) * 3600, 100.0] for i in range(30)]
+        few_pts = [[now - (20 - i) * 3600, 100.0] for i in range(20)]
+        old = {
+            "cache_get": history.cache_get,
+            "cache_set": history.cache_set,
+            "_daily_bars": history._daily_bars,
+            "load_price_hist": indicators.load_price_hist,
+            "get_sector": risk.get_sector,
+        }
+        try:
+            history.cache_get = lambda *_a, **_k: None
+            history.cache_set = lambda *_a, **_k: None
+            history._daily_bars = lambda _tk: None
+            risk.get_sector = lambda _tk: None
+
+            indicators.load_price_hist = lambda: {"SYN": fresh_pts}
+            r = history.get_history("SYN")
+            self.assertEqual(r["history_source"], "synthetic_recorded")
+            self.assertEqual(r["history_status"], "synthetic_recorded")
+            self.assertEqual(r["history_rows"], 30)
+            self.assertIn("rsi", r)
+            self.assertIn("ma30", r)
+            import trading.bot as bot
+            st = bot._history_execution_status(r)
+            self.assertTrue(st["trusted"])
+            self.assertIsNone(st["blocker"])
+
+            indicators.load_price_hist = lambda: {"SYN": few_pts}
+            r2 = history.get_history("SYN")
+            self.assertEqual(r2.get("history_rows", 0), 0)
+
+            indicators.load_price_hist = lambda: {"SYN": old_pts}
+            r3 = history.get_history("SYN")
+            self.assertEqual(r3.get("history_rows", 0), 0)
+        finally:
+            history.cache_get = old["cache_get"]
+            history.cache_set = old["cache_set"]
+            history._daily_bars = old["_daily_bars"]
+            indicators.load_price_hist = old["load_price_hist"]
+            risk.get_sector = old["get_sector"]
+
+    def test_half_missing_providers_still_rank_candidates(self):
+        # Audit P1 goal: with 50% of tickers on synthetic ctx and 50% missing,
+        # ranking still produces tradable candidates (no MISSING_HISTORY wall).
+        import trading.bot as bot
+
+        good_ctx = {"history_rows": 30, "history_source": "synthetic_recorded",
+                    "history_status": "synthetic_recorded", "adx": 30, "rsi": 55,
+                    "week_chg_pct": 0, "dist_from_high_pct": 0, "vol_ratio": 1.2,
+                    "avg_dollar_vol_20d": 100_000_000, "atr_pct": 2.0}
+        dead_ctx = {"history_rows": 0, "history_source": "missing",
+                    "history_status": "missing"}
+        pool = []
+        for i in range(8):
+            cand = _entry_candidate(f"MIX{i}", confidence=55, cluster="trend")
+            cand["ctx"] = dict(good_ctx if i % 2 == 0 else dead_ctx)
+            pool.append(cand)
+        buyable = [c for c in pool
+                   if bot._history_execution_status(c["ctx"])["blocker"] is None]
+        self.assertEqual(len(buyable), 4)
+        ranked = rank_candidates(buyable, 10_000, -6, "neutral", 1, 1, 1, {},
+                                 min_position_usd=150)
+        self.assertTrue(any(c["tradable"] for c in ranked))
+
+    def test_rel_str_spy_fallback_when_sector_etf_missing(self):
+        # Audit P1-12: XLK/XLY 402 on PA → benchmark vs SPY, labeled.
+        import pandas as pd
+        import trading.indicators as ind
+        import market.data_manager as dm
+
+        df = pd.DataFrame({"Close": [100.0 + i for i in range(25)]})
+        old_get_daily = dm.get_daily
+        old_cache_get = ind.cache_get
+        old_cache_set = ind.cache_set
+        try:
+            ind.cache_get = lambda *_a, **_k: None
+            ind.cache_set = lambda *_a, **_k: None
+            dm.get_daily = lambda tk: None if tk == "XLK" else df
+            out = ind.sector_relative_strength("TKR", "tech", lookback_days=20)
+        finally:
+            dm.get_daily = old_get_daily
+            ind.cache_get = old_cache_get
+            ind.cache_set = old_cache_set
+        self.assertEqual(out["relative_strength_source"], "spy_fallback")
+        self.assertEqual(out["rel_str_benchmark"], "SPY")
+        self.assertIn("rel_str_pct", out)
+
+    def test_credit_signal_neutral_immediately_on_pa(self):
+        # Audit P1-13: HYG/IEI permanently 402 on PA — no fetch spend.
+        import trading.risk as risk
+
+        old_mode = risk.PYTHONANYWHERE_MODE
+        old_cache_get = risk.cache_get
+        try:
+            risk.PYTHONANYWHERE_MODE = True
+            def _boom(*_a, **_k):
+                raise AssertionError("credit_signal touched cache/providers on PA")
+            risk.cache_get = _boom
+            out = risk.credit_signal()
+        finally:
+            risk.PYTHONANYWHERE_MODE = old_mode
+            risk.cache_get = old_cache_get
+        self.assertEqual(out["credit_label"], "neutral")
+        self.assertEqual(out["credit_pct"], 50.0)
+        self.assertEqual(out["credit_status"], "unavailable_on_pa")
+
+    def test_data_quality_floor_with_core_history_present(self):
+        # Audit P1-11: optional categories missing (news/analyst/insider/
+        # rel_str/mfi/weekly) must not sink an otherwise-valid BUY: dq >= 0.70.
+        core_only_ctx = {
+            "current": 105.0, "ma7": 103.0, "ma30": 100.0, "rsi": 60.0,
+            "week_chg_pct": 2.0, "adx": 30.0, "mom_30d_pct": 5.0,
+            "vol_ratio": 1.4, "avg_dollar_vol_20d": 100_000_000,
+            "history_rows": 30, "history_source": "synthetic_recorded",
+            "history_status": "synthetic_recorded",
+        }
+        rec = get_recommendation(0.0, core_only_ctx, regime=None)
+        self.assertGreaterEqual(rec["data_quality"], 0.70)
+        self.assertLess(rec["data_quality_raw"], 0.70)
+        self.assertTrue(rec["data_quality_floor_applied"])
+
+        rec_no_core = get_recommendation(0.0, {}, regime=None)
+        self.assertFalse(rec_no_core["data_quality_floor_applied"])
 
     def _run_stale_holding_tick(self, snapshot_price, snapshot_age_sec,
                                 peak=None, avg_cost=100.0):

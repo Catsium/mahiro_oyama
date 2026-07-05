@@ -205,6 +205,8 @@ def _ctx_from_recorded(tk):
     ctx = _ctx_from_series(cl)
     if ctx:
         ctx["source"] = "recorded"
+        ctx["recorded_points_n"] = len(pts)
+        ctx["recorded_last_ts"] = int(pts[-1][0])
     return ctx
 
 
@@ -279,6 +281,15 @@ def sector_relative_strength(tk, sector, lookback_days=20):
         from market.data_manager import get_daily
         tk_df  = get_daily(tk)
         etf_df = get_daily(etf)
+        benchmark = etf
+        if ((etf_df is None or len(etf_df) < lookback_days + 1)
+                and tk_df is not None and len(tk_df) >= lookback_days + 1):
+            # Audit P1-12: sector ETF history unavailable (e.g. XLK/XLY 402 on
+            # PA) — benchmark vs SPY so the REL_STR category stays alive.
+            spy_df = get_daily("SPY")
+            if spy_df is not None and len(spy_df) >= lookback_days + 1:
+                etf_df = spy_df
+                benchmark = "SPY"
         if (tk_df is None or etf_df is None or
             len(tk_df) < lookback_days + 1 or len(etf_df) < lookback_days + 1):
             tk_info = _daily_source_info(tk_df)
@@ -305,7 +316,12 @@ def sector_relative_strength(tk, sector, lookback_days=20):
         out = {
             "rel_str_pct": rel_str_pct,
             "sector_etf": etf,
-            "relative_strength_source": "stale_cache" if any(s.startswith("stale_cache:") for s in sources) else "daily",
+            "rel_str_benchmark": benchmark,
+            "relative_strength_source": (
+                "spy_fallback" if benchmark == "SPY" and etf != "SPY"
+                else "stale_cache" if any(s.startswith("stale_cache:") for s in sources)
+                else "daily"
+            ),
             "ticker_history_source": tk_info.get("source"),
             "ticker_history_status": tk_info.get("status"),
             "ticker_history_rows": tk_info.get("rows"),
