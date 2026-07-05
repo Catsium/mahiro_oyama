@@ -111,10 +111,10 @@ KNIFE_CATALYST_TYPES = {
 }
 
 # A2 (cost-aware sizing): minimum dollars for ANY position open or add. At $0.99/trade
-# the round-trip commission is roughly 2% of a $100 trade, so this remains a floor,
-# not a target. Sizing and EV gates still decide whether a candidate is worth taking.
+# a $150 fill keeps the round-trip commission ≤ 1.32% (audit P0-3; $10 was 19.8%).
+# Sizing and EV gates still decide whether a candidate is worth taking.
 # Pyramid adds, new positions, and outside positions use the same minimum.
-MIN_POSITION_USD   = float(_RISK_DEFAULTS.get("min_trade_size", 10.0))
+MIN_POSITION_USD   = float(_RISK_DEFAULTS.get("min_trade_size", 150.0))
 BOT_TICK_MAX_RUNTIME_SEC = 25
 MIN_SIGNAL_HISTORY_ROWS = int(_HISTORY_DEFAULTS.get("min_history_rows_for_buy", 25))
 PREFERRED_SIGNAL_HISTORY_ROWS = int(_HISTORY_DEFAULTS.get("preferred_history_rows", 60))
@@ -1230,9 +1230,10 @@ def buyable_reason(t, s, recent_sells=None, regime_kind="neutral", holdings=None
         if not (ctx_local.get("rsi", 100) < 35 or ctx_local.get("is_dip")):
             return False, "BEAR_GATE_REQUIRES_DIP_OR_RSI_LT_35"
     if (regime_kind in ("neutral", "degraded_neutral") and ctx_local.get("adx", 100) < adx_gate
-            and not ctx_local.get("is_dip")):
+            and not ctx_local.get("is_dip")
+            and float((s.get("rec") or {}).get("confidence", 0) or 0) < 60):
         if t not in holdings:
-            return False, "NEUTRAL_ADX_BELOW_20_NON_DIP"
+            return False, "NEUTRAL_ADX_BELOW_GATE_NON_DIP"
     catalyst = (s.get("rec") or {}).get("catalyst") or {}
     catalyst_type = catalyst.get("type")
     week_chg = ctx_local.get("week_chg_pct", 0) or 0
@@ -1681,7 +1682,7 @@ def _generic_exit_shadow(h, pr, ctx, rec, stop_loss_pct, trail_stop_pct,
         ma30_e = (ctx or {}).get("ma30", 0) or 0
         if ma30_e > 0 and cur_e > 0 and pnl_pct < 0 and cur_e < ma30_e * 0.98:
             reason = "trend_failure"
-        elif held_hours > aging_hours and abs(pnl_pct) < 1.0 and h.get("shares", 0) * pr >= 200:
+        elif held_hours > aging_hours and abs(pnl_pct) < 1.0 and h.get("shares", 0) * pr >= 150:
             reason = "aging"
     return {
         "would_exit": bool(reason),
@@ -2444,9 +2445,9 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
                                f"${ma30_e:.2f} (−{(1-cur_e/ma30_e)*100:.1f}%), position "
                                f"underwater {pnl_pct:+.1f}%")
                 exit_reason_key = "trend_failure"
-            elif held_hours > aging_hours_profiled and abs(pnl_pct) < 1.0 and h["shares"] * pr >= 200:
-                # Round-6: only age-sell positions ≥$200 — don't pay $0.99 to dump
-                # a tiny stub. Stops/trails/trend-failure above are unaffected.
+            elif held_hours > aging_hours_profiled and abs(pnl_pct) < 1.0 and h["shares"] * pr >= 150:
+                # Round-6: only age-sell positions ≥$150 (matches min_trade_size) —
+                # don't pay $0.99 to dump a tiny stub. Stops/trails/trend-failure unaffected.
                 sell_reason = (f"Position aging: held {held_hours:.1f}h, flat ({pnl_pct:+.1f}%), "
                                f"freeing capital (regime={regime_label} threshold={aging_hours_profiled:.1f}h; {exit_ladder_note})")
                 exit_reason_key = "aging"
@@ -2746,7 +2747,9 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
         "kelly_mult": round(kelly_mult, 4),
         "diag":       kelly_diag,
         "ts":         int(now),
-        "notes":      "V1: Kelly modifies ATR risk budget, not final spend.",
+        "notes":      ("V1: Kelly modifies ATR risk budget, not final spend. "
+                       "Disabled until ≥50 closed outcomes; then set kelly: enabled=True, "
+                       "min_samples=50, fraction=0.5, min_mult=0.5, max_mult=1.25."),
     }
 
     candidate_pool = []

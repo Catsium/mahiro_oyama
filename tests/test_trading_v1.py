@@ -320,10 +320,11 @@ class TradingV1SizingTests(unittest.TestCase):
             edge_stats={"neutral:trend": {"5d": {"n": 8, "avg_return_pct": 0.08}}},
             min_position_usd=100,
         )
-        self.assertEqual(cand["risk"]["target_notional"], 504.0)
+        # conf-40 bucket 0.70 → 0.80 (audit P2-17): 504 → 576
+        self.assertEqual(cand["risk"]["target_notional"], 576.0)
         self.assertEqual(cand["gross_edge_pct"], 0.08)
-        self.assertAlmostEqual(cand["friction"]["total_pct"], 0.53, places=2)
-        self.assertAlmostEqual(cand["net_edge_pct"], -0.45, places=2)
+        self.assertAlmostEqual(cand["friction"]["total_pct"], 0.49, places=2)
+        self.assertAlmostEqual(cand["net_edge_pct"], -0.41, places=2)
         self.assertFalse(cand["tradable"])
         self.assertEqual(cand["rank_reason_code"], "EDGE_TOO_LOW")
 
@@ -365,10 +366,10 @@ class TradingV1SizingTests(unittest.TestCase):
         modes = DEFAULT_CONFIG["market_data_modes"]
         scan = DEFAULT_CONFIG["scan"]
         self.assertEqual(signal["min_buy_confidence"], 40)
-        self.assertEqual(risk["min_trade_size"], 10.0)
+        self.assertEqual(risk["min_trade_size"], 150.0)
         self.assertEqual(risk["max_new_buys_per_tick"], 10)
         self.assertEqual(risk["max_new_buys_per_day"], 30)
-        self.assertEqual(risk["max_positions"], 24)
+        self.assertEqual(risk["max_positions"], 12)
         self.assertEqual(risk["max_position_pct"], 0.35)
         self.assertEqual(risk["max_sector_pct"], 1.00)
         self.assertEqual(risk["max_corr_group_pct"], 1.00)
@@ -445,9 +446,9 @@ class TradingV1SizingTests(unittest.TestCase):
 
     def test_confidence_scale_uses_40_percent_entry_buckets(self):
         self.assertEqual(confidence_scale(39), 0.0)
-        self.assertEqual(confidence_scale(40), 0.70)
-        self.assertEqual(confidence_scale(44), 0.70)
-        self.assertEqual(confidence_scale(45), 0.85)
+        self.assertEqual(confidence_scale(40), 0.80)
+        self.assertEqual(confidence_scale(44), 0.80)
+        self.assertEqual(confidence_scale(45), 0.95)
         self.assertEqual(confidence_scale(50), 1.00)
         self.assertEqual(confidence_scale(55), 1.10)
         self.assertEqual(confidence_scale(65), 1.25)
@@ -599,6 +600,56 @@ class TradingV1SizingTests(unittest.TestCase):
         self.assertIn("EV gate", out["rank_reason"])
         self.assertGreaterEqual(out["risk"]["target_notional"], 100)
         self.assertEqual(out["sizing_confidence"], 70)
+
+    def test_ev_dead_zone_fixed_conf50_tradable_conf42_not(self):
+        # Audit P0-1 sanity targets: conf-50 liquid watchlist BUY tradable,
+        # conf-42 never (prior = 0 → no gross edge).
+        liquid = evaluate_candidate(
+            self._candidate("LIQ", 50, "trend", score=0),
+            total_equity=10_000, regime_stop_pct=-6, regime_kind="neutral",
+            vix_mult=1, streak_mult=1, kelly_mult=1, edge_stats={},
+            min_position_usd=100,
+        )
+        self.assertTrue(liquid["tradable"])
+
+        dead = evaluate_candidate(
+            self._candidate("DEAD", 42, "trend", score=0),
+            total_equity=10_000, regime_stop_pct=-6, regime_kind="neutral",
+            vix_mult=1, streak_mult=1, kelly_mult=1, edge_stats={},
+            min_position_usd=100,
+        )
+        self.assertFalse(dead["tradable"])
+        self.assertEqual(dead["gross_edge_pct"], 0.0)
+
+    def test_warmup_path_gross_edge_gate_and_size_haircut(self):
+        # Small notional → friction eats the prior edge; only the warmup
+        # path (conf ≥ 48, gross > 0) may allow it, at 0.60 size.
+        warm_cand = self._candidate("WARM", 50, "trend", score=0)
+        warm_cand["ctx"]["avg_dollar_vol_20d"] = 2_000_000
+        warm = evaluate_candidate(
+            warm_cand,
+            total_equity=3_000, regime_stop_pct=-6, regime_kind="neutral",
+            vix_mult=1, streak_mult=1, kelly_mult=1, edge_stats={},
+            min_position_usd=100,
+        )
+        self.assertLessEqual(warm["gross_edge_pct"],
+                             warm["ev_diagnostics"]["required_edge_pct"])
+        self.assertFalse(warm["ev_diagnostics"]["ev_pass"])
+        self.assertTrue(warm["ev_diagnostics"]["warmup_watchlist"])
+        self.assertTrue(warm["tradable"])
+        self.assertEqual(warm["rank_reason_code"], "WARMUP_CONFIDENCE_PRIOR_ALLOWED")
+        self.assertIn("WARMUP_CONFIDENCE_PRIOR_SIZE", warm["risk"]["size_penalties"])
+
+        below_cand = self._candidate("BELOW", 47, "trend", score=0)
+        below_cand["ctx"]["avg_dollar_vol_20d"] = 2_000_000
+        below = evaluate_candidate(
+            below_cand,
+            total_equity=3_000, regime_stop_pct=-6, regime_kind="neutral",
+            vix_mult=1, streak_mult=1, kelly_mult=1, edge_stats={},
+            min_position_usd=100,
+        )
+        self.assertFalse(below["ev_diagnostics"]["warmup_watchlist"])
+        self.assertFalse(below["tradable"])
 
     def test_exit_quality_size_penalty(self):
         edge_stats = {
@@ -1856,8 +1907,13 @@ class PythonAnywhereHardeningTests(unittest.TestCase):
                              "BEAR_GATE_REQUIRES_DIP_OR_RSI_LT_35")
             neutral = dict(base)
             neutral["ctx"] = dict(base["ctx"], adx=10, is_dip=False)
+            neutral["rec"] = dict(base["rec"], confidence=50)
             self.assertEqual(bot.buyable_reason("X", neutral, {}, "neutral", {})[1],
-                             "NEUTRAL_ADX_BELOW_20_NON_DIP")
+                             "NEUTRAL_ADX_BELOW_GATE_NON_DIP")
+            # conf >= 60 bypasses the neutral ADX gate (audit P2-16)
+            high_conf_neutral = dict(neutral, rec=dict(base["rec"], confidence=60))
+            self.assertEqual(bot.buyable_reason("X", high_conf_neutral, {}, "neutral", {})[1],
+                             "buyable")
             knife = dict(base)
             knife["rec"] = {"cls": "buy", "confidence": 70,
                             "catalyst": {"type": "guidance_cut"}}
@@ -3890,7 +3946,7 @@ class PythonAnywhereHardeningTests(unittest.TestCase):
         self.assertEqual(diag["main_blocker"], "interval_cooldown")
         self.assertEqual(diag["min_buy_confidence"], 40)
         self.assertEqual(diag["degraded_min_confidence"], 40)
-        self.assertEqual(diag["min_trade_size_effective"], 10.0)
+        self.assertEqual(diag["min_trade_size_effective"], 150.0)
         self.assertEqual(saved[-1]["last_cache_prune"], {"removed": 0, "kept": 0})
 
     def test_bot_no_trade_run_persists_no_buy_diagnostics(self):

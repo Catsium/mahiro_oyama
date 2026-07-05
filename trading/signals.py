@@ -409,8 +409,8 @@ def get_recommendation(sent, ctx, regime=None, earnings=None, analyst=None, insi
         sb_t, sb_c, b_t, b_c = 5.0, 4, 2.0, 3      # buy side tighter
         ss_t, ss_c, s_t, s_c = -3.5, 2, -1.25, 2   # sell side looser
     else:
-        sb_t, sb_c, b_t, b_c = 4.0, 3, 1.5, 2      # neutral = current
-        ss_t, ss_c, s_t, s_c = -4.0, 3, -1.5, 2
+        sb_t, sb_c, b_t, b_c = 3.75, 3, 1.25, 2    # neutral: slight buy lean (audit P2-15)
+        ss_t, ss_c, s_t, s_c = -4.0, 3, -1.5, 2    # sell side unchanged
 
     if   tot >= sb_t and cats_pos >= sb_c: sig, cls = "STRONG BUY",  "strong-buy"
     elif tot >= b_t  and cats_pos >= b_c:  sig, cls = "BUY",         "buy"
