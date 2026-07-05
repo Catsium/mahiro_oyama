@@ -3990,6 +3990,106 @@ class PythonAnywhereHardeningTests(unittest.TestCase):
         self.assertEqual(out["spy_data_source"], "fmp_daily")
         self.assertEqual(out["vix_display"], "SPY_REALIZED_VOL_PROXY")
 
+    def test_provider_support_registry_marks_and_reprobes(self):
+        # Audit P0-5: 402 symbols are skipped for a week, then re-probed.
+        import tempfile, os
+        import market.provider_support as ps
+
+        old_file = ps.PROVIDER_SUPPORT_FILE
+        old_state = ps._state
+        tmp = tempfile.mkdtemp()
+        try:
+            ps.PROVIDER_SUPPORT_FILE = os.path.join(tmp, "provider_support.json")
+            ps._state = None
+            self.assertTrue(ps.is_supported("XLK"))
+            ps.mark_unsupported("XLK", "402")
+            self.assertFalse(ps.is_supported("XLK"))
+            self.assertEqual(ps.unsupported_symbols(), ["XLK"])
+            # persisted?
+            ps._state = None
+            self.assertFalse(ps.is_supported("XLK"))
+            # re-probe due -> supported again
+            ps._load()["XLK"]["reprobe_after_ts"] = int(time.time()) - 1
+            self.assertTrue(ps.is_supported("XLK"))
+            self.assertEqual(ps.unsupported_symbols(), [])
+            # successful fetch clears the mark entirely
+            ps.mark_supported("XLK")
+            ps._state = None
+            self.assertNotIn("XLK", ps._load())
+        finally:
+            ps.PROVIDER_SUPPORT_FILE = old_file
+            ps._state = old_state
+
+    def test_pa_rotation_skips_unsupported_without_recorded_history(self):
+        import trading.bot as bot
+        import market.provider_support as ps
+
+        old_mode = bot.PYTHONANYWHERE_MODE
+        old_is_supported = ps.is_supported
+        old_load_hist = bot.load_price_hist
+        try:
+            bot.PYTHONANYWHERE_MODE = True
+            ps.is_supported = lambda t: t not in ("DEAD1", "DEAD2")
+            # DEAD2 has enough recorded snapshots to stay decidable
+            bot.load_price_hist = lambda: {
+                "DEAD2": [[1, 100.0]] * bot.MIN_SIGNAL_HISTORY_ROWS
+            }
+            b = {}
+            selected = bot._pa_stage_tickers(
+                ["AAA", "DEAD1", "DEAD2", "BBB"], [], b)
+        finally:
+            bot.PYTHONANYWHERE_MODE = old_mode
+            ps.is_supported = old_is_supported
+            bot.load_price_hist = old_load_hist
+        self.assertNotIn("DEAD1", selected)
+        status = b["pa_stage_status"]
+        self.assertEqual(status["rotation_skipped_unsupported"], 1)
+
+    def test_prewarm_pass_bounded_and_state_safe(self):
+        # Audit P1-10: ≤2 warms, 30-min cooldown, caches/stamps only.
+        import trading.bot as bot
+
+        calls = {"warm": [], "quotes": []}
+        old = {n: getattr(bot, n) for n in (
+            "load_tickers", "load_price_hist", "_scan_snapshot",
+            "warm_history", "get_quote")}
+        try:
+            bot.load_tickers = lambda: ["AAA", "BBB", "CCC"]
+            bot.load_price_hist = lambda: {}
+            bot._scan_snapshot = lambda: ([{"ticker": "SCN1"}], 0)
+            def fake_warm(symbols, max_symbols=None, max_fetches=None):
+                calls["warm"].append((list(symbols), max_symbols, max_fetches))
+                return {"warmed_symbols": list(symbols), "failed_symbols": []}
+            bot.warm_history = fake_warm
+            bot.get_quote = lambda t: calls["quotes"].append(t) or {"price": 1.0}
+            b = {"cash": 123.0, "holdings": {"H1": {"shares": 1}}}
+            now = time.time()
+            out = bot._prewarm_pass(b, now)
+            self.assertEqual(len(out["symbols"]), 2)
+            self.assertEqual(calls["warm"][0][1:], (2, 2))
+            self.assertLessEqual(len(calls["quotes"]), 2)
+            self.assertEqual(b["cash"], 123.0)
+            self.assertEqual(b["holdings"], {"H1": {"shares": 1}})
+            self.assertEqual(b["last_prewarm"]["symbols"], out["symbols"])
+            # cooldown: immediate second call is a no-op
+            self.assertIsNone(bot._prewarm_pass(b, now + 10))
+            self.assertEqual(len(calls["warm"]), 1)
+            # rotation advances on the next eligible pass
+            out2 = bot._prewarm_pass(b, now + bot.PREWARM_COOLDOWN_SEC + 1)
+            self.assertNotEqual(out2["symbols"], out["symbols"])
+            # expired wall clock skips the quote-refresh loop
+            calls["quotes"].clear()
+            old_wall = bot.PREWARM_WALL_CLOCK_SEC
+            try:
+                bot.PREWARM_WALL_CLOCK_SEC = -1
+                bot._prewarm_pass(b, now + 2 * (bot.PREWARM_COOLDOWN_SEC + 1))
+            finally:
+                bot.PREWARM_WALL_CLOCK_SEC = old_wall
+            self.assertEqual(calls["quotes"], [])
+        finally:
+            for name, value in old.items():
+                setattr(bot, name, value)
+
     def test_get_history_synthetic_recorded_trust_boundary(self):
         # Audit P1-7: ≥25 recorded closes with a fresh newest point → trusted
         # synthetic ctx; fewer or old points stay an untrusted fallback.

@@ -19,7 +19,7 @@ from datetime import datetime, timedelta, timezone
 from flask import render_template
 
 from market.charts import RANGE_SECS  # noqa: F401 — re-export sentinel
-from market.history import get_history, get_intraday_context
+from market.history import get_history, get_intraday_context, warm_history
 from market.quotes import (
     EXECUTION_CACHE_MAX_AGE_SEC,
     FMP_DAILY_GLOBAL_ENDPOINT,
@@ -35,6 +35,7 @@ from trading.risk import (
     get_earnings_soon, get_analyst_rec, get_insider_sentiment,
 )
 from trading.signals import classify_display_signal, get_recommendation
+from market import provider_support
 from trading.attribution import (
     TRACK_TOP_SKIPS_PER_CYCLE, ensure_attribution_state, exit_profile,
     record_entry_event, record_exit_event, update_exit_post_outcomes,
@@ -1266,7 +1267,27 @@ def _pa_stage_tickers(tickers, holdings, b):
         t for t in tickers
         if t not in holdings_ordered and t not in BENCHMARK_ONLY_TICKERS
     ]
+    # Audit P0-5: don't burn rotation slots on symbols whose daily history is
+    # permanently unsupported (FMP 402) unless recorded snapshots can decide them.
+    recorded = load_price_hist() or {}
+    decidable_watch = [
+        t for t in watch
+        if provider_support.is_supported(t)
+        or len(recorded.get(t) or []) >= MIN_SIGNAL_HISTORY_ROWS
+    ]
+    skipped_unsupported = len(watch) - len(decidable_watch)
+    watch = decidable_watch
     if not watch:
+        b["pa_stage_status"] = {
+            "mode": "pythonanywhere",
+            "selected": holdings_ordered,
+            "watchlist_size": len(tickers),
+            "holdings_size": len(holdings_ordered),
+            "batch_size": PA_TICKERS_PER_BOT_RUN,
+            "rotation_skipped_unsupported": skipped_unsupported,
+            "next_index": int(b.get("pa_rotation_index", 0) or 0),
+            "ts": int(time.time()),
+        }
         return holdings_ordered
     room = max(0, PA_TICKERS_PER_BOT_RUN - len(holdings_ordered))
     room = max(1, room) if not holdings_ordered else room
@@ -1280,10 +1301,69 @@ def _pa_stage_tickers(tickers, holdings, b):
         "watchlist_size": len(tickers),
         "holdings_size": len(holdings_ordered),
         "batch_size": PA_TICKERS_PER_BOT_RUN,
+        "rotation_skipped_unsupported": skipped_unsupported,
         "next_index": b["pa_rotation_index"],
         "ts": int(time.time()),
     }
     return holdings_ordered + selected_watch
+
+PREWARM_COOLDOWN_SEC = 1800  # ponytail: fixed 30-min cadence; promote to config if tuning ever matters
+PREWARM_WALL_CLOCK_SEC = 10
+
+
+def _prewarm_pass(b, now):
+    """Closed-market cache prewarm (audit P1-10).
+
+    ≤2 daily-history warms + ≤2 quote refreshes per pass, ≥30 min apart,
+    10s wall-clock cap between steps. Touches caches, rotation index and
+    b['last_prewarm'] only — never holdings/cash/decisions.
+    """
+    if now - float(b.get("last_prewarm_ts", 0) or 0) < PREWARM_COOLDOWN_SEC:
+        return None
+    deadline = time.time() + PREWARM_WALL_CLOCK_SEC
+    recorded = load_price_hist() or {}
+    watch = [
+        t for t in (load_tickers() or [])
+        if provider_support.is_supported(t)
+        or len(recorded.get(t) or []) >= MIN_SIGNAL_HISTORY_ROWS
+    ]
+    scan_rows, _scan_ts = _scan_snapshot()
+    scan_syms = [str(r.get("ticker") or "") for r in (scan_rows or [])]
+    universe = []
+    for t in watch + ["SPY"] + [s for s in scan_syms if s]:
+        if t and t not in universe:
+            universe.append(t)
+    b["last_prewarm_ts"] = int(now)
+    if not universe:
+        return None
+    idx = int(b.get("prewarm_rotation_index", 0) or 0) % len(universe)
+    batch = (universe[idx:] + universe[:idx])[:2]
+    b["prewarm_rotation_index"] = (idx + len(batch)) % len(universe)
+    warm_result = {}
+    try:
+        # warm_history is internally budgeted (≤2 fetches, circuits respected)
+        warm_result = warm_history(batch, max_symbols=2, max_fetches=2) or {}
+    except Exception as e:
+        warm_result = {"error": f"{type(e).__name__}: {e}"}
+    quotes_refreshed = []
+    for t in batch:
+        if time.time() >= deadline:
+            break
+        try:
+            q = get_quote(t) or {}
+            if q.get("price"):
+                quotes_refreshed.append(t)
+        except Exception:
+            pass
+    b["last_prewarm"] = {
+        "ts": int(now),
+        "symbols": batch,
+        "warmed": warm_result.get("warmed_symbols"),
+        "warm_failed": warm_result.get("failed_symbols"),
+        "quotes_refreshed": quotes_refreshed,
+    }
+    return b["last_prewarm"]
+
 
 # ── Bot state runtime mirror ────────────────────────────────────────────────
 def _set_running(flag):
@@ -1824,6 +1904,13 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
         no_buy_diag["market_open"] = False
         if not b.get("pending_run"):
             b["pending_run"] = True
+        # Audit P1-10: the 17.5 closed-market hours of keepalive pings prewarm
+        # caches so every symbol is warm by 09:30 with zero open-hours pressure.
+        try:
+            _prewarm_pass(b, now)
+        except Exception as e:
+            try: print(f"[prewarm] failed: {type(e).__name__}: {e}")
+            except Exception: pass
         _persist_no_buy_diag(b, no_buy_diag, "market_closed")
         _BOT_STATUS.update({"last_run_ts": int(now), "last_action": "market_closed_autoqueued",
                             "last_traded": False})
@@ -1858,6 +1945,9 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
     all_to_check = _pa_stage_tickers(tickers, list(b["holdings"].keys()), b)
     no_buy_diag["checked_tickers"] = list(all_to_check)
     no_buy_diag["pa_stage_status"] = b.get("pa_stage_status")
+    no_buy_diag["rotation_skipped_unsupported"] = int(
+        (b.get("pa_stage_status") or {}).get("rotation_skipped_unsupported", 0) or 0
+    )
     _raise_if_tick_deadline_exceeded(deadline_ts, b, no_buy_diag)
     regime, ok = _call_with_deadline(lambda: get_market_regime(cfg), deadline_ts)
     if not ok:
