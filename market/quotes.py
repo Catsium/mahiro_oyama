@@ -11,6 +11,7 @@ import urllib.request
 import pandas as pd
 
 from market import fh
+from market import provider_support
 from market.data_manager import get_daily as _managed_daily
 from trading.config import DEFAULT_CONFIG
 from utils.cache import (
@@ -772,6 +773,7 @@ def _fmp_daily(tk, full=False, use_cache=True):
             cache_set(cache_key, df)
         record_api_success(endpoint)
         record_api_success(FMP_DAILY_GLOBAL_ENDPOINT)
+        provider_support.mark_supported(tk)
         return df
     except Exception as e:
         try:
@@ -783,6 +785,10 @@ def _fmp_daily(tk, full=False, use_cache=True):
             status_code = getattr(e, "code", None) or getattr(e, "status", None)
         except Exception:
             status_code = None
+        if str(status_code) == "402":
+            # Audit P0-5: FMP free tier permanently rejects this symbol — the
+            # registry lets the PA rotation stop burning slots on it (weekly re-probe).
+            provider_support.mark_unsupported(tk, "402")
         if str(status_code) == "429":
             cooldown_sec = _retry_after_cooldown_sec(e)
         elif str(status_code) and str(status_code) != "None":

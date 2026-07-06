@@ -34,7 +34,7 @@ KNIFE_CATALYST_TYPES = {
 # Partial profit-taking (#2.4) — enabled Round-5
 PARTIAL_TAKE_ENABLED  = True
 PARTIAL_TAKE_PCT      = 6.0   # trim once peak P&L crosses +6%
-PARTIAL_TAKE_FRACTION = 0.40  # trim 40% of remaining
+PARTIAL_TAKE_FRACTION = 0.30  # trim 30% of remaining (audit P4: let winners run)
 
 # V1 risk budget. Values are percent of total equity at risk per trade before
 # confidence/source/Kelly modifiers.
@@ -117,9 +117,9 @@ def confidence_scale(confidence):
     if c < 40:
         return 0.0
     if c < 45:
-        return 0.70
+        return 0.80
     if c < 50:
-        return 0.85
+        return 0.95
     if c < 55:
         return 1.00
     if c < 65:
@@ -313,7 +313,7 @@ def confidence_prior_edge_pct(confidence, score=0):
         sc = float(score or 0)
     except Exception:
         sc = 0.0
-    edge = max(0.0, (conf - 50.0) * 0.08) + max(0.0, sc) * 0.04
+    edge = max(0.0, (conf - 42.0) * 0.06) + max(0.0, sc) * 0.05
     return round(_clamp(edge, 0.0, 4.0), 4)
 
 
@@ -342,8 +342,8 @@ def build_edge_diagnostics(edge, rec, friction, attr_edge=None):
         score = float(rec.get("score", 0) or 0)
     except Exception:
         score = 0.0
-    confidence_component = max(0.0, (conf - 50.0) * 0.08)
-    score_component = max(0.0, score) * 0.04
+    confidence_component = max(0.0, (conf - 42.0) * 0.06)
+    score_component = max(0.0, score) * 0.05
     return {
         "edge_source": "confidence_prior",
         "edge_horizon": EDGE_HORIZON,
@@ -353,7 +353,7 @@ def build_edge_diagnostics(edge, rec, friction, attr_edge=None):
         "score": rec.get("score"),
         "confidence_component_pct": round(confidence_component, 4),
         "score_component_pct": round(score_component, 4),
-        "formula": "max(0,(confidence-50)*0.08)+max(0,score)*0.04",
+        "formula": "max(0,(confidence-42)*0.06)+max(0,score)*0.05",
         "clamp_min_pct": 0.0,
         "clamp_max_pct": 4.0,
         "why_prior_used": "no_live_attribution_bucket",
@@ -366,14 +366,16 @@ def rank_reason_code_for(*, risk_sized, gross, required_edge, net,
                          require_net_positive=False):
     if not risk_sized:
         return "FINAL_SIZE_TOO_SMALL"
+    if ev_pass:
+        return "EV_RISK_PASS"
+    # warmup checked before the edge gates: a warmup-allowed candidate is
+    # tradable even when gross <= required, so the code must say so honestly
+    if warmup_watchlist:
+        return "WARMUP_CONFIDENCE_PRIOR_ALLOWED"
     if gross <= required_edge:
         return "EDGE_TOO_LOW"
     if net < min_net_edge or (require_net_positive and net <= 0):
         return "NET_EDGE_TOO_LOW_AFTER_COSTS"
-    if warmup_watchlist:
-        return "WARMUP_CONFIDENCE_PRIOR_ALLOWED"
-    if ev_pass:
-        return "EV_RISK_PASS"
     return "EV_RISK_PASS"
 
 
@@ -574,13 +576,25 @@ def evaluate_candidate(candidate, total_equity, regime_stop_pct, regime_kind,
         and expected_net_profit_usd >= min_expected_net_profit
         and net > 0
     )
+    # Warm-up trades are information purchases (audit P0-1): no net>0 needed,
+    # but higher confidence floor and a size haircut applied below.
     warmup_watchlist = (
         source == "watchlist"
         and edge.get("edge_source") == "confidence_prior"
         and rec.get("cls") in ("buy", "strong-buy")
-        and rec.get("confidence", 0) >= float(signal_cfg.get("min_buy_confidence", 40))
-        and net > 0
+        and rec.get("confidence", 0) >= float(signal_cfg.get("warmup_min_confidence", 48))
+        and gross > 0
     )
+    if warmup_watchlist and not (ev_pass or relaxed_ev_pass) and risk_sized:
+        apply_size_mult(risk, float(signal_cfg.get("warmup_size_mult", 0.60)),
+                        "WARMUP_CONFIDENCE_PRIOR_SIZE")
+        # flat commission → friction % moves with notional; keep diagnostics honest
+        friction = estimate_friction_pct(max(risk["target_notional"], 1.0), ctx,
+                                         commission=commission, source=source)
+        net = gross - friction["total_pct"]
+        ev_score = net / stop_pct if stop_pct > 0 else -999.0
+        expected_net_profit_usd = max(risk["target_notional"], 0.0) * net / 100.0
+        risk_sized = risk["target_notional"] >= min_position_usd
     tradable = risk_sized and (ev_pass or relaxed_ev_pass or warmup_watchlist)
     rank_reason_code = rank_reason_code_for(
         risk_sized=risk_sized,
@@ -623,7 +637,7 @@ def evaluate_candidate(candidate, total_equity, regime_stop_pct, regime_kind,
         "friction_total_pct": friction["total_pct"],
         "required_edge_pct": round(required_edge, 4),
         "net_edge_pct": round(net, 4),
-        "min_expected_edge_pct": float(signal_cfg.get("min_expected_edge_pct", 0.40)),
+        "min_expected_edge_pct": float(signal_cfg.get("min_expected_edge_pct", 0.25)),
         "min_net_edge_pct": min_net_edge,
         "require_net_edge_positive": require_net_positive,
         "paper_ev_relaxation_enabled": relaxed_ev_enabled,

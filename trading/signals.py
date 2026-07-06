@@ -409,8 +409,8 @@ def get_recommendation(sent, ctx, regime=None, earnings=None, analyst=None, insi
         sb_t, sb_c, b_t, b_c = 5.0, 4, 2.0, 3      # buy side tighter
         ss_t, ss_c, s_t, s_c = -3.5, 2, -1.25, 2   # sell side looser
     else:
-        sb_t, sb_c, b_t, b_c = 4.0, 3, 1.5, 2      # neutral = current
-        ss_t, ss_c, s_t, s_c = -4.0, 3, -1.5, 2
+        sb_t, sb_c, b_t, b_c = 3.75, 3, 1.25, 2    # neutral: slight buy lean (audit P2-15)
+        ss_t, ss_c, s_t, s_c = -4.0, 3, -1.5, 2    # sell side unchanged
 
     if   tot >= sb_t and cats_pos >= sb_c: sig, cls = "STRONG BUY",  "strong-buy"
     elif tot >= b_t  and cats_pos >= b_c:  sig, cls = "BUY",         "buy"
@@ -472,7 +472,14 @@ def get_recommendation(sent, ctx, regime=None, earnings=None, analyst=None, insi
         data_quality_present_n += 1
 
     n_raw = sum(len(v) for v in cat_signals.values())
-    data_quality = min(1.0, data_quality_present_n / max(1, data_quality_expected_n))
+    data_quality_raw = min(1.0, data_quality_present_n / max(1, data_quality_expected_n))
+    # Audit P1-11: when core data (daily history incl. synthetic_recorded) is
+    # present, floor the multiplier at 0.70 so losing optional categories
+    # (news/analyst/insider/rel_str — the realistic 50% outage) cannot alone
+    # push an otherwise-valid BUY into the untradable zone. Missing core data
+    # still blocks via floor_blockers/history gates (unchanged).
+    core_history_present = bool(ctx) and "daily_history" not in data_quality_missing_fields
+    data_quality = max(data_quality_raw, 0.70) if core_history_present else data_quality_raw
 
     # ── Confidence ─────────────────────────────────────────────────────
     max_plausible = 14.0
@@ -590,6 +597,8 @@ def get_recommendation(sent, ctx, regime=None, earnings=None, analyst=None, insi
         "sizing_confidence": sizing_confidence,
         "max_score": max_plausible, "reasons": reasons,
         "data_quality": data_quality, "is_dip": is_dip_flag,
+        "data_quality_raw": data_quality_raw,
+        "data_quality_floor_applied": data_quality > data_quality_raw,
         "categories": cat_votes, "cats_pos": cats_pos, "cats_neg": cats_neg,
         "expected_n": expected_n, "n_raw": n_raw,
         "data_quality_actual_n": data_quality_present_n,

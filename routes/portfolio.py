@@ -273,9 +273,15 @@ def bot_tick():
             scan_warm_started = False
             scan_warm_error = f"{type(e).__name__}: {e}"
     start = time.time()
+    # Audit P0-4: the UptimeRobot ping is a machine, not a human — user_forced
+    # only for real manual runs (&manual=1), which relax the human-only gates.
+    try:
+        manual = str(request.args.get("manual", "")).lower() in ("1", "true", "yes")
+    except Exception:  # direct calls outside a request context (tests)
+        manual = False
     b, traded, last_action = run_bot(
         force=True,
-        user_forced=True,
+        user_forced=manual,
         max_runtime_sec=BOT_TICK_MAX_RUNTIME_SEC,
     )
     diag = b.get("last_no_buy_diagnostics") or {}

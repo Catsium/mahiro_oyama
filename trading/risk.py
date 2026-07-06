@@ -171,6 +171,12 @@ def get_vix():
 def credit_signal():
     """Returns {credit_label, credit_pct} where credit_label is one of:
        'risk_on' (>70th pct), 'neutral' (30-70), 'risk_off' (<30th pct)."""
+    if PYTHONANYWHERE_MODE:
+        # Audit P1-13: HYG/IEI daily bars are permanently 402 on the PA free
+        # tier — don't spend fetch budget; neutral is byte-identical to the
+        # failure path below so Rule 1 parity holds.
+        return {"credit_label": "neutral", "credit_pct": 50.0,
+                "credit_status": "unavailable_on_pa"}
     c = cache_get("credit_signal", max_age=3600)
     if c is not None:
         return c
