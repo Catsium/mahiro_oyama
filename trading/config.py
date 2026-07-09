@@ -17,13 +17,15 @@ RISK_CONFIG = {
         "neutral": 0.70,
         "bear": 0.40,
     },
-    "min_trade_size": 10.0,
+    # A2 floor raised $10 → $150 (audit P0-3): $10 fill pays $1.98 round trip
+    # = 19.8% commission; at $150 the round trip is ≤ 1.32%.
+    "min_trade_size": 150.0,
     "max_position_pct": 0.35,
     "max_sector_pct": 1.00,
     "max_corr_group_pct": 1.00,
     "max_gross_exposure_pct": 1.00,
     "min_cash_reserve_pct": 0.00,
-    "max_positions": 24,
+    "max_positions": 12,  # 24 slots at $10k equity = dust positions (audit P3-19)
     "max_new_buys_per_tick": 10,
     "max_new_buys_per_day": 30,
     "daily_loss_warning_pct": -0.10,
@@ -55,7 +57,9 @@ RISK_CONFIG = {
 SIGNAL_CONFIG = {
     "min_buy_confidence": 40,
     "min_strong_buy_confidence": 70,
-    "min_expected_edge_pct": 0.40,
+    "min_expected_edge_pct": 0.25,
+    "warmup_min_confidence": 48,
+    "warmup_size_mult": 0.60,
     "min_net_edge_pct": 0.00,
     "require_net_edge_positive": True,
     "paper_ev_relaxation_enabled": True,
@@ -81,7 +85,7 @@ SIGNAL_CONFIG = {
     "high_atr_warning_pct": 10.0,
     "high_atr_size_multiplier": 0.85,
     "extreme_atr_size_multiplier": 0.65,
-    "neutral_gate_adx_threshold": 20,
+    "neutral_gate_adx_threshold": 15,
     "allow_bullish_lean_buy_attempts": True,
     "bullish_lean_candidate_size_multiplier": 0.85,
     "allow_high_confidence_hold_buy_attempts": True,
@@ -91,6 +95,9 @@ SIGNAL_CONFIG = {
     "sell_can_buy": False,
 }
 
+# Kelly stays OFF until ≥50 closed trade outcomes exist (audit P3-20).
+# Re-enable recipe once there: enabled=True, min_samples=50, fraction=0.5,
+# min_mult=0.5, max_mult=1.25. Do not auto-flip.
 KELLY_CONFIG = {
     "enabled": False,
     "min_samples": 100,
@@ -270,12 +277,12 @@ SCAN_CONFIG = {
 HISTORY_CONFIG = {
     "min_history_rows_for_buy": 25,
     "preferred_history_rows": 60,
-    "stale_history_max_completed_trading_days": 2,
+    "stale_history_max_completed_trading_days": 3,
     "cached_history_allowed": True,
     "missing_core_history_policy": "block",
     "missing_optional_signal_policy": "neutral",
     "missing_core_quote_policy": "block",
-    "max_history_fetches_per_tick": 1,
+    "max_history_fetches_per_tick": 2,
     "max_history_fetches_per_warm_call": 3,
     "max_symbols_per_warm_call": 3,
     "provider_history_request_timeout_sec": 5,

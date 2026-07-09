@@ -320,10 +320,11 @@ class TradingV1SizingTests(unittest.TestCase):
             edge_stats={"neutral:trend": {"5d": {"n": 8, "avg_return_pct": 0.08}}},
             min_position_usd=100,
         )
-        self.assertEqual(cand["risk"]["target_notional"], 504.0)
+        # conf-40 bucket 0.70 → 0.80 (audit P2-17): 504 → 576
+        self.assertEqual(cand["risk"]["target_notional"], 576.0)
         self.assertEqual(cand["gross_edge_pct"], 0.08)
-        self.assertAlmostEqual(cand["friction"]["total_pct"], 0.53, places=2)
-        self.assertAlmostEqual(cand["net_edge_pct"], -0.45, places=2)
+        self.assertAlmostEqual(cand["friction"]["total_pct"], 0.49, places=2)
+        self.assertAlmostEqual(cand["net_edge_pct"], -0.41, places=2)
         self.assertFalse(cand["tradable"])
         self.assertEqual(cand["rank_reason_code"], "EDGE_TOO_LOW")
 
@@ -365,10 +366,10 @@ class TradingV1SizingTests(unittest.TestCase):
         modes = DEFAULT_CONFIG["market_data_modes"]
         scan = DEFAULT_CONFIG["scan"]
         self.assertEqual(signal["min_buy_confidence"], 40)
-        self.assertEqual(risk["min_trade_size"], 10.0)
+        self.assertEqual(risk["min_trade_size"], 150.0)
         self.assertEqual(risk["max_new_buys_per_tick"], 10)
         self.assertEqual(risk["max_new_buys_per_day"], 30)
-        self.assertEqual(risk["max_positions"], 24)
+        self.assertEqual(risk["max_positions"], 12)
         self.assertEqual(risk["max_position_pct"], 0.35)
         self.assertEqual(risk["max_sector_pct"], 1.00)
         self.assertEqual(risk["max_corr_group_pct"], 1.00)
@@ -405,7 +406,10 @@ class TradingV1SizingTests(unittest.TestCase):
         self.assertFalse(modes["degraded_block_low_volume_penalty"])
         self.assertFalse(modes["degraded_block_pyramiding"])
 
-    def test_missing_spy_is_neutral_warning_not_degraded(self):
+    def test_missing_spy_is_degraded_label_with_normal_gates(self):
+        # Audit P1-6 reverses the warning-only pin: missing SPY now reports
+        # DEGRADED_MODE truthfully, while standard-gates parity (Rule 1) keeps
+        # every effective gate identical to NORMAL.
         import trading.bot as bot
 
         mode = bot._market_data_mode(
@@ -414,20 +418,21 @@ class TradingV1SizingTests(unittest.TestCase):
              "volatility_source": "spy_realized_vol_proxy"},
             DEFAULT_CONFIG,
         )
-        self.assertEqual(mode["trading_mode"], "NORMAL_MODE")
-        self.assertFalse(mode["degraded_mode_active"])
-        self.assertFalse(mode["degraded_standard_gates_active"])
-        self.assertIsNone(mode["degraded_gate_policy"])
+        self.assertEqual(mode["trading_mode"], "DEGRADED_MODE")
+        self.assertTrue(mode["degraded_mode_active"])
+        self.assertTrue(mode["degraded_standard_gates_active"])
+        self.assertEqual(mode["degraded_gate_policy"], "standard_gates_for_testing")
         self.assertEqual(mode["mode_size_mult"], 1.0)
         self.assertIsNone(mode["mode_size_reason"])
         self.assertEqual(mode["effective_min_buy_confidence"], 40)
         self.assertTrue(mode["normal_ev_gates_required"])
         self.assertTrue(mode["normal_risk_caps_required"])
         self.assertTrue(mode["fresh_quote_required"])
-        self.assertEqual(mode["data_health_blocks"], [])
+        self.assertTrue(mode["allow_buys"])
+        self.assertEqual(mode["data_health_blocks"], ["SPY_DATA_MISSING"])
         self.assertEqual(mode["data_health_warnings"], ["SPY_DATA_MISSING"])
 
-    def test_missing_volatility_is_neutral_warning_not_degraded(self):
+    def test_missing_volatility_is_degraded_label_with_normal_gates(self):
         import trading.bot as bot
 
         mode = bot._market_data_mode(
@@ -435,19 +440,58 @@ class TradingV1SizingTests(unittest.TestCase):
             {"data_ok": False, "source": None, "volatility_source": None},
             DEFAULT_CONFIG,
         )
-        self.assertEqual(mode["trading_mode"], "NORMAL_MODE")
-        self.assertFalse(mode["degraded_mode_active"])
-        self.assertFalse(mode["degraded_standard_gates_active"])
+        self.assertEqual(mode["trading_mode"], "DEGRADED_MODE")
+        self.assertTrue(mode["degraded_mode_active"])
+        self.assertTrue(mode["degraded_standard_gates_active"])
         self.assertEqual(mode["mode_size_mult"], 1.0)
         self.assertIsNone(mode["mode_size_reason"])
-        self.assertEqual(mode["data_health_blocks"], [])
+        self.assertTrue(mode["allow_buys"])
+        self.assertEqual(mode["data_health_blocks"], ["VOLATILITY_DATA_MISSING"])
         self.assertEqual(mode["data_health_warnings"], ["VOLATILITY_DATA_MISSING"])
+
+    def test_degraded_parity_identical_decisions_and_sizes(self):
+        # Rule 1 regression: the same candidate pool ranked under NORMAL and
+        # DEGRADED(standard gates) mode_info must produce identical decisions.
+        import trading.bot as bot
+
+        normal = bot._market_data_mode(
+            {"spy_data_ok": True},
+            {"data_ok": True, "source": "vix", "volatility_source": "vix"},
+            DEFAULT_CONFIG,
+        )
+        degraded = bot._market_data_mode(
+            {"spy_data_ok": False},
+            {"data_ok": False, "source": None, "volatility_source": None},
+            DEFAULT_CONFIG,
+        )
+        self.assertEqual(normal["trading_mode"], "NORMAL_MODE")
+        self.assertEqual(degraded["trading_mode"], "DEGRADED_MODE")
+        pool = [
+            _entry_candidate("PAR1", confidence=55, cluster="trend"),
+            _entry_candidate("PAR2", confidence=42, cluster="mixed", score=0),
+            _entry_candidate("PAR3", confidence=75, cluster="dip", score=6),
+        ]
+        results = {}
+        for label, mode in (("normal", normal), ("degraded", degraded)):
+            ranked = rank_candidates(
+                [dict(c, ctx=dict(c["ctx"]), rec=dict(c["rec"])) for c in pool],
+                10_000, -6, "neutral", 1, 1, 1, {},
+                min_position_usd=150,
+                mode_size_mult=mode["mode_size_mult"],
+                mode_size_reason=mode["mode_size_reason"],
+            )
+            results[label] = [
+                (c["ticker"], c["tradable"], c["rank_reason_code"],
+                 c["risk"]["target_notional"])
+                for c in ranked
+            ]
+        self.assertEqual(results["normal"], results["degraded"])
 
     def test_confidence_scale_uses_40_percent_entry_buckets(self):
         self.assertEqual(confidence_scale(39), 0.0)
-        self.assertEqual(confidence_scale(40), 0.70)
-        self.assertEqual(confidence_scale(44), 0.70)
-        self.assertEqual(confidence_scale(45), 0.85)
+        self.assertEqual(confidence_scale(40), 0.80)
+        self.assertEqual(confidence_scale(44), 0.80)
+        self.assertEqual(confidence_scale(45), 0.95)
         self.assertEqual(confidence_scale(50), 1.00)
         self.assertEqual(confidence_scale(55), 1.10)
         self.assertEqual(confidence_scale(65), 1.25)
@@ -599,6 +643,56 @@ class TradingV1SizingTests(unittest.TestCase):
         self.assertIn("EV gate", out["rank_reason"])
         self.assertGreaterEqual(out["risk"]["target_notional"], 100)
         self.assertEqual(out["sizing_confidence"], 70)
+
+    def test_ev_dead_zone_fixed_conf50_tradable_conf42_not(self):
+        # Audit P0-1 sanity targets: conf-50 liquid watchlist BUY tradable,
+        # conf-42 never (prior = 0 → no gross edge).
+        liquid = evaluate_candidate(
+            self._candidate("LIQ", 50, "trend", score=0),
+            total_equity=10_000, regime_stop_pct=-6, regime_kind="neutral",
+            vix_mult=1, streak_mult=1, kelly_mult=1, edge_stats={},
+            min_position_usd=100,
+        )
+        self.assertTrue(liquid["tradable"])
+
+        dead = evaluate_candidate(
+            self._candidate("DEAD", 42, "trend", score=0),
+            total_equity=10_000, regime_stop_pct=-6, regime_kind="neutral",
+            vix_mult=1, streak_mult=1, kelly_mult=1, edge_stats={},
+            min_position_usd=100,
+        )
+        self.assertFalse(dead["tradable"])
+        self.assertEqual(dead["gross_edge_pct"], 0.0)
+
+    def test_warmup_path_gross_edge_gate_and_size_haircut(self):
+        # Small notional → friction eats the prior edge; only the warmup
+        # path (conf ≥ 48, gross > 0) may allow it, at 0.60 size.
+        warm_cand = self._candidate("WARM", 50, "trend", score=0)
+        warm_cand["ctx"]["avg_dollar_vol_20d"] = 2_000_000
+        warm = evaluate_candidate(
+            warm_cand,
+            total_equity=3_000, regime_stop_pct=-6, regime_kind="neutral",
+            vix_mult=1, streak_mult=1, kelly_mult=1, edge_stats={},
+            min_position_usd=100,
+        )
+        self.assertLessEqual(warm["gross_edge_pct"],
+                             warm["ev_diagnostics"]["required_edge_pct"])
+        self.assertFalse(warm["ev_diagnostics"]["ev_pass"])
+        self.assertTrue(warm["ev_diagnostics"]["warmup_watchlist"])
+        self.assertTrue(warm["tradable"])
+        self.assertEqual(warm["rank_reason_code"], "WARMUP_CONFIDENCE_PRIOR_ALLOWED")
+        self.assertIn("WARMUP_CONFIDENCE_PRIOR_SIZE", warm["risk"]["size_penalties"])
+
+        below_cand = self._candidate("BELOW", 47, "trend", score=0)
+        below_cand["ctx"]["avg_dollar_vol_20d"] = 2_000_000
+        below = evaluate_candidate(
+            below_cand,
+            total_equity=3_000, regime_stop_pct=-6, regime_kind="neutral",
+            vix_mult=1, streak_mult=1, kelly_mult=1, edge_stats={},
+            min_position_usd=100,
+        )
+        self.assertFalse(below["ev_diagnostics"]["warmup_watchlist"])
+        self.assertFalse(below["tradable"])
 
     def test_exit_quality_size_penalty(self):
         edge_stats = {
@@ -986,6 +1080,40 @@ class TradingV2AttributionTests(unittest.TestCase):
         self.assertEqual(bucket["neutral"], 1)
         self.assertEqual(bucket["ema_net_ret_pct"], 0.2)
 
+    def test_skipped_candidates_fill_edge_buckets_with_per_tick_cap(self):
+        # Audit P0-2: top skipped candidates are recorded (decision="skipped")
+        # so forward-return buckets fill without trading; cap 5 per tick.
+        import trading.bot as bot
+        state = {}
+        bot._SKIPS_RECORDED_THIS_TICK = 0
+        recorded = 0
+        for i in range(7):
+            cand = _entry_candidate(f"SKP{i:02d}", confidence=55, cluster="trend")
+            ok = bot._record_candidate_observation(
+                state, cand, "skipped", "EDGE_TOO_LOW", 1_700_000_000, "neutral")
+            recorded += 1 if ok else 0
+        self.assertEqual(recorded, 5)  # TRACK_TOP_SKIPS_PER_CYCLE
+        events = state["attribution_events"]
+        self.assertEqual(len(events), 5)
+        self.assertTrue(all(e["decision"] == "skipped" for e in events))
+        self.assertTrue(all(e["skip_reason"] == "EDGE_TOO_LOW" for e in events))
+
+        updated = update_forward_outcomes(
+            state, lambda tk: 105.0, ts=1_700_000_000 + 6 * 86400)
+        self.assertGreater(updated, 0)
+        self.assertTrue(all(e["forward_returns"].get("5d") == 5.0
+                            for e in state["attribution_events"]))
+        bucket = state["attribution_buckets"]["neutral:trend:trend"]
+        self.assertEqual(bucket["skipped_n"], 5)
+        self.assertEqual(bucket["executed_n"], 0)
+
+        # executed events are never blocked by the skip cap
+        bot._SKIPS_RECORDED_THIS_TICK = bot.TRACK_TOP_SKIPS_PER_CYCLE
+        execd = bot._record_candidate_observation(
+            state, _entry_candidate("EXEC1"), "executed", "buy",
+            1_700_100_000, "neutral")
+        self.assertTrue(execd)
+
     def test_negative_votes_fall_back_to_global_bucket(self):
         state = {}
         cand = _entry_candidate("NEG", cluster="mixed")
@@ -1102,7 +1230,9 @@ class TradingV2AttributionTests(unittest.TestCase):
         finally:
             dc.PYTHONANYWHERE_MODE = old_pa
 
-    def test_record_entry_event_ignores_skipped_candidates(self):
+    def test_record_entry_event_accepts_skipped_rejects_others(self):
+        # Reversed by audit P0-2: skipped candidates ARE recorded now so edge
+        # buckets can fill without trading. Other decisions stay ignored.
         state = {}
         event = record_entry_event(
             state,
@@ -1112,8 +1242,19 @@ class TradingV2AttributionTests(unittest.TestCase):
             ts=123,
             regime="neutral",
         )
-        self.assertIsNone(event)
-        self.assertEqual(state.get("attribution_events"), [])
+        self.assertIsNotNone(event)
+        self.assertEqual(event["decision"], "skipped")
+        self.assertEqual(event["skip_reason"], "EV gate")
+        other = record_entry_event(
+            state,
+            _entry_candidate("IGN", cluster="trend"),
+            "blocked",
+            "whatever",
+            ts=123,
+            regime="neutral",
+        )
+        self.assertIsNone(other)
+        self.assertEqual(len(state["attribution_events"]), 1)
 
 
 class TradingV2IntegrationTests(unittest.TestCase):
@@ -1445,10 +1586,14 @@ class TradingV1SignalTests(unittest.TestCase):
             allow_live_risk=False,
         )
 
+        # Audit P1-11 reverses the old pin: core daily history is present and
+        # only optional categories (mfi/weekly/rel_str) are missing, so the
+        # 0.70 floor applies and low_data_quality no longer blocks the floor.
         self.assertEqual(rec["cls"], "buy")
-        self.assertLess(rec["data_quality"], 0.60)
-        self.assertFalse(rec["confidence_floor_candidate"])
-        self.assertIn("low_data_quality", rec["confidence_floor_blockers"])
+        self.assertLess(rec["data_quality_raw"], 0.60)
+        self.assertGreaterEqual(rec["data_quality"], 0.70)
+        self.assertTrue(rec["data_quality_floor_applied"])
+        self.assertNotIn("low_data_quality", rec["confidence_floor_blockers"])
 
     def test_vote_positive_buy_labels_survive_confidence_penalties(self):
         ctx = {
@@ -1856,8 +2001,13 @@ class PythonAnywhereHardeningTests(unittest.TestCase):
                              "BEAR_GATE_REQUIRES_DIP_OR_RSI_LT_35")
             neutral = dict(base)
             neutral["ctx"] = dict(base["ctx"], adx=10, is_dip=False)
+            neutral["rec"] = dict(base["rec"], confidence=50)
             self.assertEqual(bot.buyable_reason("X", neutral, {}, "neutral", {})[1],
-                             "NEUTRAL_ADX_BELOW_20_NON_DIP")
+                             "NEUTRAL_ADX_BELOW_GATE_NON_DIP")
+            # conf >= 60 bypasses the neutral ADX gate (audit P2-16)
+            high_conf_neutral = dict(neutral, rec=dict(base["rec"], confidence=60))
+            self.assertEqual(bot.buyable_reason("X", high_conf_neutral, {}, "neutral", {})[1],
+                             "buyable")
             knife = dict(base)
             knife["rec"] = {"cls": "buy", "confidence": 70,
                             "catalyst": {"type": "guidance_cut"}}
@@ -3840,6 +3990,360 @@ class PythonAnywhereHardeningTests(unittest.TestCase):
         self.assertEqual(out["spy_data_source"], "fmp_daily")
         self.assertEqual(out["vix_display"], "SPY_REALIZED_VOL_PROXY")
 
+    def test_jsonl_rotation_keeps_newest_lines(self):
+        # Audit P5-25: >8000 lines -> keep newest 5000 (free-tier disk quota).
+        import tempfile, os
+        import trading.bot as bot
+
+        tmp = tempfile.mkdtemp()
+        path = os.path.join(tmp, "tick_log.jsonl")
+        with open(path, "w", encoding="utf-8") as f:
+            for i in range(8100):
+                f.write(f'{{"i": {i}}}\n')
+        bot._jsonl_appends_since_check["tick_log.jsonl"] = 49
+        bot._rotate_jsonl_if_needed(path, "tick_log.jsonl")
+        with open(path, encoding="utf-8") as f:
+            lines = f.readlines()
+        self.assertEqual(len(lines), bot.JSONL_ROTATE_KEEP_LINES)
+        self.assertEqual(lines[-1].strip(), '{"i": 8099}')
+        self.assertEqual(lines[0].strip(), f'{{"i": {8100 - bot.JSONL_ROTATE_KEEP_LINES}}}')
+
+    def test_provider_support_registry_marks_and_reprobes(self):
+        # Audit P0-5: 402 symbols are skipped for a week, then re-probed.
+        import tempfile, os
+        import market.provider_support as ps
+
+        old_file = ps.PROVIDER_SUPPORT_FILE
+        old_state = ps._state
+        tmp = tempfile.mkdtemp()
+        try:
+            ps.PROVIDER_SUPPORT_FILE = os.path.join(tmp, "provider_support.json")
+            ps._state = None
+            self.assertTrue(ps.is_supported("XLK"))
+            ps.mark_unsupported("XLK", "402")
+            self.assertFalse(ps.is_supported("XLK"))
+            self.assertEqual(ps.unsupported_symbols(), ["XLK"])
+            # persisted?
+            ps._state = None
+            self.assertFalse(ps.is_supported("XLK"))
+            # re-probe due -> supported again
+            ps._load()["XLK"]["reprobe_after_ts"] = int(time.time()) - 1
+            self.assertTrue(ps.is_supported("XLK"))
+            self.assertEqual(ps.unsupported_symbols(), [])
+            # successful fetch clears the mark entirely
+            ps.mark_supported("XLK")
+            ps._state = None
+            self.assertNotIn("XLK", ps._load())
+        finally:
+            ps.PROVIDER_SUPPORT_FILE = old_file
+            ps._state = old_state
+
+    def test_pa_rotation_skips_unsupported_without_recorded_history(self):
+        import trading.bot as bot
+        import market.provider_support as ps
+
+        old_mode = bot.PYTHONANYWHERE_MODE
+        old_is_supported = ps.is_supported
+        old_load_hist = bot.load_price_hist
+        try:
+            bot.PYTHONANYWHERE_MODE = True
+            ps.is_supported = lambda t: t not in ("DEAD1", "DEAD2")
+            # DEAD2 has enough recorded snapshots to stay decidable
+            bot.load_price_hist = lambda: {
+                "DEAD2": [[1, 100.0]] * bot.MIN_SIGNAL_HISTORY_ROWS
+            }
+            b = {}
+            selected = bot._pa_stage_tickers(
+                ["AAA", "DEAD1", "DEAD2", "BBB"], [], b)
+        finally:
+            bot.PYTHONANYWHERE_MODE = old_mode
+            ps.is_supported = old_is_supported
+            bot.load_price_hist = old_load_hist
+        self.assertNotIn("DEAD1", selected)
+        status = b["pa_stage_status"]
+        self.assertEqual(status["rotation_skipped_unsupported"], 1)
+
+    def test_prewarm_pass_bounded_and_state_safe(self):
+        # Audit P1-10: ≤2 warms, 30-min cooldown, caches/stamps only.
+        import trading.bot as bot
+
+        calls = {"warm": [], "quotes": []}
+        old = {n: getattr(bot, n) for n in (
+            "load_tickers", "load_price_hist", "_scan_snapshot",
+            "warm_history", "get_quote")}
+        try:
+            bot.load_tickers = lambda: ["AAA", "BBB", "CCC"]
+            bot.load_price_hist = lambda: {}
+            bot._scan_snapshot = lambda: ([{"ticker": "SCN1"}], 0)
+            def fake_warm(symbols, max_symbols=None, max_fetches=None):
+                calls["warm"].append((list(symbols), max_symbols, max_fetches))
+                return {"warmed_symbols": list(symbols), "failed_symbols": []}
+            bot.warm_history = fake_warm
+            bot.get_quote = lambda t: calls["quotes"].append(t) or {"price": 1.0}
+            b = {"cash": 123.0, "holdings": {"H1": {"shares": 1}}}
+            now = time.time()
+            out = bot._prewarm_pass(b, now)
+            self.assertEqual(len(out["symbols"]), 2)
+            self.assertEqual(calls["warm"][0][1:], (2, 2))
+            self.assertLessEqual(len(calls["quotes"]), 2)
+            self.assertEqual(b["cash"], 123.0)
+            self.assertEqual(b["holdings"], {"H1": {"shares": 1}})
+            self.assertEqual(b["last_prewarm"]["symbols"], out["symbols"])
+            # cooldown: immediate second call is a no-op
+            self.assertIsNone(bot._prewarm_pass(b, now + 10))
+            self.assertEqual(len(calls["warm"]), 1)
+            # rotation advances on the next eligible pass
+            out2 = bot._prewarm_pass(b, now + bot.PREWARM_COOLDOWN_SEC + 1)
+            self.assertNotEqual(out2["symbols"], out["symbols"])
+            # expired wall clock skips the quote-refresh loop
+            calls["quotes"].clear()
+            old_wall = bot.PREWARM_WALL_CLOCK_SEC
+            try:
+                bot.PREWARM_WALL_CLOCK_SEC = -1
+                bot._prewarm_pass(b, now + 2 * (bot.PREWARM_COOLDOWN_SEC + 1))
+            finally:
+                bot.PREWARM_WALL_CLOCK_SEC = old_wall
+            self.assertEqual(calls["quotes"], [])
+        finally:
+            for name, value in old.items():
+                setattr(bot, name, value)
+
+    def test_get_history_synthetic_recorded_trust_boundary(self):
+        # Audit P1-7: ≥25 recorded closes with a fresh newest point → trusted
+        # synthetic ctx; fewer or old points stay an untrusted fallback.
+        import market.history as history
+        import trading.indicators as indicators
+        import trading.risk as risk
+
+        now = int(time.time())
+        fresh_pts = [[now - (30 - i) * 3600, 100.0 + i * 0.1] for i in range(30)]
+        old_pts = [[now - 12 * 86400 - (30 - i) * 3600, 100.0] for i in range(30)]
+        few_pts = [[now - (20 - i) * 3600, 100.0] for i in range(20)]
+        old = {
+            "cache_get": history.cache_get,
+            "cache_set": history.cache_set,
+            "_daily_bars": history._daily_bars,
+            "load_price_hist": indicators.load_price_hist,
+            "get_sector": risk.get_sector,
+        }
+        try:
+            history.cache_get = lambda *_a, **_k: None
+            history.cache_set = lambda *_a, **_k: None
+            history._daily_bars = lambda _tk: None
+            risk.get_sector = lambda _tk: None
+
+            indicators.load_price_hist = lambda: {"SYN": fresh_pts}
+            r = history.get_history("SYN")
+            self.assertEqual(r["history_source"], "synthetic_recorded")
+            self.assertEqual(r["history_status"], "synthetic_recorded")
+            self.assertEqual(r["history_rows"], 30)
+            self.assertIn("rsi", r)
+            self.assertIn("ma30", r)
+            import trading.bot as bot
+            st = bot._history_execution_status(r)
+            self.assertTrue(st["trusted"])
+            self.assertIsNone(st["blocker"])
+
+            indicators.load_price_hist = lambda: {"SYN": few_pts}
+            r2 = history.get_history("SYN")
+            self.assertEqual(r2.get("history_rows", 0), 0)
+
+            indicators.load_price_hist = lambda: {"SYN": old_pts}
+            r3 = history.get_history("SYN")
+            self.assertEqual(r3.get("history_rows", 0), 0)
+        finally:
+            history.cache_get = old["cache_get"]
+            history.cache_set = old["cache_set"]
+            history._daily_bars = old["_daily_bars"]
+            indicators.load_price_hist = old["load_price_hist"]
+            risk.get_sector = old["get_sector"]
+
+    def test_half_missing_providers_still_rank_candidates(self):
+        # Audit P1 goal: with 50% of tickers on synthetic ctx and 50% missing,
+        # ranking still produces tradable candidates (no MISSING_HISTORY wall).
+        import trading.bot as bot
+
+        good_ctx = {"history_rows": 30, "history_source": "synthetic_recorded",
+                    "history_status": "synthetic_recorded", "adx": 30, "rsi": 55,
+                    "week_chg_pct": 0, "dist_from_high_pct": 0, "vol_ratio": 1.2,
+                    "avg_dollar_vol_20d": 100_000_000, "atr_pct": 2.0}
+        dead_ctx = {"history_rows": 0, "history_source": "missing",
+                    "history_status": "missing"}
+        pool = []
+        for i in range(8):
+            cand = _entry_candidate(f"MIX{i}", confidence=55, cluster="trend")
+            cand["ctx"] = dict(good_ctx if i % 2 == 0 else dead_ctx)
+            pool.append(cand)
+        buyable = [c for c in pool
+                   if bot._history_execution_status(c["ctx"])["blocker"] is None]
+        self.assertEqual(len(buyable), 4)
+        ranked = rank_candidates(buyable, 10_000, -6, "neutral", 1, 1, 1, {},
+                                 min_position_usd=150)
+        self.assertTrue(any(c["tradable"] for c in ranked))
+
+    def test_rel_str_spy_fallback_when_sector_etf_missing(self):
+        # Audit P1-12: XLK/XLY 402 on PA → benchmark vs SPY, labeled.
+        import pandas as pd
+        import trading.indicators as ind
+        import market.data_manager as dm
+
+        df = pd.DataFrame({"Close": [100.0 + i for i in range(25)]})
+        old_get_daily = dm.get_daily
+        old_cache_get = ind.cache_get
+        old_cache_set = ind.cache_set
+        try:
+            ind.cache_get = lambda *_a, **_k: None
+            ind.cache_set = lambda *_a, **_k: None
+            dm.get_daily = lambda tk: None if tk == "XLK" else df
+            out = ind.sector_relative_strength("TKR", "tech", lookback_days=20)
+        finally:
+            dm.get_daily = old_get_daily
+            ind.cache_get = old_cache_get
+            ind.cache_set = old_cache_set
+        self.assertEqual(out["relative_strength_source"], "spy_fallback")
+        self.assertEqual(out["rel_str_benchmark"], "SPY")
+        self.assertIn("rel_str_pct", out)
+
+    def test_credit_signal_neutral_immediately_on_pa(self):
+        # Audit P1-13: HYG/IEI permanently 402 on PA — no fetch spend.
+        import trading.risk as risk
+
+        old_mode = risk.PYTHONANYWHERE_MODE
+        old_cache_get = risk.cache_get
+        try:
+            risk.PYTHONANYWHERE_MODE = True
+            def _boom(*_a, **_k):
+                raise AssertionError("credit_signal touched cache/providers on PA")
+            risk.cache_get = _boom
+            out = risk.credit_signal()
+        finally:
+            risk.PYTHONANYWHERE_MODE = old_mode
+            risk.cache_get = old_cache_get
+        self.assertEqual(out["credit_label"], "neutral")
+        self.assertEqual(out["credit_pct"], 50.0)
+        self.assertEqual(out["credit_status"], "unavailable_on_pa")
+
+    def test_data_quality_floor_with_core_history_present(self):
+        # Audit P1-11: optional categories missing (news/analyst/insider/
+        # rel_str/mfi/weekly) must not sink an otherwise-valid BUY: dq >= 0.70.
+        core_only_ctx = {
+            "current": 105.0, "ma7": 103.0, "ma30": 100.0, "rsi": 60.0,
+            "week_chg_pct": 2.0, "adx": 30.0, "mom_30d_pct": 5.0,
+            "vol_ratio": 1.4, "avg_dollar_vol_20d": 100_000_000,
+            "history_rows": 30, "history_source": "synthetic_recorded",
+            "history_status": "synthetic_recorded",
+        }
+        rec = get_recommendation(0.0, core_only_ctx, regime=None)
+        self.assertGreaterEqual(rec["data_quality"], 0.70)
+        self.assertLess(rec["data_quality_raw"], 0.70)
+        self.assertTrue(rec["data_quality_floor_applied"])
+
+        rec_no_core = get_recommendation(0.0, {}, regime=None)
+        self.assertFalse(rec_no_core["data_quality_floor_applied"])
+
+    def _run_stale_holding_tick(self, snapshot_price, snapshot_age_sec,
+                                peak=None, avg_cost=100.0):
+        # Audit P1-14 harness: one holding, stale live quote, recorded snapshot.
+        import trading.bot as bot
+
+        now = time.time()
+        state = {
+            "cash": 1000.0,
+            "starting": 1000.0,
+            "holdings": {"STALE1": {
+                "shares": 5.0,
+                "avg_cost": avg_cost,
+                "entry_ts": now - 48 * 3600,
+                "peak": peak if peak is not None else avg_cost,
+                "trough": avg_cost,
+                "peak_pnl_pct": (((peak or avg_cost) - avg_cost) / avg_cost * 100.0),
+            }},
+            "history": [],
+            "last_trade": 0,
+            "stopped": False,
+        }
+        hold_rec = {"cls": "hold", "signal": "HOLD", "confidence": 50,
+                    "score": 0, "categories": {}, "reasons": []}
+        names = [
+            "load_bot", "save_bot", "is_market_open", "in_new_buy_window",
+            "load_tickers", "get_market_regime", "get_vix", "get_news",
+            "get_history", "get_intraday_context", "get_earnings_soon",
+            "get_analyst_rec", "get_insider_sentiment", "get_recommendation",
+            "classify_catalyst", "get_quote", "get_sector", "get_corr_group",
+            "_scan_snapshot", "load_feedback_stats", "load_recent_suggestions",
+            "log_suggestion_run", "prune_suggestion_store", "prune_cache_dir",
+            "build_extra_ticker_suggestions", "load_price_hist",
+        ]
+        old = {n: getattr(bot, n) for n in names}
+        try:
+            bot.load_bot = lambda: state
+            bot.save_bot = lambda _b: None
+            bot.is_market_open = lambda: True
+            bot.in_new_buy_window = lambda: True
+            bot.load_tickers = lambda: []
+            bot.get_market_regime = lambda _cfg=None: {
+                "regime": "neutral", "regime_effective": "neutral",
+                "regime_v3": "normal", "regime_v3_effective": "normal",
+                "regime_v3_raw": "normal", "spy_data_ok": True,
+                "regime_data_status": "ok", "top_sectors": [],
+            }
+            bot.get_vix = lambda: {"regime": "NORMAL", "mult": 1.0, "vix": 12.0,
+                                   "data_ok": True, "data_status": "ok"}
+            bot.get_news = lambda _t: ([], 0.0)
+            bot.get_history = lambda _t: {}
+            bot.get_intraday_context = lambda _t: {}
+            bot.get_earnings_soon = lambda _t: {}
+            bot.get_analyst_rec = lambda _t: {}
+            bot.get_insider_sentiment = lambda _t: {}
+            bot.get_recommendation = lambda *_a, **_k: dict(hold_rec)
+            bot.classify_catalyst = lambda *_a, **_k: {}
+            bot.get_quote = lambda _t: {"price": 0, "stale": True}
+            bot.get_sector = lambda _t: "tech"
+            bot.get_corr_group = lambda _t: None
+            bot._scan_snapshot = lambda: ([], 0)
+            bot.load_feedback_stats = lambda *_a, **_k: {}
+            bot.load_recent_suggestions = lambda *_a, **_k: {}
+            bot.log_suggestion_run = lambda *_a, **_k: None
+            bot.prune_suggestion_store = lambda *_a, **_k: None
+            bot.prune_cache_dir = lambda **_k: {"removed": 0, "kept": 0}
+            bot.build_extra_ticker_suggestions = lambda *_a, **_k: []
+            bot.load_price_hist = lambda: {
+                "STALE1": [[int(now - snapshot_age_sec), float(snapshot_price)]]
+            }
+            out_state, traded, _action = bot._run_bot_locked(force=True)
+        finally:
+            for name, value in old.items():
+                setattr(bot, name, value)
+        return out_state, traded
+
+    def test_stale_quote_protective_stop_fires_only_hard_stop(self):
+        # Deep loss vs fresh snapshot → ONLY the hard stop fires
+        out, traded = self._run_stale_holding_tick(80.0, 20 * 60)
+        self.assertTrue(traded)
+        self.assertNotIn("STALE1", out["holdings"])
+        outcome = out["trade_outcomes"][-1]
+        self.assertEqual(outcome["exit_reason"], "stop_loss_stale_quote")
+
+    def test_stale_quote_small_loss_does_not_exit_even_when_aging_due(self):
+        # −1%, held 48h (> neutral aging 12h): live aging would exit; stale must not
+        out, traded = self._run_stale_holding_tick(99.0, 20 * 60)
+        self.assertFalse(traded)
+        self.assertIn("STALE1", out["holdings"])
+
+    def test_stale_quote_old_snapshot_halts_completely(self):
+        # Snapshot 90 min old (> 60 min freshness) → halt exactly as before
+        out, traded = self._run_stale_holding_tick(80.0, 90 * 60)
+        self.assertFalse(traded)
+        self.assertIn("STALE1", out["holdings"])
+        # and no peak/trough mutation happened off the recorded price
+        self.assertEqual(out["holdings"]["STALE1"]["peak"], 100.0)
+
+    def test_stale_quote_trail_never_fires(self):
+        # +20% with peak +40% → live trail would exit; stale must hold
+        out, traded = self._run_stale_holding_tick(120.0, 20 * 60, peak=140.0)
+        self.assertFalse(traded)
+        self.assertIn("STALE1", out["holdings"])
+
     def test_record_hold_uses_display_signal_labels(self):
         import trading.bot as bot
 
@@ -3890,7 +4394,7 @@ class PythonAnywhereHardeningTests(unittest.TestCase):
         self.assertEqual(diag["main_blocker"], "interval_cooldown")
         self.assertEqual(diag["min_buy_confidence"], 40)
         self.assertEqual(diag["degraded_min_confidence"], 40)
-        self.assertEqual(diag["min_trade_size_effective"], 10.0)
+        self.assertEqual(diag["min_trade_size_effective"], 150.0)
         self.assertEqual(saved[-1]["last_cache_prune"], {"removed": 0, "kept": 0})
 
     def test_bot_no_trade_run_persists_no_buy_diagnostics(self):
@@ -4059,22 +4563,24 @@ class PythonAnywhereHardeningTests(unittest.TestCase):
         finally:
             for name, value in old.items():
                 setattr(bot, name, value)
+        # Audit P1-6: missing SPY now truthfully reports DEGRADED_MODE, and the
+        # standard-gates parity path keeps every effective gate/size at NORMAL.
         self.assertEqual(captured["vix_mult"], 1.0)
         self.assertEqual(captured["mode_size_mult"], 1.0)
         self.assertIsNone(captured["mode_size_reason"])
         diag = out_state["last_no_buy_diagnostics"]
         self.assertTrue(diag["regime_allow_buys"])
-        self.assertEqual(diag["trading_mode"], "NORMAL_MODE")
-        self.assertFalse(diag["degraded_mode_active"])
+        self.assertEqual(diag["trading_mode"], "DEGRADED_MODE")
+        self.assertTrue(diag["degraded_mode_active"])
         self.assertTrue(diag["degraded_use_standard_gates_for_testing"])
-        self.assertFalse(diag["degraded_standard_gates_active"])
-        self.assertIsNone(diag["degraded_gate_policy"])
+        self.assertTrue(diag["degraded_standard_gates_active"])
+        self.assertEqual(diag["degraded_gate_policy"], "standard_gates_for_testing")
         self.assertEqual(diag["effective_size_mult"], 1.0)
         self.assertEqual(diag["effective_min_buy_confidence"], 40)
         self.assertTrue(diag["normal_ev_gates_required"])
         self.assertTrue(diag["normal_risk_caps_required"])
         self.assertTrue(diag["fresh_quote_required"])
-        self.assertEqual(diag["data_health_blocks"], [])
+        self.assertEqual(diag["data_health_blocks"], ["SPY_DATA_MISSING"])
         self.assertIn("SPY_DATA_MISSING", diag["data_health_warnings"])
         self.assertTrue(diag["regime_data_fallback"])
         self.assertEqual(diag["regime_data_size_mult"], 1.0)

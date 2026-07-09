@@ -372,7 +372,9 @@ def update_entry_buckets(state, event, horizon=MAIN_HORIZON):
 
 def record_entry_event(state, candidate, decision, reason, ts=None, regime=None):
     ensure_attribution_state(state)
-    if decision != "executed":
+    # "skipped" events fill forward-return edge buckets without trading
+    # (audit P0-2); caller caps them at TRACK_TOP_SKIPS_PER_CYCLE per tick.
+    if decision not in ("executed", "skipped"):
         return None
     rec = candidate.get("rec") or {}
     ctx = candidate.get("ctx") or {}
