@@ -1,0 +1,70 @@
+{# Shared Win98 macros — imported by base98.html, index.html, bot.html.
+   (Macros can't cross an {% extends %} boundary, hence this file.) #}
+
+{# ---- pixel icon set (16x16, crisp) ---- #}
+{% macro w98icon(name) -%}
+<svg viewBox="0 0 16 16" xmlns="http://www.w3.org/2000/svg" shape-rendering="crispEdges" aria-hidden="true">
+{%- if name == 'computer' -%}
+<rect x="1" y="2" width="14" height="10" fill="#dcd3c3" stroke="#211d17"/><rect x="3" y="4" width="10" height="6" fill="#177f74"/><rect x="4" y="5" width="4" height="1" fill="#39ff6e"/><rect x="4" y="7" width="6" height="1" fill="#39ff6e"/><rect x="6" y="12" width="4" height="1" fill="#211d17"/><rect x="4" y="13" width="8" height="2" fill="#dcd3c3" stroke="#211d17"/>
+{%- elif name == 'chart' -%}
+<rect x="1" y="1" width="14" height="14" fill="#081209" stroke="#211d17"/><rect x="3" y="10" width="2" height="3" fill="#39ff6e"/><rect x="6" y="7" width="2" height="6" fill="#39ff6e"/><rect x="9" y="8" width="2" height="5" fill="#ffb347"/><rect x="12" y="4" width="2" height="9" fill="#39ff6e"/><rect x="3" y="3" width="3" height="1" fill="#39ff6e"/>
+{%- elif name == 'stats' -%}
+<rect x="1" y="1" width="14" height="14" fill="#fffdf6" stroke="#211d17"/><rect x="3" y="9" width="2" height="4" fill="#232e8f"/><rect x="6" y="6" width="2" height="7" fill="#c85a2e"/><rect x="9" y="3" width="2" height="10" fill="#232e8f"/><rect x="12" y="7" width="1" height="6" fill="#c85a2e"/>
+{%- elif name == 'folder' -%}
+<rect x="1" y="4" width="14" height="10" fill="#e8a33d" stroke="#211d17"/><rect x="1" y="2" width="7" height="3" fill="#ffd257" stroke="#211d17"/><rect x="2" y="6" width="12" height="1" fill="#ffd257"/>
+{%- elif name == 'money' -%}
+<rect x="1" y="3" width="14" height="10" fill="#1fbf4e" stroke="#211d17"/><rect x="3" y="5" width="10" height="6" fill="none" stroke="#04270f"/><rect x="7" y="6" width="2" height="4" fill="#fffdf6"/><rect x="6" y="6" width="1" height="1" fill="#fffdf6"/><rect x="9" y="9" width="1" height="1" fill="#fffdf6"/>
+{%- elif name == 'buy' -%}
+<rect x="1" y="1" width="14" height="14" fill="#fffdf6" stroke="#211d17"/><rect x="7" y="4" width="2" height="8" fill="#12873f"/><rect x="5" y="6" width="2" height="2" fill="#12873f"/><rect x="9" y="6" width="2" height="2" fill="#12873f"/><rect x="6" y="5" width="1" height="1" fill="#12873f"/><rect x="9" y="5" width="1" height="1" fill="#12873f"/>
+{%- elif name == 'sell' -%}
+<rect x="1" y="1" width="14" height="14" fill="#fffdf6" stroke="#211d17"/><rect x="7" y="4" width="2" height="8" fill="#c93a28"/><rect x="5" y="8" width="2" height="2" fill="#c93a28"/><rect x="9" y="8" width="2" height="2" fill="#c93a28"/><rect x="6" y="10" width="1" height="1" fill="#c93a28"/><rect x="9" y="10" width="1" height="1" fill="#c93a28"/>
+{%- elif name == 'decisions' -%}
+<rect x="2" y="1" width="12" height="14" fill="#fffdf6" stroke="#211d17"/><rect x="4" y="3" width="8" height="1" fill="#232e8f"/><rect x="4" y="5" width="6" height="1" fill="#8d8172"/><rect x="4" y="7" width="8" height="1" fill="#8d8172"/><rect x="4" y="9" width="5" height="1" fill="#8d8172"/><rect x="4" y="11" width="7" height="1" fill="#c85a2e"/>
+{%- elif name == 'watchlist' -%}
+<rect x="1" y="1" width="14" height="14" fill="#fffdf6" stroke="#211d17"/><rect x="7" y="3" width="2" height="2" fill="#e8a33d"/><rect x="5" y="5" width="6" height="2" fill="#e8a33d"/><rect x="3" y="7" width="10" height="2" fill="#ffd257"/><rect x="5" y="9" width="2" height="2" fill="#e8a33d"/><rect x="9" y="9" width="2" height="2" fill="#e8a33d"/><rect x="4" y="11" width="2" height="1" fill="#e8a33d"/><rect x="10" y="11" width="2" height="1" fill="#e8a33d"/>
+{%- elif name == 'scanner' -%}
+<rect x="1" y="1" width="14" height="14" fill="#fffdf6" stroke="#211d17"/><rect x="3" y="3" width="7" height="7" fill="#b6e3ff" stroke="#232e8f"/><rect x="5" y="5" width="3" height="3" fill="#232e8f"/><rect x="10" y="10" width="2" height="2" fill="#211d17"/><rect x="12" y="12" width="2" height="2" fill="#211d17"/>
+{%- elif name == 'compare' -%}
+<rect x="1" y="1" width="14" height="14" fill="#fffdf6" stroke="#211d17"/><rect x="3" y="3" width="10" height="2" fill="#232e8f"/><rect x="3" y="7" width="10" height="2" fill="#c85a2e"/><rect x="3" y="11" width="10" height="2" fill="#12873f"/>
+{%- elif name == 'display' -%}
+<rect x="1" y="2" width="14" height="10" fill="#dcd3c3" stroke="#211d17"/><rect x="3" y="4" width="10" height="6" fill="#177f74"/><rect x="4" y="5" width="3" height="2" fill="#c85a2e"/><rect x="8" y="6" width="4" height="3" fill="#232e8f"/><rect x="6" y="12" width="4" height="1" fill="#211d17"/><rect x="4" y="13" width="8" height="2" fill="#dcd3c3" stroke="#211d17"/>
+{%- elif name == 'info' -%}
+<rect x="2" y="2" width="12" height="12" fill="#28509e" stroke="#211d17"/><rect x="7" y="4" width="2" height="2" fill="#fffdf6"/><rect x="7" y="7" width="2" height="5" fill="#fffdf6"/>
+{%- elif name == 'warn' -%}
+<rect x="7" y="2" width="2" height="2" fill="#ffd257" stroke="#211d17"/><rect x="6" y="4" width="4" height="4" fill="#ffd257" stroke="#211d17"/><rect x="4" y="8" width="8" height="4" fill="#ffd257" stroke="#211d17"/><rect x="2" y="12" width="12" height="2" fill="#ffd257" stroke="#211d17"/><rect x="7" y="5" width="2" height="5" fill="#211d17"/><rect x="7" y="11" width="2" height="2" fill="#211d17"/>
+{%- elif name == 'error' -%}
+<rect x="2" y="2" width="12" height="12" fill="#c93a28" stroke="#211d17"/><rect x="5" y="5" width="2" height="2" fill="#fffdf6"/><rect x="9" y="5" width="2" height="2" fill="#fffdf6"/><rect x="7" y="7" width="2" height="2" fill="#fffdf6"/><rect x="5" y="9" width="2" height="2" fill="#fffdf6"/><rect x="9" y="9" width="2" height="2" fill="#fffdf6"/>
+{%- elif name == 'question' -%}
+<rect x="2" y="2" width="12" height="12" fill="#28509e" stroke="#211d17"/><rect x="5" y="4" width="6" height="2" fill="#fffdf6"/><rect x="9" y="6" width="2" height="2" fill="#fffdf6"/><rect x="7" y="8" width="2" height="2" fill="#fffdf6"/><rect x="7" y="11" width="2" height="1" fill="#fffdf6"/>
+{%- else -%}
+<rect x="2" y="2" width="12" height="12" fill="#dcd3c3" stroke="#211d17"/>
+{%- endif -%}
+</svg>
+{%- endmacro %}
+
+{# ---- Win98 window macro ----
+   slug: persistence key; title: titlebar text; icon: w98icon name;
+   x/y/w: default desktop-mode geometry (px); h optional (0 = auto);
+   status: optional pre-rendered status-bar HTML ({% set %} block);
+   closed: start closed (e.g. Display Properties);
+   front: raised on load; behind: starts at the bottom of the stack. #}
+{% macro win98(slug, title, icon, x, y, w, h=0, status=None, closed=False, front=False, behind=False) %}
+<section class="win98-window {% if closed %}hidden-win{% endif %}" id="win-{{ slug }}"
+         data-win="{{ slug }}" data-title="{{ title }}" data-icon="{{ icon }}"
+         data-x="{{ x }}" data-y="{{ y }}" data-w="{{ w }}" data-h="{{ h }}"
+         {% if closed %}data-closed="1"{% endif %}
+         {% if front %}data-front="1"{% endif %}
+         {% if behind %}data-behind="1"{% endif %}>
+  <div class="titlebar">
+    <span class="t-icon">{{ w98icon(icon) }}</span>
+    <span class="t-text">{{ title }}</span>
+    <span class="t-controls">
+      <button type="button" data-act="min" aria-label="Minimize {{ title }}">_</button>
+      <button type="button" data-act="max" aria-label="Maximize {{ title }}">□</button>
+      <button type="button" data-act="close" aria-label="Close {{ title }}">×</button>
+    </span>
+  </div>
+  <div class="win-body">{{ caller() }}</div>
+  {% if status %}<div class="win-status">{{ status }}</div>{% endif %}
+</section>
+{% endmacro %}

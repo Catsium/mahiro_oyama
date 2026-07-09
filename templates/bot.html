@@ -1,611 +1,430 @@
-{% extends 'base.html' %}
-{% set active = 'bot' %}
-{% block title %}//catsium · Mahiro Oyama's portfolio{% endblock %}
+{% extends 'base98.html' %}
+{% from '_w98.html' import win98 %}
+{% block title %}//catsium 98 · Mahiro Oyama's portfolio{% endblock %}
 
 {% block head_extra %}
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.2/dist/chart.umd.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/hammerjs@2.0.8/hammer.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-zoom@2.0.1/dist/chartjs-plugin-zoom.min.js"></script>
-<style>
-  .chart-wrap{
-    position:relative;height:300px;margin:8px 0 14px;
-    border-radius:12px;overflow:hidden;
-    background:linear-gradient(180deg,rgba(255,255,255,.01),rgba(0,0,0,.15));
-    padding:6px;
-  }
-  /* Round-6: click-a-point detail modal (replaces R5 side panel) */
-  .pt-modal-backdrop{
-    display:none;position:fixed;inset:0;z-index:1000;
-    background:rgba(0,0,0,.55);align-items:center;justify-content:center;
-  }
-  .pt-modal-backdrop.show{display:flex}
-  .pt-modal{
-    background:#15171c;border:1px solid var(--pink);border-radius:14px;
-    padding:18px 20px;min-width:260px;max-width:90vw;max-height:80vh;overflow-y:auto;
-    box-shadow:0 12px 40px rgba(0,0,0,.5);
-  }
-  .pt-modal .pm-ts{color:var(--muted);font-size:.74rem}
-  .pt-modal .pm-eq{font-size:1.5rem;font-weight:700;color:#fff;margin:2px 0}
-  .pt-modal .pm-pos{margin-top:10px;border-top:1px dashed var(--border);padding-top:8px;font-size:.82rem}
-  .pt-modal .pm-pos .row{display:flex;justify-content:space-between;gap:14px;padding:2px 0}
-  .pt-modal .pm-close{
-    float:right;background:none;border:none;color:var(--muted);
-    font-size:1.2rem;cursor:pointer;line-height:1;margin:-4px -6px 0 0;
-  }
-  .pt-modal .pm-close:hover{color:#fff}
-  .pc-backdrop{
-    display:none;position:fixed;inset:0;z-index:1100;
-    background:rgba(8,7,10,.68);backdrop-filter:blur(8px);
-    align-items:center;justify-content:center;padding:20px;
-  }
-  .pc-backdrop.show{display:flex}
-  .pc-modal{
-    width:min(960px,96vw);max-height:90vh;overflow:auto;
-    background:linear-gradient(180deg,rgba(37,32,43,.98),rgba(28,25,34,.98));
-    border:2px solid rgba(246,168,200,.62);border-radius:18px;
-    box-shadow:0 22px 70px rgba(0,0,0,.48), inset 0 1px 0 rgba(255,255,255,.03);
-    padding:22px;animation:pcModalIn .22s cubic-bezier(.2,.8,.2,1) both;
-  }
-  @keyframes pcModalIn{from{opacity:0;transform:translateY(10px) scale(.985)}to{opacity:1;transform:translateY(0) scale(1)}}
-  .pc-close{float:right;background:none;border:0;color:var(--muted);font-size:1.3rem;cursor:pointer;line-height:1}
-  .pc-close:hover{color:#fff}
-  .pc-top{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:16px}
-  .pc-title h3{margin:0;color:#fff;font-size:1.08rem}
-  .pc-title p{margin:5px 0 0;color:var(--muted);font-size:.78rem;line-height:1.45}
-  .pc-nav{display:flex;align-items:center;gap:8px;flex-wrap:wrap;justify-content:flex-end}
-  .pc-month{min-width:140px;text-align:center;color:var(--pink);font-weight:700;font-size:.88rem}
-  .pc-summary{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin-bottom:14px}
-  .pc-stat{border:1px solid var(--border);border-radius:12px;background:rgba(255,255,255,.03);padding:11px 12px}
-  .pc-stat .label{color:var(--muted);font-size:.7rem;text-transform:uppercase;letter-spacing:.5px}
-  .pc-stat .value{margin-top:5px;font-size:1rem;font-weight:700;color:#fff}
-  .pc-stat.pos .value{color:var(--green)}
-  .pc-stat.neg .value{color:var(--red)}
-  .pc-legend{display:flex;align-items:center;gap:12px;flex-wrap:wrap;color:var(--muted);font-size:.74rem;margin:4px 0 12px}
-  .pc-dot{width:10px;height:10px;border-radius:3px;display:inline-block;margin-right:5px;border:1px solid var(--border);vertical-align:-1px}
-  .pc-dot.profit{background:var(--green-zone);border-color:var(--green)}
-  .pc-dot.loss{background:var(--red-zone);border-color:var(--red)}
-  .pc-dot.neutral{background:rgba(255,255,255,.06)}
-  .pc-body{display:grid;grid-template-columns:minmax(0,1fr) 280px;gap:16px;align-items:start}
-  .pc-weekdays,.pc-grid{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:7px}
-  .pc-weekdays{margin-bottom:7px;color:var(--muted);font-size:.7rem;text-align:center}
-  .pc-day,.pc-blank{
-    min-height:82px;border-radius:12px;border:1px solid var(--border);
-    background:rgba(255,255,255,.035);
-  }
-  .pc-day{
-    color:var(--text);cursor:pointer;padding:8px;text-align:left;
-    display:flex;flex-direction:column;justify-content:space-between;gap:6px;
-    transition:transform var(--t-fast),border-color var(--t-fast),background var(--t-fast),box-shadow var(--t-fast);
-  }
-  .pc-day:hover,.pc-day.active{transform:translateY(-1px);border-color:var(--pink);box-shadow:0 0 0 1px rgba(246,168,200,.14)}
-  .pc-day.profit{background:linear-gradient(180deg,rgba(126,228,155,.18),rgba(126,228,155,.06));border-color:rgba(126,228,155,.56)}
-  .pc-day.loss{background:linear-gradient(180deg,rgba(255,138,160,.18),rgba(255,138,160,.06));border-color:rgba(255,138,160,.56)}
-  .pc-day .num{font-weight:700;font-size:.82rem}
-  .pc-day .pl{font-size:.74rem;font-weight:700}
-  .pc-day.profit .pl{color:var(--green)}
-  .pc-day.loss .pl{color:var(--red)}
-  .pc-day .meta{color:var(--muted);font-size:.66rem;line-height:1.3}
-  .pc-detail{border:1px solid var(--border);border-radius:14px;background:rgba(255,255,255,.035);padding:14px;min-height:250px}
-  .pc-detail h4{margin:0 0 8px;font-size:.95rem}
-  .pc-detail-row{display:flex;justify-content:space-between;gap:12px;padding:5px 0;border-bottom:1px dashed rgba(255,255,255,.08);font-size:.78rem}
-  .pc-detail-row span:first-child{color:var(--muted)}
-  .pc-tags{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
-  .pc-tag{border:1px solid var(--border);border-radius:999px;padding:3px 8px;font-size:.7rem;color:#fff;background:rgba(255,255,255,.04)}
-  .pc-note{margin-top:10px;color:var(--muted);font-size:.76rem;line-height:1.45}
-  .pc-error{color:var(--red);font-size:.82rem;margin:10px 0}
-  @media (max-width:760px){
-    .pc-modal{padding:16px}
-    .pc-summary{grid-template-columns:repeat(2,minmax(0,1fr))}
-    .pc-body{grid-template-columns:1fr}
-    .pc-day,.pc-blank{min-height:70px}
-    .pc-day .meta{display:none}
-  }
-  .total-row{
-    display:flex;align-items:baseline;justify-content:center;flex-wrap:wrap;
-    gap:14px;margin-top:18px;padding:14px 0 4px;
-    border-top:1px dashed var(--border);
-  }
-  .total-amount{font-size:2.1rem;font-weight:700;letter-spacing:.5px}
-  .total-delta{font-size:1.15rem;font-weight:700}
-  .total-delta.pos{color:var(--green)}
-  .total-delta.neg{color:var(--red)}
-  .total-delta .pct{opacity:.85;font-weight:500;font-size:.95rem;margin-left:6px}
-  .actions{display:flex;gap:10px;justify-content:center;flex-wrap:wrap;margin-top:14px}
-  .sectors{display:flex;flex-wrap:wrap;gap:6px;margin-top:14px}
-  .chev{display:inline-block;transition:transform var(--t-med);color:var(--pink);opacity:.6}
-  tr.open .chev{transform:rotate(90deg);opacity:1}
-  .detail{display:none}
-  .detail.show{display:table-row}
-  .detail td{background:var(--surface-2);padding:14px 18px;font-size:.84rem;line-height:1.6;border-bottom:1px solid var(--border)}
-  .detail .note{color:var(--muted)}
-  .detail .news{margin-top:10px;background:#0f0f0f;border:1px solid var(--border);border-radius:8px;padding:8px 12px}
-  .ro-note{color:var(--muted);font-size:.82rem;text-align:center;margin-top:10px}
-</style>
+{% endblock %}
+
+{% block body_data %}
+  data-bot-state="{{ 'stopped' if bot.stopped else 'running' }}"
+  data-today-pct="{{ stats.today_pct }}"
+  data-pnl-pct="{{ '%.3f'|format(pnl_pct) }}"
+  data-equity="{{ '{:,.2f}'.format(total) }}"
+  {% if no_buy.last_bot_error %}data-bot-error="1"{% endif %}
+  {% if last_decision_ago_min is not none %}data-last-decision="{{ last_decision_ago_min }} min ago"{% endif %}
 {% endblock %}
 
 {% block content %}
-<div class="scene">
-<div class="container">
 
-  <div class="banner">
-    Stock data updates every minute · bot makes decisions every 2 minutes.<br>
-    project inspired by <a href="https://portfolio.neurosama.com/" target="_blank" rel="noopener">neuro's portfolio</a> · i love neuro
-  </div>
-
-  <!-- ============== portfolio performance ============== -->
-  <section class="card s1">
-    <div class="card-head">
-      <span class="icon-tile">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
-          <path d="M3 17l5-5 4 4 8-9"/><path d="M14 7h6v6"/>
-        </svg>
-      </span>
-      <h2>//Mahiro Oyama's portfolio performance</h2>
-      <div class="head-meta">
-        <button class="ghost-btn" type="button" id="profitCalendarOpen">
-          <i class="fa-regular fa-calendar-days" aria-hidden="true"></i>
-          Profit Calendar
-        </button>
-      </div>
-    </div>
-
-    <div class="range-row">
-      <div class="range-group" id="rangeGroup">
-        <span class="slider" id="rangeSlider"></span>
-        <button class="range-btn active" data-range="1d">1D · 1min</button>
-        <button class="range-btn"        data-range="1w">1W · 30min</button>
-        <button class="range-btn"        data-range="1m">1M · 1day</button>
-        <button class="range-btn"        data-range="all">All Time</button>
-      </div>
-      <button class="ghost-btn" id="resetZoom" title="Reset zoom">
-        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 3-6.7"/><path d="M3 4v5h5"/></svg>
-        reset zoom
+{# ============== portfolio performance ============== #}
+{% set portfolio_status %}
+  <span class="seg">Stock data updates every minute · bot decides every 2 min.</span>
+  <span class="seg">inspired by <a href="https://portfolio.neurosama.com/" target="_blank" rel="noopener">neuro's portfolio</a> · i love neuro</span>
+{% endset %}
+{% call win98('portfolio', 'PORTFOLIO.EXE — Mahiro Oyama', 'chart', 16, 12, 720, 566, status=portfolio_status, front=True) %}
+  <div class="card-head">
+    <h2>//portfolio performance</h2>
+    <div class="head-meta">
+      <button class="ghost-btn" type="button" id="profitCalendarOpen">
+        <span aria-hidden="true">▦</span> Profit Calendar
       </button>
     </div>
-
-    <div class="chart-wrap">
-      <canvas id="equityChart"></canvas>
-    </div>
-    <div style="text-align:center;color:var(--muted);font-size:.72rem;margin-top:.2rem">
-      hover for price · click a point for detail · scroll to zoom · drag to pan
-    </div>
-
-    {# Round-6: point-detail modal (opened by clicking a chart point) #}
-    <div class="pt-modal-backdrop" id="ptModalBackdrop">
-      <div class="pt-modal" id="ptModal">
-        <button class="pm-close" id="ptModalClose" aria-label="close">&times;</button>
-        <div class="pm-ts" id="pmTs"></div>
-        <div class="pm-eq" id="pmEq"></div>
-        <div id="pmPct"></div>
-        <div class="pm-pos" id="pmPos"></div>
-      </div>
-    </div>
-
-    <div class="pc-backdrop" id="profitCalendarBackdrop" aria-hidden="true">
-      <div class="pc-modal" id="profitCalendarModal" role="dialog" aria-modal="true" aria-labelledby="profitCalendarTitle" tabindex="-1">
-        <button class="pc-close" id="profitCalendarClose" aria-label="close profit calendar">&times;</button>
-        <div class="pc-top">
-          <div class="pc-title">
-            <h3 id="profitCalendarTitle">//profit calendar</h3>
-            <p>Daily paper-bot performance from stored equity snapshots and trade history.</p>
-          </div>
-          <div class="pc-nav" aria-label="calendar month navigation">
-            <button class="ghost-btn" type="button" id="profitCalendarPrev">prev</button>
-            <div class="pc-month" id="profitCalendarMonth">Loading</div>
-            <button class="ghost-btn" type="button" id="profitCalendarNext">next</button>
-          </div>
-        </div>
-        <div class="pc-summary" id="profitCalendarSummary" aria-live="polite"></div>
-        <div class="pc-legend" aria-label="profit calendar legend">
-          <span><span class="pc-dot neutral"></span> no data / flat</span>
-          <span><span class="pc-dot profit"></span> profitable</span>
-          <span><span class="pc-dot loss"></span> losing</span>
-        </div>
-        <div class="pc-error" id="profitCalendarError" hidden></div>
-        <div class="pc-body">
-          <div>
-            <div class="pc-weekdays" aria-hidden="true">
-              <span>Sun</span><span>Mon</span><span>Tue</span><span>Wed</span><span>Thu</span><span>Fri</span><span>Sat</span>
-            </div>
-            <div class="pc-grid" id="profitCalendarGrid"></div>
-          </div>
-          <aside class="pc-detail" id="profitCalendarDetail" aria-live="polite">
-            <h4>Pick a day</h4>
-            <div class="pc-note">No trading data for this day.</div>
-          </aside>
-        </div>
-      </div>
-    </div>
-
-    <div class="total-row">
-      <div class="total-amount" id="totalAmt">${{ '{:,.2f}'.format(total) }}</div>
-      <div class="total-delta {{ 'pos' if pnl >= 0 else 'neg' }}" id="totalDelta">
-        {{ '{:+,.2f}'.format(pnl) }} <span class="pct">{{ '{:+.3f}'.format(pnl_pct) }}% all time</span>
-      </div>
-    </div>
-
-    {% if read_only %}
-    <div class="ro-note">
-      view-only · bot status:
-      {% if bot.stopped %}<span style="color:#ff7b8a">⏸ STOPPED by user</span>
-      {% elif not market_open %}<span style="color:var(--pink)">auto-queued — runs at next market open</span>
-      {% else %}<span style="color:var(--green)">active — checking every 2 min</span>{% endif %}
-      {% if last_decision_ago_min is not none %}
-      <br><span style="color:var(--muted);font-size:.75rem">
-        last decision:
-        {% if last_decision_ago_min == 0 %}<span style="color:#fff">just now</span>
-        {% else %}<span style="color:#fff">{{ last_decision_ago_min }} min ago</span>{% endif %}
-      </span>
-      {% endif %}
-    </div>
-    {% else %}
-    <div class="actions">
-      {% if bot.stopped %}
-        <form method="POST" action="{{ url_for('bot_start') }}" style="display:inline">
-          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-          <button class="btn live" type="submit"><span class="live-dot" style="background:var(--green)"></span>start bot</button>
-        </form>
-        <div style="color:var(--muted);font-size:.78rem;align-self:center">
-          bot is STOPPED — holdings preserved
-        </div>
-      {% else %}
-        <form method="POST" action="{{ url_for('bot_run') }}" id="runForm" style="display:inline">
-          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-          {% if not market_open %}
-          <button class="btn" type="button" id="runBtn" disabled title="Auto-queues for next market open">
-            auto-queued for next open
-          </button>
-          {% else %}
-          <button class="btn live" type="submit" id="runBtn" title="Force immediate decision">
-            <span class="live-dot"></span>force check
-          </button>
-          {% endif %}
-        </form>
-        <form method="POST" action="{{ url_for('bot_stop') }}" style="display:inline" onsubmit="return confirm('Stop the bot? Holdings stay open but no new decisions until restart.')">
-          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-          <button class="btn danger" type="submit">
-            <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="1.5"/></svg>
-            stop bot
-          </button>
-        </form>
-      {% endif %}
-      <form method="POST" action="{{ url_for('bot_reset') }}" style="display:inline" onsubmit="return confirm('Reset bot to ${{ '{:,.0f}'.format(starting) }}?')">
-        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-        <input type="hidden" name="starting" value="{{ starting }}">
-        <button class="btn" type="submit">
-          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 3-6.7"/><path d="M3 4v5h5"/></svg>
-          reset bot
-        </button>
-      </form>
-    </div>
-    {% if not read_only and no_buy.last_bot_error %}
-    <div class="ro-note" style="color:var(--red)">last bot error: {{ no_buy.last_bot_error }}</div>
-    {% endif %}
-    {% endif %}
-  </section>
-
-  <!-- ============== stats ============== -->
-  <section class="card s2">
-    <div class="card-head">
-      <span class="icon-tile">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
-          <rect x="3" y="13" width="4" height="8" rx="1"/>
-          <rect x="10" y="8" width="4" height="13" rx="1"/>
-          <rect x="17" y="3" width="4" height="18" rx="1"/>
-        </svg>
-      </span>
-      <h2>//bot stats &amp; risk</h2>
-    </div>
-
-    <div class="stats">
-      <div class="stat">
-        {# Round-5 extra: Peak is ALL-TIME, server-rendered, never resets #}
-        <div class="label">Peak (all time)</div>
-        <div class="val pos">${{ '{:,.2f}'.format(stats.peak_equity) }}</div>
-        <div class="sub">
-          {% if total >= stats.peak_equity - 0.01 %}at peak now{% else %}{{ '{:+.2f}'.format((stats.peak_equity - total) / total * 100 if total else 0) }}% above current{% endif %}
-        </div>
-      </div>
-      <div class="stat">
-        <div class="label">Win rate · Avg W/L</div>
-        <div class="val">
-          <span style="color:{% if stats.win_rate is none %}var(--muted){% elif stats.win_rate >= 55 %}var(--green){% elif stats.win_rate >= 40 %}var(--pink){% else %}var(--red){% endif %}">{% if stats.win_rate is none %}n/a{% else %}{{ stats.win_rate }}%{% endif %}</span>
-          <span style="color:var(--muted);font-size:.85rem"> · </span>
-          <span style="color:var(--green);font-size:.95rem">+{{ stats.avg_win_pct }}%</span><span style="color:var(--muted)">/</span><span style="color:var(--red);font-size:.95rem">{{ stats.avg_loss_pct }}%</span>
-        </div>
-        <div class="sub">{{ stats.wins }}W / {{ stats.losses }}L · all time</div>
-      </div>
-      <div class="stat">
-        {# Round-4 Bug Fix #4: replaced Drawdown with Today (% change since market open) #}
-        <div class="label">Today</div>
-        <div class="val" style="color:{% if stats.today_pct >= 0 %}var(--green){% else %}var(--red){% endif %}">
-          {{ '{:+.2f}'.format(stats.today_pct) }}%
-        </div>
-        <div class="sub">vs. open ${{ '{:,.0f}'.format(stats.today_open_equity) }} · resets at market open</div>
-      </div>
-      <div class="stat">
-        <div class="label">Total trades</div>
-        <div class="val">{{ stats.trades_total }}</div>
-        <div class="sub">
-          buys + sells, all time
-          {# Round-5: cost drag = flat $0.99/trade, no slippage #}
-          {% if stats.total_costs_usd is defined and stats.total_costs_usd > 0 %}
-          <br><span title="${{ '%.2f'|format(stats.commission_per_trade) }}/trade flat commission">cost drag −${{ '%.2f'|format(stats.total_costs_usd) }}</span>
-          {% endif %}
-        </div>
-      </div>
-    </div>
-
-    {% if stats.sectors %}
-    <div class="sectors">
-      {% for s in stats.sectors %}
-      <span class="chip">
-        {{ s.sector or 'other' }}
-        <span class="pct">{{ s.pct }}%</span>
-        <span class="v">(${{ '{:,.0f}'.format(s.value) }})</span>
-      </span>
-      {% endfor %}
-    </div>
-    {% endif %}
-
-    {# Round-5 #8: per-exit-reason P&L breakdown #}
-    {% if stats.exit_breakdown %}
-    <div style="margin-top:14px">
-      <div style="color:var(--muted);font-size:.72rem;text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px">exit breakdown</div>
-      <table class="t" style="font-size:.8rem">
-        <thead><tr><th>Reason</th><th>Trades</th><th>Win %</th><th>Avg P&amp;L</th></tr></thead>
-        <tbody>
-          {% for e in stats.exit_breakdown %}
-          <tr>
-            <td>{{ e.reason }}</td>
-            <td>{{ e.n }}</td>
-            <td>{{ e.win_rate }}%</td>
-            <td style="color:{{ 'var(--green)' if e.avg_pnl >= 0 else 'var(--red)' }}">{{ '{:+.2f}'.format(e.avg_pnl) }}%</td>
-          </tr>
-          {% endfor %}
-        </tbody>
-      </table>
-    </div>
-    {% endif %}
-  </section>
-
-  <!-- ============== holdings ============== -->
-  <section class="card s3">
-    <div class="card-head">
-      <span class="icon-tile">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
-          <rect x="3" y="6" width="18" height="13" rx="2"/>
-          <path d="M16 12h2"/><path d="M3 10h18"/>
-        </svg>
-      </span>
-      <h2>//individual holdings</h2>
-    </div>
-    <div class="card-sub">
-      Cash on hand: <strong style="color:#fff">${{ '{:,.2f}'.format(bot.cash) }}</strong> · started with ${{ '{:,.0f}'.format(starting) }}
-    </div>
-
-    {% if not positions %}
-    <div class="text-muted" style="font-size:.9rem">No open positions.</div>
-    {% else %}
-    <div class="scroll">
-      <table class="t">
-        <thead>
-          <tr>
-            <th>Symbol</th><th>Price</th><th>Qty</th>
-            <th>Avg Cost</th>             <!-- Round-3 Bug #4: per-share price bought at -->
-            <th>Cost Basis</th>           <!-- Round-3 Bug #4: total bought-for ($) -->
-            <th>Market Value</th>
-            <th style="text-align:right">Profit / Loss</th>
-          </tr>
-        </thead>
-        <tbody>
-          {% for p in positions %}
-          <tr class="anim-row" style="animation-delay:{{ 0.5 + loop.index0 * 0.04 }}s">
-            <td class="sym">{{ p.symbol }}</td>
-            <td>${{ '{:,.2f}'.format(p.price) }}</td>
-            <td>{{ '{:.4f}'.format(p.qty) }}</td>
-            <td>${{ '{:,.2f}'.format(p.avg_cost) }}</td>
-            <td><strong>${{ '{:,.2f}'.format(p.cost_basis) }}</strong></td>
-            <td><strong>${{ '{:,.2f}'.format(p.value) }}</strong></td>
-            <td style="text-align:right" class="{{ 'pos' if p.pnl >= 0 else 'neg' }}">
-              {{ '{:+,.2f}'.format(p.pnl) }} <span style="opacity:.75">({{ '{:+.2f}'.format(p.pnl_pct) }}%)</span>
-            </td>
-          </tr>
-          {% endfor %}
-        </tbody>
-      </table>
-    </div>
-    {% endif %}
-  </section>
-
-  <!-- ====== recent account history — BUY / SELL side-by-side windows ====== -->
-  <div class="grid-2">
-    <!-- BUY window (Round-8: up to 100 buys, newest first) -->
-    <section class="card s4">
-      <div class="card-head">
-        <span class="icon-tile">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M12 19V5"/><path d="m5 12 7-7 7 7"/>
-          </svg>
-        </span>
-        <h2>//buy</h2>
-      </div>
-      <div class="card-sub">Executed buys — click any row to expand the reasoning.</div>
-
-      {% if not buys %}
-      <div class="text-muted" style="font-size:.9rem">No buys yet.</div>
-      {% else %}
-      <div class="scroll" style="max-height:380px">
-        <table class="t">
-          <thead>
-            <tr><th style="width:32px"></th><th>Symbol</th><th>Qty</th><th>Spent</th><th>Timestamp (ET / SGT)</th></tr>
-          </thead>
-          <tbody>
-            {% for tx in buys %}
-            <tr class="clickable trade-row" data-target="buy-{{ loop.index }}">
-              <td><span class="chev">▸</span></td>
-              <td class="sym">{{ tx.ticker }}</td>
-              <td>{{ '{:.4f}'.format(tx.shares) }}</td>
-              <td><span class="text-muted">−${{ '{:,.2f}'.format(tx.total) }}</span></td>
-              <td class="text-muted" style="font-size:.82rem">
-                {% if tx.time_et %}{{ tx.time_et }}<br><span style="opacity:.7">{{ tx.time_sgt }}</span>{% else %}{{ tx.time }}{% endif %}
-              </td>
-            </tr>
-            <tr id="buy-{{ loop.index }}" class="detail">
-              <td colspan="5">
-                <div><strong style="color:#fff">{{ tx.display_signal or tx.signal }}</strong><span class="text-muted"> at {{ tx.confidence }}% confidence</span></div>
-                <div class="note" style="margin-top:6px"><span class="text-muted">Decision reasoning:</span> {{ tx.reason }}</div>
-                <div class="text-muted" style="font-size:.78rem;margin-top:6px">
-                  Executed @ ${{ '{:,.2f}'.format(tx.price) }} · Total spent: ${{ '{:,.2f}'.format(tx.total) }}
-                </div>
-                {% if tx.news_title %}
-                <div class="news">
-                  <span class="text-muted">supporting news:</span>
-                  {% if tx.news_link %}<a href="{{ tx.news_link }}" target="_blank" rel="noopener">{{ tx.news_title }}</a>
-                  {% else %}{{ tx.news_title }}{% endif %}
-                </div>
-                {% endif %}
-              </td>
-            </tr>
-            {% endfor %}
-          </tbody>
-        </table>
-      </div>
-      {% endif %}
-    </section>
-
-    <!-- SELL window (Round-8: up to 100 sells, newest first) -->
-    <section class="card s4">
-      <div class="card-head">
-        <span class="icon-tile">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M12 5v14"/><path d="m5 12 7 7 7-7"/>
-          </svg>
-        </span>
-        <h2>//sell</h2>
-      </div>
-      <div class="card-sub">Closed &amp; trimmed positions — click any row to expand the reasoning.</div>
-
-      {% if not sells %}
-      <div class="text-muted" style="font-size:.9rem">No sells yet.</div>
-      {% else %}
-      <div class="scroll" style="max-height:380px">
-        <table class="t">
-          <thead>
-            <tr><th style="width:32px"></th><th>Symbol</th><th>Qty</th><th>Profit</th><th>Timestamp (ET / SGT)</th></tr>
-          </thead>
-          <tbody>
-            {% for tx in sells %}
-            <tr class="clickable trade-row" data-target="sell-{{ loop.index }}">
-              <td><span class="chev">▸</span></td>
-              <td class="sym">{{ tx.ticker }}</td>
-              <td>{{ '{:.4f}'.format(tx.shares) }}</td>
-              <td>
-                {# Round-5 Bug 3: realized profit (green/red); legacy rows w/o pnl_usd
-                   fall back to cash received #}
-                {% if tx.pnl_usd is not none %}
-                  <span style="color:{{ 'var(--green)' if tx.pnl_usd >= 0 else 'var(--red)' }}">{{ '{:+,.2f}'.format(tx.pnl_usd) }}</span>
-                {% else %}
-                  <span class="sell-c">+${{ '{:,.2f}'.format(tx.total) }}</span>
-                {% endif %}
-              </td>
-              <td class="text-muted" style="font-size:.82rem">
-                {% if tx.time_et %}{{ tx.time_et }}<br><span style="opacity:.7">{{ tx.time_sgt }}</span>{% else %}{{ tx.time }}{% endif %}
-              </td>
-            </tr>
-            <tr id="sell-{{ loop.index }}" class="detail">
-              <td colspan="5">
-                <div><strong style="color:#fff">{{ tx.display_signal or tx.signal }}</strong><span class="text-muted"> at {{ tx.confidence }}% confidence</span></div>
-                <div class="note" style="margin-top:6px"><span class="text-muted">Decision reasoning:</span> {{ tx.reason }}</div>
-                <div class="text-muted" style="font-size:.78rem;margin-top:6px">
-                  Executed @ ${{ '{:,.2f}'.format(tx.price) }} · Total received: ${{ '{:,.2f}'.format(tx.total) }}
-                </div>
-                {% if tx.news_title %}
-                <div class="news">
-                  <span class="text-muted">supporting news:</span>
-                  {% if tx.news_link %}<a href="{{ tx.news_link }}" target="_blank" rel="noopener">{{ tx.news_title }}</a>
-                  {% else %}{{ tx.news_title }}{% endif %}
-                </div>
-                {% endif %}
-              </td>
-            </tr>
-            {% endfor %}
-          </tbody>
-        </table>
-      </div>
-      {% endif %}
-    </section>
   </div>
 
-  <!-- ============== //decisions (HOLD / SKIP only) ======================= -->
-  <section class="card s5">
-    <div class="card-head">
-      <span class="icon-tile">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
-          <path d="M12 2a7 7 0 0 0-4 12.7V17a2 2 0 0 0 2 2h4a2 2 0 0 0 2-2v-2.3A7 7 0 0 0 12 2z"/>
-          <path d="M9 21h6"/>
-        </svg>
-      </span>
-      <h2>//decisions</h2>
+  <div class="range-row">
+    <div class="range-group" id="rangeGroup">
+      <span class="slider" id="rangeSlider"></span>
+      <button class="range-btn active" data-range="1d">1D · 1min</button>
+      <button class="range-btn"        data-range="1w">1W · 30min</button>
+      <button class="range-btn"        data-range="1m">1M · 1day</button>
+      <button class="range-btn"        data-range="all">All Time</button>
     </div>
-    <div class="card-sub">HOLD = bot was idle this tick. SKIP = a buy was prepared but blocked by a filter. Click any row to expand.</div>
+    <button class="ghost-btn" id="resetZoom" title="Reset zoom">⟳ reset zoom</button>
+  </div>
 
-    {% if not decisions %}
-    <div class="text-muted" style="font-size:.9rem">No decisions yet.</div>
-    {% else %}
-    <div class="scroll" style="max-height:380px">
-      <table class="t">
-        <thead>
-          <tr><th style="width:32px"></th><th>Type</th><th>Symbol</th><th>Outcome</th><th>Timestamp (ET / SGT)</th></tr>
-        </thead>
-        <tbody>
-          {% for tx in decisions %}
-          {% set is_hold = tx.action == 'HOLD' %}
-          <tr class="clickable trade-row" data-target="dec-{{ loop.index }}">
-            <td><span class="chev">▸</span></td>
-            <td class="hold-c">{{ tx.action }}</td>
-            <td class="sym">{% if is_hold %}—{% else %}{{ tx.ticker }}{% endif %}</td>
-            <td><span class="text-muted">{% if is_hold %}no trade{% else %}no buy{% endif %}</span></td>
-            <td class="text-muted" style="font-size:.82rem">
-              {% if tx.time_et %}{{ tx.time_et }}<br><span style="opacity:.7">{{ tx.time_sgt }}</span>{% else %}{{ tx.time }}{% endif %}
-            </td>
-          </tr>
-          <tr id="dec-{{ loop.index }}" class="detail">
-            <td colspan="5">
-              <div><strong style="color:#fff">{{ tx.display_signal or tx.signal }}</strong>{% if not is_hold %}<span class="text-muted"> at {{ tx.confidence }}% confidence</span>{% endif %}</div>
-              <div class="note" style="margin-top:6px"><span class="text-muted">Decision reasoning:</span> {{ tx.reason }}</div>
-              {% if is_hold and tx.signals %}
-              <div class="text-muted" style="font-size:.78rem;margin-top:6px">Signals across watchlist: {{ tx.signals }}</div>
-              {% elif not is_hold %}
-              <div class="text-muted" style="font-size:.78rem;margin-top:6px">Buy attempt blocked — position not opened</div>
-              {% if tx.rank_reason_code is defined or tx.gross_edge_pct is defined or tx.friction_pct is defined %}
-              <div class="text-muted" style="font-size:.78rem;margin-top:6px">
-                {% if tx.rank_reason_code is defined and tx.rank_reason_code %}Code: {{ tx.rank_reason_code }}{% endif %}
-                {% if tx.gross_edge_pct is defined and tx.gross_edge_pct is not none %}
-                  <br>EV: gross {{ '%.2f'|format(tx.gross_edge_pct) }}%
-                  {% if tx.required_edge_pct is defined and tx.required_edge_pct is not none %} | required {{ '%.2f'|format(tx.required_edge_pct) }}%{% endif %}
-                  {% if tx.net_edge_pct is defined and tx.net_edge_pct is not none %} | net {{ '%.2f'|format(tx.net_edge_pct) }}%{% endif %}
-                {% endif %}
-                {% if tx.friction_pct is defined and tx.friction_pct is not none %}
-                  <br>Friction: {{ '%.2f'|format(tx.friction_pct) }}%
-                {% endif %}
-                {% if tx.target_notional is defined and tx.target_notional is not none %}
-                  <br>Target notional: ${{ '%.0f'|format(tx.target_notional) }}
-                {% endif %}
-              </div>
-              {% endif %}
-              {% endif %}
-            </td>
-          </tr>
-          {% endfor %}
-        </tbody>
-      </table>
+  <div class="chart-wrap">
+    <canvas id="equityChart"></canvas>
+  </div>
+  <div class="chart-hint">
+    hover for price · click a point for detail · scroll to zoom · drag to pan
+  </div>
+
+  {# point-detail modal (opened by clicking a chart point) #}
+  <div class="pt-modal-backdrop" id="ptModalBackdrop">
+    <div class="pt-modal" id="ptModal">
+      <button class="pm-close" id="ptModalClose" aria-label="close">&times;</button>
+      <div class="pm-ts" id="pmTs"></div>
+      <div class="pm-eq" id="pmEq"></div>
+      <div id="pmPct"></div>
+      <div class="pm-pos" id="pmPos"></div>
     </div>
+  </div>
+
+  <div class="pc-backdrop" id="profitCalendarBackdrop" aria-hidden="true">
+    <div class="pc-modal" id="profitCalendarModal" role="dialog" aria-modal="true" aria-labelledby="profitCalendarTitle" tabindex="-1">
+      <button class="pc-close" id="profitCalendarClose" aria-label="close profit calendar">&times;</button>
+      <div class="pc-top">
+        <div class="pc-title">
+          <h3 id="profitCalendarTitle">//profit calendar</h3>
+          <p>Daily paper-bot performance from stored equity snapshots and trade history.</p>
+        </div>
+        <div class="pc-nav" aria-label="calendar month navigation">
+          <button class="ghost-btn" type="button" id="profitCalendarPrev">prev</button>
+          <div class="pc-month" id="profitCalendarMonth">Loading</div>
+          <button class="ghost-btn" type="button" id="profitCalendarNext">next</button>
+        </div>
+      </div>
+      <div class="pc-summary" id="profitCalendarSummary" aria-live="polite"></div>
+      <div class="pc-legend" aria-label="profit calendar legend">
+        <span><span class="pc-dot neutral"></span> no data / flat</span>
+        <span><span class="pc-dot profit"></span> profitable</span>
+        <span><span class="pc-dot loss"></span> losing</span>
+      </div>
+      <div class="pc-error" id="profitCalendarError" hidden></div>
+      <div class="pc-body">
+        <div>
+          <div class="pc-weekdays" aria-hidden="true">
+            <span>Sun</span><span>Mon</span><span>Tue</span><span>Wed</span><span>Thu</span><span>Fri</span><span>Sat</span>
+          </div>
+          <div class="pc-grid" id="profitCalendarGrid"></div>
+        </div>
+        <aside class="pc-detail" id="profitCalendarDetail" aria-live="polite">
+          <h4>Pick a day</h4>
+          <div class="pc-note">No trading data for this day.</div>
+        </aside>
+      </div>
+    </div>
+  </div>
+
+  <div class="total-row">
+    <div class="total-amount" id="totalAmt">${{ '{:,.2f}'.format(total) }}</div>
+    <div class="total-delta {{ 'pos' if pnl >= 0 else 'neg' }}" id="totalDelta">
+      {{ '{:+,.2f}'.format(pnl) }} <span class="pct">{{ '{:+.3f}'.format(pnl_pct) }}% all time</span>
+    </div>
+  </div>
+
+  {% if read_only %}
+  <div class="ro-note">
+    view-only · bot status:
+    {% if bot.stopped %}<span style="color:var(--red)">⏸ STOPPED by user</span>
+    {% elif not market_open %}<span style="color:var(--yellow)">auto-queued — runs at next market open</span>
+    {% else %}<span style="color:var(--green)">active — checking every 2 min</span>{% endif %}
+    {% if last_decision_ago_min is not none %}
+    <br><span class="text-muted" style="font-size:10px">
+      last decision:
+      {% if last_decision_ago_min == 0 %}<span class="w">just now</span>
+      {% else %}<span class="w">{{ last_decision_ago_min }} min ago</span>{% endif %}
+    </span>
     {% endif %}
-  </section>
+  </div>
+  {% else %}
+  <div class="actions">
+    {% if bot.stopped %}
+      <form method="POST" action="{{ url_for('bot_start') }}" style="display:inline">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <button class="btn live" type="submit"><span class="live-dot"></span>start bot</button>
+      </form>
+      <div class="text-muted" style="align-self:center">bot is STOPPED — holdings preserved</div>
+    {% else %}
+      <form method="POST" action="{{ url_for('bot_run') }}" id="runForm" style="display:inline">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        {% if not market_open %}
+        <button class="btn" type="button" id="runBtn" disabled title="Auto-queues for next market open">
+          auto-queued for next open
+        </button>
+        {% else %}
+        <button class="btn live" type="submit" id="runBtn" title="Force immediate decision">
+          <span class="live-dot"></span>force check
+        </button>
+        {% endif %}
+      </form>
+      <form method="POST" action="{{ url_for('bot_stop') }}" style="display:inline" data-confirm="Stop the bot? Holdings stay open but no new decisions until restart.">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <button class="btn danger" type="submit">■ stop bot</button>
+      </form>
+    {% endif %}
+    <form method="POST" action="{{ url_for('bot_reset') }}" style="display:inline" data-confirm="Reset bot to ${{ '{:,.0f}'.format(starting) }}?">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <input type="hidden" name="starting" value="{{ starting }}">
+      <button class="btn" type="submit">⟳ reset bot</button>
+    </form>
+  </div>
+  {% if not read_only and no_buy.last_bot_error %}
+  <div class="ro-note" style="color:var(--red)">last bot error: {{ no_buy.last_bot_error }}</div>
+  {% endif %}
+  {% endif %}
+{% endcall %}
 
-</div>
-</div>
+{# ============== stats & risk ============== #}
+{% call win98('stats', 'STATS.EXE — risk', 'stats', 748, 12, 490, 372) %}
+  <div class="card-head"><h2>//bot stats &amp; risk</h2></div>
+
+  <div class="stats">
+    <div class="stat">
+      <div class="label">Peak (all time)</div>
+      <div class="val pos">${{ '{:,.2f}'.format(stats.peak_equity) }}</div>
+      <div class="sub">
+        {% if total >= stats.peak_equity - 0.01 %}at peak now{% else %}{{ '{:+.2f}'.format((stats.peak_equity - total) / total * 100 if total else 0) }}% above current{% endif %}
+      </div>
+    </div>
+    <div class="stat">
+      <div class="label">Win rate · Avg W/L</div>
+      <div class="val">
+        <span style="color:{% if stats.win_rate is none %}var(--muted){% elif stats.win_rate >= 55 %}var(--green){% elif stats.win_rate >= 40 %}var(--pink){% else %}var(--red){% endif %}">{% if stats.win_rate is none %}n/a{% else %}{{ stats.win_rate }}%{% endif %}</span>
+        <span class="text-muted" style="font-size:12px"> · </span>
+        <span style="color:var(--green);font-size:13px">+{{ stats.avg_win_pct }}%</span><span class="text-muted">/</span><span style="color:var(--red);font-size:13px">{{ stats.avg_loss_pct }}%</span>
+      </div>
+      <div class="sub">{{ stats.wins }}W / {{ stats.losses }}L · all time</div>
+    </div>
+    <div class="stat">
+      <div class="label">Today</div>
+      <div class="val" style="color:{% if stats.today_pct >= 0 %}var(--green){% else %}var(--red){% endif %}">
+        {{ '{:+.2f}'.format(stats.today_pct) }}%
+      </div>
+      <div class="sub">vs. open ${{ '{:,.0f}'.format(stats.today_open_equity) }} · resets at market open</div>
+    </div>
+    <div class="stat">
+      <div class="label">Total trades</div>
+      <div class="val">{{ stats.trades_total }}</div>
+      <div class="sub">
+        buys + sells, all time
+        {% if stats.total_costs_usd is defined and stats.total_costs_usd > 0 %}
+        <br><span title="${{ '%.2f'|format(stats.commission_per_trade) }}/trade flat commission">cost drag −${{ '%.2f'|format(stats.total_costs_usd) }}</span>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+
+  {% if stats.sectors %}
+  <div class="sectors">
+    {% for s in stats.sectors %}
+    <span class="chip">
+      {{ s.sector or 'other' }}
+      <span class="pct">{{ s.pct }}%</span>
+      <span class="v">(${{ '{:,.0f}'.format(s.value) }})</span>
+    </span>
+    {% endfor %}
+  </div>
+  {% endif %}
+
+  {% if stats.exit_breakdown %}
+  <div style="margin-top:14px">
+    <div class="text-muted" style="font-size:10px;text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px">exit breakdown</div>
+    <table class="t" style="font-size:11px">
+      <thead><tr><th>Reason</th><th>Trades</th><th>Win %</th><th>Avg P&amp;L</th></tr></thead>
+      <tbody>
+        {% for e in stats.exit_breakdown %}
+        <tr>
+          <td>{{ e.reason }}</td>
+          <td>{{ e.n }}</td>
+          <td>{{ e.win_rate }}%</td>
+          <td style="color:{{ 'var(--green)' if e.avg_pnl >= 0 else 'var(--red)' }}">{{ '{:+.2f}'.format(e.avg_pnl) }}%</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endif %}
+{% endcall %}
+
+{# ============== holdings ============== #}
+{% set holdings_status %}
+  <span class="seg">Cash: <strong>${{ '{:,.2f}'.format(bot.cash) }}</strong></span>
+  <span class="seg">started with ${{ '{:,.0f}'.format(starting) }}</span>
+{% endset %}
+{% call win98('holdings', 'HOLDINGS.EXE', 'money', 748, 396, 490, 300, status=holdings_status) %}
+  <div class="card-head"><h2>//individual holdings</h2></div>
+  {% if not positions %}
+  <div class="text-muted">No open positions.</div>
+  {% else %}
+  <div class="scroll">
+    <table class="t">
+      <thead>
+        <tr>
+          <th>Symbol</th><th>Price</th><th>Qty</th>
+          <th>Avg Cost</th><th>Cost Basis</th><th>Market Value</th>
+          <th style="text-align:right">Profit / Loss</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for p in positions %}
+        <tr class="anim-row">
+          <td class="sym">{{ p.symbol }}</td>
+          <td>${{ '{:,.2f}'.format(p.price) }}</td>
+          <td>{{ '{:.4f}'.format(p.qty) }}</td>
+          <td>${{ '{:,.2f}'.format(p.avg_cost) }}</td>
+          <td><strong>${{ '{:,.2f}'.format(p.cost_basis) }}</strong></td>
+          <td><strong>${{ '{:,.2f}'.format(p.value) }}</strong></td>
+          <td style="text-align:right" class="{{ 'pos' if p.pnl >= 0 else 'neg' }}">
+            {{ '{:+,.2f}'.format(p.pnl) }} <span style="opacity:.75">({{ '{:+.2f}'.format(p.pnl_pct) }}%)</span>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endif %}
+{% endcall %}
+
+{# ============== buy log ============== #}
+{% call win98('buys', 'BUY.LOG', 'buy', 40, 120, 560, 392) %}
+  <div class="card-head"><h2>//buy</h2></div>
+  <div class="card-sub">Executed buys — click any row to expand the reasoning.</div>
+  {% if not buys %}
+  <div class="text-muted">No buys yet.</div>
+  {% else %}
+  <div class="scroll" style="max-height:380px">
+    <table class="t">
+      <thead>
+        <tr><th style="width:28px"></th><th>Symbol</th><th>Qty</th><th>Spent</th><th>Time (ET / SGT)</th></tr>
+      </thead>
+      <tbody>
+        {% for tx in buys %}
+        <tr class="clickable trade-row" data-target="buy-{{ loop.index }}">
+          <td><span class="chev">▸</span></td>
+          <td class="sym">{{ tx.ticker }}</td>
+          <td>{{ '{:.4f}'.format(tx.shares) }}</td>
+          <td><span class="text-muted">−${{ '{:,.2f}'.format(tx.total) }}</span></td>
+          <td class="text-muted" style="font-size:11px">
+            {% if tx.time_et %}{{ tx.time_et }}<br><span style="opacity:.7">{{ tx.time_sgt }}</span>{% else %}{{ tx.time }}{% endif %}
+          </td>
+        </tr>
+        <tr id="buy-{{ loop.index }}" class="detail">
+          <td colspan="5">
+            <div><strong>{{ tx.display_signal or tx.signal }}</strong><span class="note"> at {{ tx.confidence }}% confidence</span></div>
+            <div class="note" style="margin-top:6px"><span class="note">Decision reasoning:</span> {{ tx.reason }}</div>
+            <div class="note" style="font-size:11px;margin-top:6px">
+              Executed @ ${{ '{:,.2f}'.format(tx.price) }} · Total spent: ${{ '{:,.2f}'.format(tx.total) }}
+            </div>
+            {% if tx.news_title %}
+            <div class="news">
+              <span class="note">supporting news:</span>
+              {% if tx.news_link %}<a href="{{ tx.news_link }}" target="_blank" rel="noopener">{{ tx.news_title }}</a>
+              {% else %}{{ tx.news_title }}{% endif %}
+            </div>
+            {% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endif %}
+{% endcall %}
+
+{# ============== sell log ============== #}
+{% call win98('sells', 'SELL.LOG', 'sell', 636, 160, 560, 392) %}
+  <div class="card-head"><h2>//sell</h2></div>
+  <div class="card-sub">Closed &amp; trimmed positions — click any row to expand the reasoning.</div>
+  {% if not sells %}
+  <div class="text-muted">No sells yet.</div>
+  {% else %}
+  <div class="scroll" style="max-height:380px">
+    <table class="t">
+      <thead>
+        <tr><th style="width:28px"></th><th>Symbol</th><th>Qty</th><th>Profit</th><th>Time (ET / SGT)</th></tr>
+      </thead>
+      <tbody>
+        {% for tx in sells %}
+        <tr class="clickable trade-row" data-target="sell-{{ loop.index }}">
+          <td><span class="chev">▸</span></td>
+          <td class="sym">{{ tx.ticker }}</td>
+          <td>{{ '{:.4f}'.format(tx.shares) }}</td>
+          <td>
+            {% if tx.pnl_usd is not none %}
+              <span style="color:{{ 'var(--green)' if tx.pnl_usd >= 0 else 'var(--red)' }}">{{ '{:+,.2f}'.format(tx.pnl_usd) }}</span>
+            {% else %}
+              <span class="sell-c">+${{ '{:,.2f}'.format(tx.total) }}</span>
+            {% endif %}
+          </td>
+          <td class="text-muted" style="font-size:11px">
+            {% if tx.time_et %}{{ tx.time_et }}<br><span style="opacity:.7">{{ tx.time_sgt }}</span>{% else %}{{ tx.time }}{% endif %}
+          </td>
+        </tr>
+        <tr id="sell-{{ loop.index }}" class="detail">
+          <td colspan="5">
+            <div><strong>{{ tx.display_signal or tx.signal }}</strong><span class="note"> at {{ tx.confidence }}% confidence</span></div>
+            <div class="note" style="margin-top:6px"><span class="note">Decision reasoning:</span> {{ tx.reason }}</div>
+            <div class="note" style="font-size:11px;margin-top:6px">
+              Executed @ ${{ '{:,.2f}'.format(tx.price) }} · Total received: ${{ '{:,.2f}'.format(tx.total) }}
+            </div>
+            {% if tx.news_title %}
+            <div class="news">
+              <span class="note">supporting news:</span>
+              {% if tx.news_link %}<a href="{{ tx.news_link }}" target="_blank" rel="noopener">{{ tx.news_title }}</a>
+              {% else %}{{ tx.news_title }}{% endif %}
+            </div>
+            {% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endif %}
+{% endcall %}
+
+{# ============== decisions (HOLD / SKIP) ============== #}
+{% call win98('decisions', 'DECISIONS.LOG', 'decisions', 120, 220, 680, 392) %}
+  <div class="card-head"><h2>//decisions</h2></div>
+  <div class="card-sub">HOLD = bot was idle this tick. SKIP = a buy was prepared but blocked by a filter. Click any row to expand.</div>
+  {% if not decisions %}
+  <div class="text-muted">No decisions yet.</div>
+  {% else %}
+  <div class="scroll" style="max-height:380px">
+    <table class="t">
+      <thead>
+        <tr><th style="width:28px"></th><th>Type</th><th>Symbol</th><th>Outcome</th><th>Time (ET / SGT)</th></tr>
+      </thead>
+      <tbody>
+        {% for tx in decisions %}
+        {% set is_hold = tx.action == 'HOLD' %}
+        <tr class="clickable trade-row" data-target="dec-{{ loop.index }}">
+          <td><span class="chev">▸</span></td>
+          <td class="hold-c">{{ tx.action }}</td>
+          <td class="sym">{% if is_hold %}—{% else %}{{ tx.ticker }}{% endif %}</td>
+          <td><span class="text-muted">{% if is_hold %}no trade{% else %}no buy{% endif %}</span></td>
+          <td class="text-muted" style="font-size:11px">
+            {% if tx.time_et %}{{ tx.time_et }}<br><span style="opacity:.7">{{ tx.time_sgt }}</span>{% else %}{{ tx.time }}{% endif %}
+          </td>
+        </tr>
+        <tr id="dec-{{ loop.index }}" class="detail">
+          <td colspan="5">
+            <div><strong>{{ tx.display_signal or tx.signal }}</strong>{% if not is_hold %}<span class="note"> at {{ tx.confidence }}% confidence</span>{% endif %}</div>
+            <div class="note" style="margin-top:6px"><span class="note">Decision reasoning:</span> {{ tx.reason }}</div>
+            {% if is_hold and tx.signals %}
+            <div class="note" style="font-size:11px;margin-top:6px">Signals across watchlist: {{ tx.signals }}</div>
+            {% elif not is_hold %}
+            <div class="note" style="font-size:11px;margin-top:6px">Buy attempt blocked — position not opened</div>
+            {% if tx.rank_reason_code is defined or tx.gross_edge_pct is defined or tx.friction_pct is defined %}
+            <div class="note" style="font-size:11px;margin-top:6px">
+              {% if tx.rank_reason_code is defined and tx.rank_reason_code %}Code: {{ tx.rank_reason_code }}{% endif %}
+              {% if tx.gross_edge_pct is defined and tx.gross_edge_pct is not none %}
+                <br>EV: gross {{ '%.2f'|format(tx.gross_edge_pct) }}%
+                {% if tx.required_edge_pct is defined and tx.required_edge_pct is not none %} | required {{ '%.2f'|format(tx.required_edge_pct) }}%{% endif %}
+                {% if tx.net_edge_pct is defined and tx.net_edge_pct is not none %} | net {{ '%.2f'|format(tx.net_edge_pct) }}%{% endif %}
+              {% endif %}
+              {% if tx.friction_pct is defined and tx.friction_pct is not none %}
+                <br>Friction: {{ '%.2f'|format(tx.friction_pct) }}%
+              {% endif %}
+              {% if tx.target_notional is defined and tx.target_notional is not none %}
+                <br>Target notional: ${{ '%.0f'|format(tx.target_notional) }}
+              {% endif %}
+            </div>
+            {% endif %}
+            {% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endif %}
+{% endcall %}
+
 {% endblock %}
 
 {% block scripts %}
@@ -673,8 +492,8 @@ async function loadEquity(range) {
 
     if (pts.length < 2) {
       ctx.clearRect(0, 0, canvas.width, canvas.height);
-      ctx.fillStyle = '#a8a8a8';
-      ctx.font = "14px 'JetBrains Mono', monospace";
+      ctx.fillStyle = '#39ff6e';
+      ctx.font = "14px monospace";
       ctx.textAlign = 'center';
       ctx.fillText('Collecting performance data for this range…', canvas.clientWidth / 2, 80);
       ctx.fillText('(chart appears after a few snapshots)', canvas.clientWidth / 2, 100);
@@ -683,6 +502,9 @@ async function loadEquity(range) {
 
     const labels = pts.map(p => fmtTime(p[0], currentRange));
     const values = pts.map(p => p[1]);
+    // phosphor terminal: green line when at/above starting equity, amber when below
+    const up = values[values.length - 1] >= STARTING;
+    const lineColor = up ? '#39ff6e' : '#ffb347';
 
     equityChart = new Chart(ctx, {
       type: 'line',
@@ -690,16 +512,16 @@ async function loadEquity(range) {
         labels,
         datasets: [{
           data: values,
-          borderColor: '#f6a8c8',
+          borderColor: lineColor,
           borderWidth: 2.2,
           pointRadius: 0,
           pointHoverRadius: 5,
-          pointHoverBackgroundColor: '#f6a8c8',
+          pointHoverBackgroundColor: lineColor,
           tension: 0.25,
           fill: {
             target: { value: STARTING },
-            above: 'rgba(91, 217, 122, 0.22)',
-            below: 'rgba(255, 93, 122, 0.22)',
+            above: 'rgba(57, 255, 110, 0.18)',
+            below: 'rgba(255, 179, 71, 0.16)',
           },
         }]
       },
@@ -751,10 +573,11 @@ async function loadEquity(range) {
           tooltip: {
             // Round-6: hover shows ONLY price. Full detail is on click (modal).
             enabled: true,
-            backgroundColor: 'rgba(15,15,15,.96)',
-            borderColor: '#f6a8c8', borderWidth: 1,
-            titleColor: '#f6a8c8', bodyColor: '#fff',
+            backgroundColor: 'rgba(8,18,9,.96)',
+            borderColor: lineColor, borderWidth: 1,
+            titleColor: '#39ff6e', bodyColor: '#eaffea',
             padding: 8, displayColors: false,
+            titleFont: { family: 'monospace' }, bodyFont: { family: 'monospace' },
             callbacks: {
               title: (items) => (items && items.length ? labels[items[0].dataIndex] : ''),
               label: (c) => '$' + c.parsed.y.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }),
@@ -768,12 +591,12 @@ async function loadEquity(range) {
         },
         scales: {
           x: {
-            ticks: { color: '#a8a8a8', font: { family: "'JetBrains Mono', monospace", size: 10 }, maxRotation: 0, autoSkip: true, maxTicksLimit: 8 },
-            grid: { color: 'rgba(255,255,255,.04)' },
+            ticks: { color: '#4fe07a', font: { family: 'monospace', size: 10 }, maxRotation: 0, autoSkip: true, maxTicksLimit: 8 },
+            grid: { color: 'rgba(57,255,110,.08)' },
           },
           y: {
-            ticks: { color: '#a8a8a8', font: { family: "'JetBrains Mono', monospace" } },
-            grid: { color: 'rgba(255,255,255,.04)' },
+            ticks: { color: '#4fe07a', font: { family: 'monospace' } },
+            grid: { color: 'rgba(57,255,110,.08)' },
           },
         },
         interaction: { mode: 'index', intersect: false },

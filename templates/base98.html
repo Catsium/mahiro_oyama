@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Catsium is a paper-trading stock dashboard with watchlist signals, scans, and bot portfolio tracking.">
+  <meta property="og:title" content="Catsium paper-trading dashboard">
+  <meta property="og:description" content="Watchlist signals, scans, and paper bot portfolio tracking. Not financial advice.">
+  <meta property="og:type" content="website">
+  <meta name="twitter:card" content="summary">
+  <title>{% block title %}//catsium 98{% endblock %}</title>
+  <link rel="icon" href="{{ url_for('static', filename='catsium.png') }}">
+  <link rel="apple-touch-icon" href="{{ url_for('static', filename='catsium.png') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='win98.css') }}">
+  {% block head_extra %}{% endblock %}
+</head>
+
+{% from '_w98.html' import w98icon, win98 %}
+
+<body data-market="{{ 'open' if (market_open if market_open is defined else false) else 'closed' }}" {% block body_data %}{% endblock %}>
+
+<div class="desktop" id="desktop">
+{% block content %}{% endblock %}
+
+{% call win98('display', 'DISPLAY PROPERTIES', 'display', 420, 180, 380, closed=True) %}
+  <div class="disp-row">
+    <label><input type="checkbox" class="w98-check" id="crtChk"> CRT scanline effect</label>
+  </div>
+  <div class="disp-row">
+    <label><input type="checkbox" class="w98-check" id="sndChk"> 8-bit UI sounds</label>
+  </div>
+  <div class="disp-row text-muted" style="font-size:11px">
+    Window layout, effects &amp; sound persist in this browser.
+    Use Start &gt; Reset Window Layout to restore defaults.
+  </div>
+{% endcall %}
+
+<div id="deskIcons"></div>
+</div>
+
+{# ---- flash messages as Win98 message boxes ---- #}
+{% with messages = get_flashed_messages(with_categories=true) %}
+<div class="dlg-layer {% if not messages %}empty{% endif %}" id="dlgLayer">
+  {% if messages %}
+  {% for cat, msg in messages %}
+  <div class="w98-dialog" role="alertdialog" aria-label="System message">
+    <div class="titlebar">
+      <span class="t-text">SYSTEM MESSAGE</span>
+      <span class="t-controls"><button type="button" data-dlg-close aria-label="dismiss">×</button></span>
+    </div>
+    <div class="dlg-body">
+      <span class="dlg-ico">{{ w98icon('error' if cat == 'danger' else ('warn' if cat == 'warning' else ('info' if cat == 'info' else 'money'))) }}</span>
+      <span>{{ msg }}</span>
+    </div>
+    <div class="dlg-btns"><button type="button" class="btn" data-dlg-close>OK</button></div>
+  </div>
+  {% endfor %}
+  {% endif %}
+</div>
+{% endwith %}
+
+<div class="trust-note" role="note">
+  Paper-trading research dashboard. Not financial advice. Data may be delayed or stale.
+</div>
+
+{# ---- taskbar ---- #}
+<div class="taskbar">
+  <button type="button" class="start-btn" id="startBtn" aria-haspopup="menu" aria-expanded="false">
+    <img src="{{ url_for('static', filename='catsium.png') }}" alt="">Start
+  </button>
+  <span class="tb-divider" aria-hidden="true"></span>
+  <div id="tbWindows"></div>
+  <div class="tray">
+    <button type="button" id="sndToggle" title="Toggle UI sounds" aria-label="Toggle UI sounds">🔇</button>
+    {% set _mo = market_open if market_open is defined else false %}
+    <span class="market-pill {% if _mo %}open{% endif %}">
+      <span class="dot"></span>{% if _mo %}MKT OPEN{% else %}MKT CLOSED{% endif %}
+    </span>
+    <span id="tbClock" aria-live="off"></span>
+  </div>
+</div>
+
+{# ---- start menu ---- #}
+<div class="start-menu" id="startMenu" role="menu">
+  <div class="sm-banner">CATSIUM<span style="color:#ffd257">98</span></div>
+  <div class="sm-items">
+    <a role="menuitem" href="{{ url_for('index') }}"><span class="sm-ico">{{ w98icon('watchlist') }}</span>Market Dashboard</a>
+    <a role="menuitem" href="{{ url_for('bot_view') }}"><span class="sm-ico">{{ w98icon('chart') }}</span>Bot Portfolio</a>
+    <a role="menuitem" href="{{ url_for('top_picks') }}"><span class="sm-ico">{{ w98icon('scanner') }}</span>Top Picks</a>
+    <a role="menuitem" href="{{ url_for('simulator') }}"><span class="sm-ico">{{ w98icon('money') }}</span>Paper Simulator</a>
+    <div class="sm-div" aria-hidden="true"></div>
+    <button type="button" role="menuitem" class="sm-item" data-menu="display"><span class="sm-ico">{{ w98icon('display') }}</span>Display Properties</button>
+    <button type="button" role="menuitem" class="sm-item" data-menu="reset-layout"><span class="sm-ico">{{ w98icon('compare') }}</span>Reset Window Layout</button>
+  </div>
+</div>
+
+<script src="{{ url_for('static', filename='win98.js') }}"></script>
+<script src="{{ url_for('static', filename='mascot.js') }}"></script>
+{% block scripts %}{% endblock %}
+</body>
+</html>
