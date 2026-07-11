@@ -11,7 +11,6 @@ import urllib.request
 import pandas as pd
 
 from market import fh
-from market import provider_support
 from market.data_manager import get_daily as _managed_daily
 from trading.config import DEFAULT_CONFIG
 from utils.cache import (
@@ -25,6 +24,13 @@ from utils.time_utils import completed_trading_days_since, is_market_open
 FMP_DAILY_GLOBAL_ENDPOINT = "fmp_daily:global"
 FMP_DAILY_RATE_LIMIT_COOLDOWN_SEC = int(
     DEFAULT_CONFIG.get("history", {}).get("fmp_daily_global_429_cooldown_sec", 30 * 60)
+)
+# Google Finance quote scraper — user-selected FIRST-choice quote provider.
+# One 429/captcha means Google is throttling the shared PA proxy IP, so a
+# single global circuit demotes it for all symbols; Finnhub takes over.
+GOOGLE_QUOTE_GLOBAL_ENDPOINT = "google_quote:global"
+GOOGLE_QUOTE_GLOBAL_COOLDOWN_SEC = int(
+    DEFAULT_CONFIG.get("market_data_modes", {}).get("google_quote_global_cooldown_sec", 30 * 60)
 )
 # Entry 027 — endpoint-global Finnhub daily circuit. A single 401/403 on the
 # candle endpoint means the key has no candle access for ANY symbol, so we open
@@ -773,7 +779,6 @@ def _fmp_daily(tk, full=False, use_cache=True):
             cache_set(cache_key, df)
         record_api_success(endpoint)
         record_api_success(FMP_DAILY_GLOBAL_ENDPOINT)
-        provider_support.mark_supported(tk)
         return df
     except Exception as e:
         try:
@@ -785,10 +790,6 @@ def _fmp_daily(tk, full=False, use_cache=True):
             status_code = getattr(e, "code", None) or getattr(e, "status", None)
         except Exception:
             status_code = None
-        if str(status_code) == "402":
-            # Audit P0-5: FMP free tier permanently rejects this symbol — the
-            # registry lets the PA rotation stop burning slots on it (weekly re-probe).
-            provider_support.mark_unsupported(tk, "402")
         if str(status_code) == "429":
             cooldown_sec = _retry_after_cooldown_sec(e)
         elif str(status_code) and str(status_code) != "None":
@@ -1002,20 +1003,80 @@ def _append_live_bar(df, tk):
     return df
 
 
+def google_quote_global_circuit_state():
+    """Endpoint-global Google quote circuit (429/captcha on the PA proxy IP)."""
+    state = api_cooldown_state(
+        GOOGLE_QUOTE_GLOBAL_ENDPOINT,
+        GOOGLE_QUOTE_GLOBAL_COOLDOWN_SEC,
+        active_statuses={"rate_limited", "blocked_or_forbidden"},
+    )
+    active = bool(state.get("active"))
+    return {
+        "status": "rate_limited" if active else "ok",
+        "active": active,
+        "cooldown_remaining_sec": int(state.get("cooldown_remaining_sec") or 0),
+        "last_error": state.get("last_error"),
+    }
+
+
+def _google_quote_attempt(tk, attempts):
+    """First-choice Google quote. Returns a quote dict or None (fall through)."""
+    from market.google_quotes import GoogleQuoteBlocked, google_quote
+    if not DEFAULT_CONFIG.get("market_data_modes", {}).get("google_quote_enabled", True):
+        return None
+    endpoint = f"google_quote:{tk}"
+    if google_quote_global_circuit_state()["active"]:
+        attempts.append({"provider": "google", "kind": "quote",
+                         "status": "skipped_by_global_circuit"})
+        return None
+    if should_skip_api(endpoint, cooldown_sec=120):
+        attempts.append({"provider": "google", "kind": "quote",
+                         "status": "circuit_skipped"})
+        return None
+    try:
+        q = google_quote(tk)
+    except GoogleQuoteBlocked as e:
+        record_api_failure(
+            GOOGLE_QUOTE_GLOBAL_ENDPOINT, e, status="rate_limited",
+            cooldown_sec=GOOGLE_QUOTE_GLOBAL_COOLDOWN_SEC,
+        )
+        attempts.append({"provider": "google", "kind": "quote",
+                         "status": "blocked_global_circuit_opened"})
+        return None
+    except Exception as e:
+        record_api_failure(endpoint, e)
+        attempts.append({"provider": "google", "kind": "quote",
+                         "status": "error", "error_type": type(e).__name__})
+        return None
+    if not q or (q.get("price") or 0) <= 0:
+        attempts.append({"provider": "google", "kind": "quote",
+                         "status": "empty"})
+        return None
+    record_api_success(endpoint)
+    attempts.append({"provider": "google", "kind": "quote", "status": "ok"})
+    q["provider_attempts"] = attempts
+    q["provider_used"] = q.get("source")
+    return q
+
+
 def _fetch_quote_once(tk):
-    """Single quote attempt: Finnhub primary, yfinance fallback off-PA."""
+    """Single quote attempt: Google first (user choice), then Finnhub,
+    yfinance fallback off-PA."""
+    attempts = []
+    g = _google_quote_attempt(tk, attempts)
+    if g is not None:
+        return g
     endpoint = f"quote:{tk}"
     if should_skip_api(endpoint, cooldown_sec=120):
         return {"price": 0, "change": 0, "pct": 0, "high": 0, "low": 0,
                 "open": 0, "prev": 0, "source": "finnhub_quote",
-                "provider_attempts": [{
+                "provider_attempts": attempts + [{
                     "provider": "finnhub",
                     "kind": "quote",
                     "status": "circuit_skipped",
                 }],
                 "provider_error_type": "circuit_skipped"}
     try:
-        attempts = []
         q = fh.quote(tk)
         r = {"price": q.get("c", 0), "change": q.get("d", 0), "pct": q.get("dp", 0),
              "high": q.get("h", 0), "low": q.get("l", 0), "open": q.get("o", 0),
@@ -1056,7 +1117,7 @@ def _fetch_quote_once(tk):
         record_api_failure(endpoint, e)
         return {"price": 0, "change": 0, "pct": 0, "high": 0, "low": 0,
                 "open": 0, "prev": 0, "source": "finnhub_quote",
-                "provider_attempts": [{
+                "provider_attempts": attempts + [{
                     "provider": "finnhub",
                     "kind": "quote",
                     "status": "error",

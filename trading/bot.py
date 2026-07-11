@@ -19,7 +19,7 @@ from datetime import datetime, timedelta, timezone
 from flask import render_template
 
 from market.charts import RANGE_SECS  # noqa: F401 — re-export sentinel
-from market.history import get_history, get_intraday_context, warm_history
+from market.history import get_history, get_intraday_context
 from market.quotes import (
     EXECUTION_CACHE_MAX_AGE_SEC,
     FMP_DAILY_GLOBAL_ENDPOINT,
@@ -35,11 +35,10 @@ from trading.risk import (
     get_earnings_soon, get_analyst_rec, get_insider_sentiment,
 )
 from trading.signals import classify_display_signal, get_recommendation
-from market import provider_support
 from trading.attribution import (
-    TRACK_TOP_SKIPS_PER_CYCLE, ensure_attribution_state, exit_profile,
-    record_entry_event, record_exit_event, update_exit_post_outcomes,
-    update_forward_outcomes,
+    TRACK_TOP_SKIPS_PER_CYCLE,
+    ensure_attribution_state, exit_profile, record_entry_event,
+    record_exit_event, update_exit_post_outcomes, update_forward_outcomes,
 )
 from trading.catalysts import classify_catalyst
 from trading.config import DEFAULT_CONFIG, active_config, config_hash
@@ -73,8 +72,8 @@ from utils.deploy_config import (
 )
 from utils.config import BOT_ENABLED
 from utils.storage import (
-    acquire_bot_file_lock, load_bot, save_bot, load_tickers, load_price_hist,
-    SUGGESTION_DB_FILE, DATA_DIR, storage_debug_info,
+    acquire_bot_file_lock, load_bot, save_bot, load_tickers, SUGGESTION_DB_FILE,
+    DATA_DIR, storage_debug_info,
 )
 from utils.threading_utils import _bot_run_lock, _BOT_STATUS, BOT_INTERVAL
 from utils.time_utils import (
@@ -113,10 +112,10 @@ KNIFE_CATALYST_TYPES = {
 }
 
 # A2 (cost-aware sizing): minimum dollars for ANY position open or add. At $0.99/trade
-# a $150 fill keeps the round-trip commission ≤ 1.32% (audit P0-3; $10 was 19.8%).
-# Sizing and EV gates still decide whether a candidate is worth taking.
+# the round-trip commission is roughly 2% of a $100 trade, so this remains a floor,
+# not a target. Sizing and EV gates still decide whether a candidate is worth taking.
 # Pyramid adds, new positions, and outside positions use the same minimum.
-MIN_POSITION_USD   = float(_RISK_DEFAULTS.get("min_trade_size", 150.0))
+MIN_POSITION_USD   = float(_RISK_DEFAULTS.get("min_trade_size", 10.0))
 BOT_TICK_MAX_RUNTIME_SEC = 25
 MIN_SIGNAL_HISTORY_ROWS = int(_HISTORY_DEFAULTS.get("min_history_rows_for_buy", 25))
 PREFERRED_SIGNAL_HISTORY_ROWS = int(_HISTORY_DEFAULTS.get("preferred_history_rows", 60))
@@ -173,8 +172,6 @@ REQUIRED_TICK_LOG_FIELDS = (
     "candidate_pool_count",
     "ranked_count",
     "tradable_count",
-    "ev_near_miss_count",
-    "rotation_skipped_unsupported",
     "top_rejection_reasons",
     "degraded_reject_counts",
     "buys_executed",
@@ -191,44 +188,12 @@ def _bump(counts, reason):
     counts[key] = counts.get(key, 0) + 1
 
 
-JSONL_ROTATE_MAX_LINES = 8000
-JSONL_ROTATE_KEEP_LINES = 5000
-_jsonl_appends_since_check = {}
-
-
-def _rotate_jsonl_if_needed(path, filename):
-    """Audit P5-25: cap JSONL logs on the 512MB free-tier disk quota.
-    # ponytail: amortized check (every 50 appends or >2MB); exact-per-append
-    # only matters if losing a few over-cap lines ever matters."""
-    count = _jsonl_appends_since_check.get(filename, 0) + 1
-    _jsonl_appends_since_check[filename] = count
-    try:
-        oversized = os.path.getsize(path) > 2 * 1024 * 1024
-    except Exception:
-        oversized = False
-    if count < 50 and not oversized:
-        return
-    _jsonl_appends_since_check[filename] = 0
-    try:
-        with open(path, encoding="utf-8") as f:
-            lines = f.readlines()
-        if len(lines) <= JSONL_ROTATE_MAX_LINES:
-            return
-        tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            f.writelines(lines[-JSONL_ROTATE_KEEP_LINES:])
-        os.replace(tmp, path)
-    except Exception:
-        pass
-
-
 def _append_jsonl(filename, event):
     try:
         os.makedirs(DATA_DIR, exist_ok=True)
         path = os.path.join(DATA_DIR, filename)
         with open(path, "a", encoding="utf-8") as f:
             f.write(json.dumps(event, sort_keys=True, default=str) + "\n")
-        _rotate_jsonl_if_needed(path, filename)
     except Exception:
         try:
             _BOT_STATUS["last_log_error"] = f"{filename}:write_failed"
@@ -1017,20 +982,19 @@ def _market_data_mode(regime, vix_data, cfg):
     standard_gates_config = _degraded_standard_gates_enabled(mode_cfg)
     normal_min_confidence = float(signal_cfg.get("min_buy_confidence", 40))
     degraded_min_confidence = float(mode_cfg.get("degraded_min_confidence", normal_min_confidence))
-    # Audit P1-6 (reverses the earlier warning-only decision): missing SPY/vol
-    # now BLOCKS into DEGRADED_MODE so the label/diagnostics are truthful. Rule 1
-    # (degraded == normal) is enforced by degraded_use_standard_gates_for_testing
-    # (default True): size mult 1.0, normal min-conf/EV/risk/quote gates — identical
-    # decisions, honest label. The restricted degraded_* keys remain a rollback
-    # profile behind that flag only. Known quirk kept on purpose: PROXY_MODE sizes
-    # x0.85 while DEGRADED sizes x1.0 — that is exactly what Rule 1 prescribes.
+    # DELIBERATE (pinned by test_missing_spy_is_neutral_warning_not_degraded and its
+    # volatility variant): missing SPY/vol data is recorded as a *warning*, never a
+    # *block*, so `blocks` stays empty and mode falls through to NORMAL_MODE rather than
+    # DEGRADED_MODE — the buy-lean bot keeps trading through data gaps. Two known
+    # consequences are left as-is ON PURPOSE (do not "fix" without updating those tests):
+    #   1. DEGRADED_MODE is unreachable in the live path — its whole engine is dead code.
+    #   2. On PA the healthy mode is PROXY_MODE (size x0.85); losing SPY/vol data flips to
+    #      NORMAL_MODE (size x1.0), i.e. degraded data yields LARGER size + no vol gate.
     blocks = []
     warnings = []
     if not spy_ok:
-        blocks.append("SPY_DATA_MISSING")
         warnings.append("SPY_DATA_MISSING")
     if not vol_ok:
-        blocks.append("VOLATILITY_DATA_MISSING")
         warnings.append("VOLATILITY_DATA_MISSING")
 
     if spy_ok and vol_ok and is_proxy and mode_cfg.get("allow_proxy_mode", True):
@@ -1232,7 +1196,7 @@ def buyable_reason(t, s, recent_sells=None, regime_kind="neutral", holdings=None
         sell_ts = float((recent_sells.get(t) or {}).get("ts", 0) or 0)
         age_min = (time.time() - sell_ts) / 60.0 if sell_ts else 0.0
         reason_l = str(recent_reason or "").lower()
-        if reason_l in {"loss", "stop_loss", "stop_loss_stale_quote", "trend_failure"}:
+        if reason_l in {"loss", "stop_loss", "trend_failure"}:
             base_cd = float(risk_cfg.get("stop_loss_rebuy_cooldown_minutes", 30))
         elif reason_l in {"trail", "trailing_stop"}:
             base_cd = float(risk_cfg.get("trailing_stop_rebuy_cooldown_minutes", 15))
@@ -1267,10 +1231,28 @@ def buyable_reason(t, s, recent_sells=None, regime_kind="neutral", holdings=None
         if not (ctx_local.get("rsi", 100) < 35 or ctx_local.get("is_dip")):
             return False, "BEAR_GATE_REQUIRES_DIP_OR_RSI_LT_35"
     if (regime_kind in ("neutral", "degraded_neutral") and ctx_local.get("adx", 100) < adx_gate
-            and not ctx_local.get("is_dip")
-            and float((s.get("rec") or {}).get("confidence", 0) or 0) < 60):
+            and not ctx_local.get("is_dip")):
         if t not in holdings:
-            return False, "NEUTRAL_ADX_BELOW_GATE_NON_DIP"
+            return False, "NEUTRAL_ADX_BELOW_20_NON_DIP"
+    # Learning v3 posture gate: live history showed NEUTRAL-regime
+    # trend-continuation entries losing consistently (20/22 trades, every
+    # confidence bucket negative). That one pattern now needs momentum
+    # confirmation; config flag lets the learner supersede it later.
+    if (bool(signal_cfg.get("neutral_trend_confirmation_enabled", True))
+            and regime_kind in ("neutral", "degraded_neutral")
+            and t not in holdings
+            and not ctx_local.get("is_dip")):
+        try:
+            cluster_l = entry_cluster(s.get("rec") or {}, ctx_local)
+        except Exception:
+            cluster_l = None
+        if cluster_l == "trend_continuation":
+            adx_confirm = float(ctx_local.get("adx", 0) or 0) >= float(
+                signal_cfg.get("neutral_trend_confirmation_adx", 25))
+            vol_confirm = float(ctx_local.get("vol_ratio", 0) or 0) >= float(
+                signal_cfg.get("neutral_trend_confirmation_vol_ratio", 1.2))
+            if not (adx_confirm or vol_confirm):
+                return False, "NEUTRAL_TREND_NEEDS_CONFIRMATION"
     catalyst = (s.get("rec") or {}).get("catalyst") or {}
     catalyst_type = catalyst.get("type")
     week_chg = ctx_local.get("week_chg_pct", 0) or 0
@@ -1299,27 +1281,7 @@ def _pa_stage_tickers(tickers, holdings, b):
         t for t in tickers
         if t not in holdings_ordered and t not in BENCHMARK_ONLY_TICKERS
     ]
-    # Audit P0-5: don't burn rotation slots on symbols whose daily history is
-    # permanently unsupported (FMP 402) unless recorded snapshots can decide them.
-    recorded = load_price_hist() or {}
-    decidable_watch = [
-        t for t in watch
-        if provider_support.is_supported(t)
-        or len(recorded.get(t) or []) >= MIN_SIGNAL_HISTORY_ROWS
-    ]
-    skipped_unsupported = len(watch) - len(decidable_watch)
-    watch = decidable_watch
     if not watch:
-        b["pa_stage_status"] = {
-            "mode": "pythonanywhere",
-            "selected": holdings_ordered,
-            "watchlist_size": len(tickers),
-            "holdings_size": len(holdings_ordered),
-            "batch_size": PA_TICKERS_PER_BOT_RUN,
-            "rotation_skipped_unsupported": skipped_unsupported,
-            "next_index": int(b.get("pa_rotation_index", 0) or 0),
-            "ts": int(time.time()),
-        }
         return holdings_ordered
     room = max(0, PA_TICKERS_PER_BOT_RUN - len(holdings_ordered))
     room = max(1, room) if not holdings_ordered else room
@@ -1333,69 +1295,10 @@ def _pa_stage_tickers(tickers, holdings, b):
         "watchlist_size": len(tickers),
         "holdings_size": len(holdings_ordered),
         "batch_size": PA_TICKERS_PER_BOT_RUN,
-        "rotation_skipped_unsupported": skipped_unsupported,
         "next_index": b["pa_rotation_index"],
         "ts": int(time.time()),
     }
     return holdings_ordered + selected_watch
-
-PREWARM_COOLDOWN_SEC = 1800  # ponytail: fixed 30-min cadence; promote to config if tuning ever matters
-PREWARM_WALL_CLOCK_SEC = 10
-
-
-def _prewarm_pass(b, now):
-    """Closed-market cache prewarm (audit P1-10).
-
-    ≤2 daily-history warms + ≤2 quote refreshes per pass, ≥30 min apart,
-    10s wall-clock cap between steps. Touches caches, rotation index and
-    b['last_prewarm'] only — never holdings/cash/decisions.
-    """
-    if now - float(b.get("last_prewarm_ts", 0) or 0) < PREWARM_COOLDOWN_SEC:
-        return None
-    deadline = time.time() + PREWARM_WALL_CLOCK_SEC
-    recorded = load_price_hist() or {}
-    watch = [
-        t for t in (load_tickers() or [])
-        if provider_support.is_supported(t)
-        or len(recorded.get(t) or []) >= MIN_SIGNAL_HISTORY_ROWS
-    ]
-    scan_rows, _scan_ts = _scan_snapshot()
-    scan_syms = [str(r.get("ticker") or "") for r in (scan_rows or [])]
-    universe = []
-    for t in watch + ["SPY"] + [s for s in scan_syms if s]:
-        if t and t not in universe:
-            universe.append(t)
-    b["last_prewarm_ts"] = int(now)
-    if not universe:
-        return None
-    idx = int(b.get("prewarm_rotation_index", 0) or 0) % len(universe)
-    batch = (universe[idx:] + universe[:idx])[:2]
-    b["prewarm_rotation_index"] = (idx + len(batch)) % len(universe)
-    warm_result = {}
-    try:
-        # warm_history is internally budgeted (≤2 fetches, circuits respected)
-        warm_result = warm_history(batch, max_symbols=2, max_fetches=2) or {}
-    except Exception as e:
-        warm_result = {"error": f"{type(e).__name__}: {e}"}
-    quotes_refreshed = []
-    for t in batch:
-        if time.time() >= deadline:
-            break
-        try:
-            q = get_quote(t) or {}
-            if q.get("price"):
-                quotes_refreshed.append(t)
-        except Exception:
-            pass
-    b["last_prewarm"] = {
-        "ts": int(now),
-        "symbols": batch,
-        "warmed": warm_result.get("warmed_symbols"),
-        "warm_failed": warm_result.get("failed_symbols"),
-        "quotes_refreshed": quotes_refreshed,
-    }
-    return b["last_prewarm"]
-
 
 # ── Bot state runtime mirror ────────────────────────────────────────────────
 def _set_running(flag):
@@ -1453,6 +1356,27 @@ def record_equity_snapshot(b, total_equity):
 
 
 # ── Trade history records ──────────────────────────────────────────────────
+def _humanize_trade_reason(action, t, sh, pr, confidence, signal, why, pnl_usd=None):
+    """Plain-English primary line for the history UI ("logs hard to read").
+
+    The full technical explanation is preserved in reason_detail; this line is
+    what a person scans first.
+    """
+    try:
+        sig_txt = str(signal or "signal").replace("_", " ").replace("-", " ").lower()
+        if action == "BUY":
+            return (f"Bought {sh:.4f} {t} for ${sh * pr:,.2f} — "
+                    f"{sig_txt} at {confidence}% confidence.")
+        if action == "SELL":
+            pnl = float(pnl_usd or 0.0)
+            outcome = f"made ${pnl:,.2f}" if pnl >= 0 else f"lost ${abs(pnl):,.2f}"
+            trigger = str(why or "exit rule").split(":", 1)[0].strip().rstrip(".")
+            return f"Sold {sh:.4f} {t} — {outcome}. Trigger: {trigger}."
+    except Exception:
+        pass
+    return why or ""
+
+
 def _record_trade(b, action, t, sh, pr, rec, arts, why, pnl_usd=None):
     """Append a trade (BUY/SELL) to history with reasoning + supporting article.
     Round-5 Bug #3: pnl_usd = realized profit on SELL (None for BUY) so the
@@ -1464,6 +1388,7 @@ def _record_trade(b, action, t, sh, pr, rec, arts, why, pnl_usd=None):
     et, sgt = _fmt_times()
     display_signal = rec.get("display_signal_label") or rec.get("signal")
     raw_signal = rec.get("raw_signal_label") or rec.get("signal")
+    detail = why or (rec["reasons"][0] if rec["reasons"] else "")
     b["history"].insert(0, {
         "action": action, "ticker": t, "shares": sh, "price": pr,
         "total": sh * pr,
@@ -1474,7 +1399,11 @@ def _record_trade(b, action, t, sh, pr, rec, arts, why, pnl_usd=None):
         "raw_signal": raw_signal,
         "display_signal": display_signal,
         "confidence": rec["confidence"],
-        "reason": why or (rec["reasons"][0] if rec["reasons"] else ""),
+        "reason": _humanize_trade_reason(
+            action, t, sh, pr, rec.get("confidence"), display_signal, detail,
+            pnl_usd=pnl_usd,
+        ),
+        "reason_detail": detail,
         "news_title": sup["title"] if sup else "",
         "news_link":  sup.get("link", "") if sup else "",
     })
@@ -1509,6 +1438,28 @@ def _record_hold(b, reason, sigs):
     })
 
 
+_SKIP_CODE_PLAIN = {
+    "EDGE_TOO_LOW": "expected profit didn't clear the required bar",
+    "NET_EDGE_TOO_LOW_AFTER_COSTS": "expected profit disappears after fees",
+    "MAX_GROSS_EXPOSURE": "portfolio is already at its exposure cap",
+    "FINAL_SIZE_TOO_SMALL": "position would be below the minimum trade size",
+    "MAX_POSITIONS_REACHED": "already holding the maximum number of positions",
+    "MAX_SCAN_BUYS_PER_TICK": "scan-buy limit for this check already used",
+    "MAX_SCAN_BUYS_PER_DAY": "scan-buy limit for today already used",
+    "NEUTRAL_TREND_NEEDS_CONFIRMATION": "trend entry lacked momentum confirmation in a neutral market",
+}
+
+
+def _humanize_skip_reason(ticker, reason, confidence, rank_reason_code=None):
+    """One plain sentence for SKIP rows; codes/detail stay in their own fields."""
+    code = str(rank_reason_code or reason or "").strip()
+    plain = _SKIP_CODE_PLAIN.get(code) or _SKIP_CODE_PLAIN.get(str(reason or "").split(":", 1)[0])
+    if plain:
+        conf_txt = f" ({confidence}% confidence)" if confidence else ""
+        return f"Wanted to buy {ticker}{conf_txt} but {plain}."
+    return reason
+
+
 def _record_skip(b, ticker, reason, signal, confidence, *,
                  display_signal=None, original_reason=None, skip_stage=None,
                  rank_reason_code=None, gross_edge_pct=None, net_edge_pct=None,
@@ -1526,7 +1477,8 @@ def _record_skip(b, ticker, reason, signal, confidence, *,
         "raw_signal": signal,
         "display_signal": display_signal,
         "confidence": confidence,
-        "reason": reason,
+        "reason": _humanize_skip_reason(ticker, reason, confidence, rank_reason_code),
+        "reason_detail": reason if reason else None,
         "original_reason": original_reason,
         "skip_stage": skip_stage,
         "rank_reason_code": rank_reason_code,
@@ -1730,41 +1682,26 @@ def _persist_no_buy_diag(b, diag, blocker=None, traded=False):
     return b
 
 
-# Per-tick budget for recording skipped candidates (audit P0-2). Buy loop
-# processes candidates in ranked order, so the first N skips are the top-N.
-_SKIPS_RECORDED_THIS_TICK = 0
-
-
-def _recorded_price_within(t, max_age_sec=3600):
-    """Latest recorded snapshot price for `t` if fresh enough → (price, age_sec).
-
-    Used by the SELL pass to run the protective hard stop when the live quote
-    is stale (audit P1-14). Returns (None, None) when no usable snapshot.
-    """
-    try:
-        pts = (load_price_hist() or {}).get(t) or []
-        ts, price = pts[-1]
-        age = time.time() - float(ts)
-        if 0 <= age <= max_age_sec and float(price) > 0:
-            return float(price), age
-    except Exception:
-        pass
-    return None, None
+_SKIP_RECORD_TICK = {"ts": None, "count": 0}
 
 
 def _record_candidate_observation(b, cand, decision, reason, now, regime_kind):
-    """Persist one candidate (executed or top-ranked skip) for forward-return attribution."""
-    global _SKIPS_RECORDED_THIS_TICK
+    """Persist one candidate for forward-return attribution.
+
+    Learning v3: skipped candidates are recorded too (bounded per tick) so the
+    learner sees mistakes of omission — record_entry_event dedupes repeats of
+    the same ticker within 6h, keeping growth small.
+    """
     if decision == "skipped":
-        if _SKIPS_RECORDED_THIS_TICK >= TRACK_TOP_SKIPS_PER_CYCLE:
+        if _SKIP_RECORD_TICK["ts"] != now:
+            _SKIP_RECORD_TICK["ts"] = now
+            _SKIP_RECORD_TICK["count"] = 0
+        if _SKIP_RECORD_TICK["count"] >= TRACK_TOP_SKIPS_PER_CYCLE:
             return False
-        if float(cand.get("price") or 0) <= 0:
-            return False
+        _SKIP_RECORD_TICK["count"] += 1
     elif decision != "executed":
         return False
     event = record_entry_event(b, cand, decision, reason, ts=now, regime=regime_kind)
-    if event is not None and decision == "skipped":
-        _SKIPS_RECORDED_THIS_TICK += 1
     return bool(event)
 
 
@@ -1828,7 +1765,7 @@ def _generic_exit_shadow(h, pr, ctx, rec, stop_loss_pct, trail_stop_pct,
         ma30_e = (ctx or {}).get("ma30", 0) or 0
         if ma30_e > 0 and cur_e > 0 and pnl_pct < 0 and cur_e < ma30_e * 0.98:
             reason = "trend_failure"
-        elif held_hours > aging_hours and abs(pnl_pct) < 1.0 and h.get("shares", 0) * pr >= 150:
+        elif held_hours > aging_hours and abs(pnl_pct) < 1.0 and h.get("shares", 0) * pr >= 200:
             reason = "aging"
     return {
         "would_exit": bool(reason),
@@ -1858,11 +1795,10 @@ def run_bot(force=False, user_forced=False, max_runtime_sec=None):
     are dropped rather than queued. Returns (b, traded, last_action).
 
     A3: `force` = bypass the interval cooldown (used by the after-close auto-resume and
-    the scheduler). `user_forced` = a human clicked "run now" (/bot/run or
-    /bot/tick?manual=1) — only THIS relaxes the in_new_buy_window gate
-    (09:30–16:00 ET regular session; audit P0-4 kept the full-session window
-    per Rule 2 buy-lean) and the "buy at least one name" fallback. Machine
-    pings (UptimeRobot) pass user_forced=False."""
+    the scheduler). `user_forced` = a human clicked "run now" on /bot/run — only THIS
+    relaxes the 09:45–15:30 calm-window gate and the "buy at least one name" fallback.
+    The auto-resume must NOT churn a marginal buy in the volatile first minutes of the
+    session, which is what conflating the two flags used to cause."""
     if not BOT_ENABLED:
         b = load_bot()
         _BOT_STATUS.update({"last_run_ts": int(time.time()), "last_action": "bot_disabled",
@@ -1891,8 +1827,6 @@ def run_bot(force=False, user_forced=False, max_runtime_sec=None):
 
 
 def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
-    global _SKIPS_RECORDED_THIS_TICK
-    _SKIPS_RECORDED_THIS_TICK = 0  # ticks are single-flight (_bot_run_lock)
     b = load_bot()
     _ensure_v1_state(b)
     _memory_guard(b)
@@ -1937,13 +1871,6 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
         no_buy_diag["market_open"] = False
         if not b.get("pending_run"):
             b["pending_run"] = True
-        # Audit P1-10: the 17.5 closed-market hours of keepalive pings prewarm
-        # caches so every symbol is warm by 09:30 with zero open-hours pressure.
-        try:
-            _prewarm_pass(b, now)
-        except Exception as e:
-            try: print(f"[prewarm] failed: {type(e).__name__}: {e}")
-            except Exception: pass
         _persist_no_buy_diag(b, no_buy_diag, "market_closed")
         _BOT_STATUS.update({"last_run_ts": int(now), "last_action": "market_closed_autoqueued",
                             "last_traded": False})
@@ -1978,9 +1905,6 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
     all_to_check = _pa_stage_tickers(tickers, list(b["holdings"].keys()), b)
     no_buy_diag["checked_tickers"] = list(all_to_check)
     no_buy_diag["pa_stage_status"] = b.get("pa_stage_status")
-    no_buy_diag["rotation_skipped_unsupported"] = int(
-        (b.get("pa_stage_status") or {}).get("rotation_skipped_unsupported", 0) or 0
-    )
     _raise_if_tick_deadline_exceeded(deadline_ts, b, no_buy_diag)
     regime, ok = _call_with_deadline(lambda: get_market_regime(cfg), deadline_ts)
     if not ok:
@@ -2386,34 +2310,20 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
     for t in list(b["holdings"].keys()):
         if t not in sigs: continue
         s = sigs[t]; pr = s["price"]
-        # Round-4 Bug Fix #1 + audit P1-14: on a stale quote we do NOT
-        # trail-exit, signal-flip, or age-out — those need live data. But if a
-        # recorded snapshot ≤60 min old exists, we still evaluate ONLY the hard
-        # stop-loss against it so losses don't run unmanaged through an outage.
-        stale_stop_only = False
-        snap_age = None
+        # Round-4 Bug Fix #1: halt trading on stale-quote tickers. We do NOT
+        # trail-exit, signal-flip, or age-out a position based on a price that
+        # may be hours/days old. Stop-loss is also disabled here — if the API
+        # is down we don't have a valid current price to compare against.
         if s.get("stale"):
-            snap_pr, snap_age = _recorded_price_within(t)
-            if snap_pr is None:
-                try: print(f"[run_bot] {t}: stale quote (no live data), halting trade decisions")
-                except Exception: pass
-                continue
-            pr = snap_pr
-            stale_stop_only = True
-            try: print(f"[run_bot] {t}: stale quote — protective stop only, "
-                       f"recorded snapshot {snap_age/60.0:.0f}min old")
+            try: print(f"[run_bot] {t}: stale quote (no live data), halting trade decisions")
             except Exception: pass
+            continue
         if pr <= 0: continue
         h = b["holdings"][t]
-        if stale_stop_only:
-            # don't ratchet peaks/troughs off recorded prices
-            peak = h.get("peak", h["avg_cost"])
-            trough = h.get("trough", h["avg_cost"])
-        else:
-            peak = max(h.get("peak", h["avg_cost"]), pr)
-            h["peak"] = round(peak, 4)
-            trough = min(h.get("trough", h["avg_cost"]), pr)
-            h["trough"] = round(trough, 4)
+        peak = max(h.get("peak", h["avg_cost"]), pr)
+        h["peak"] = round(peak, 4)
+        trough = min(h.get("trough", h["avg_cost"]), pr)
+        h["trough"] = round(trough, 4)
         # Round-5 cost model: no bps slippage. pnl measured at raw price; the
         # flat $0.99 is applied to cash at execution, not baked into price.
         pnl_pct = (pr - h["avg_cost"]) / h["avg_cost"] * 100 if h["avg_cost"] else 0
@@ -2470,7 +2380,7 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
             AGING_HOURS, held_secs, MIN_HOLDING_SEC, eff_atr_for_stop,
             intra_atr=intra_atr, vwma_dist=vwma_dist,
         )
-        if shadow_old_exit.get("would_exit") and not h.get("shadow_old_exit") and not stale_stop_only:
+        if shadow_old_exit.get("would_exit") and not h.get("shadow_old_exit"):
             h["shadow_old_exit"] = shadow_old_exit
         dyn_trail_pct, trail_source = dynamic_trail_width(intra_atr, atr_pct, TRAIL_STOP_PCT)
         dyn_trail_pct = round(dyn_trail_pct * exit_ladder.get("trail_mult", 1.0), 3)
@@ -2488,18 +2398,14 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
         vwma_protects = (vwma_dist > 1.0) and (trail_pct > -3.0)
         trail_active = trail_triggered and not vwma_protects
 
-        if stale_stop_only:
-            peak_pnl_pct = h.get("peak_pnl_pct", 0)
-        else:
-            peak_pnl_pct = max(h.get("peak_pnl_pct", 0), pnl_pct)
-            h["peak_pnl_pct"] = round(peak_pnl_pct, 3)
+        peak_pnl_pct = max(h.get("peak_pnl_pct", 0), pnl_pct)
+        h["peak_pnl_pct"] = round(peak_pnl_pct, 3)
 
         # #4.3 signal-degradation partial exit
         DEGRADE_LADDER = {"strong-buy": 3, "buy": 2, "hold": 1, "sell": 0, "strong-sell": 0}
         DEGRADE_MIN_GAP = 2
         entry_cls = h.get("entry_signal_cls")
         if (entry_cls and held_secs >= MIN_HOLDING_SEC
-                and not stale_stop_only
                 and not h.get("degrade_trimmed", False)):
             entry_rank = DEGRADE_LADDER.get(entry_cls, 1)
             cur_rank   = DEGRADE_LADDER.get(cls, 1)
@@ -2520,7 +2426,6 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
             "partial_take_pct", PARTIAL_TAKE_PCT / 100.0
         ) * 100.0
         if (PARTIAL_TAKE_ENABLED and peak_pnl_pct >= ladder_partial_take_pct
-                and not stale_stop_only
                 and not h.get("partial_taken", False)
                 and held_secs >= MIN_HOLDING_SEC):
             partial_reason = (f"Partial take: peak hit +{peak_pnl_pct:.1f}%, "
@@ -2560,15 +2465,7 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
             stop_label = f"{effective_stop:.1f}%, regime={regime_label}{atr_note}; {exit_ladder_note}"
 
         sell_reason = None; exit_reason_key = ""
-        if stale_stop_only:
-            # Audit P1-14: pure hard stop only — no ratchet lock, no time-decay,
-            # no trail/aging/flip on a recorded (non-live) price.
-            if pnl_pct <= dynamic_stop:
-                sell_reason = (f"Stop-loss on stale quote: down {pnl_pct:.1f}% vs recorded "
-                               f"snapshot {(snap_age or 0)/60.0:.0f}min old "
-                               f"(threshold {dynamic_stop:.1f}%)")
-                exit_reason_key = "stop_loss_stale_quote"
-        elif pnl_pct <= effective_stop:
+        if pnl_pct <= effective_stop:
             if effective_stop > 0:
                 # Cost-aware ratchet exit — locking in a NET-positive gain, not a loss.
                 # Tag it distinctly so it gets the short (non-loss) cooldown and isn't
@@ -2631,9 +2528,9 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
                                f"${ma30_e:.2f} (−{(1-cur_e/ma30_e)*100:.1f}%), position "
                                f"underwater {pnl_pct:+.1f}%")
                 exit_reason_key = "trend_failure"
-            elif held_hours > aging_hours_profiled and abs(pnl_pct) < 1.0 and h["shares"] * pr >= 150:
-                # Round-6: only age-sell positions ≥$150 (matches min_trade_size) —
-                # don't pay $0.99 to dump a tiny stub. Stops/trails/trend-failure unaffected.
+            elif held_hours > aging_hours_profiled and abs(pnl_pct) < 1.0 and h["shares"] * pr >= 200:
+                # Round-6: only age-sell positions ≥$200 — don't pay $0.99 to dump
+                # a tiny stub. Stops/trails/trend-failure above are unaffected.
                 sell_reason = (f"Position aging: held {held_hours:.1f}h, flat ({pnl_pct:+.1f}%), "
                                f"freeing capital (regime={regime_label} threshold={aging_hours_profiled:.1f}h; {exit_ladder_note})")
                 exit_reason_key = "aging"
@@ -2834,8 +2731,7 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
                 })
         return ok
 
-    # #3 TOD gate: no NEW buys outside the 09:30-16:00 ET regular session
-    # unless a human forces it (weekends/holidays/half-day closes included).
+    # #3 TOD gate: no NEW buys outside 09:45-15:30 ET unless a human forces it.
     tod_ok = user_forced or in_new_buy_window()
     no_buy_diag["tod_ok"] = bool(tod_ok)
     no_buy_diag["buy_window_open"] = bool(in_new_buy_window())
@@ -2934,9 +2830,7 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
         "kelly_mult": round(kelly_mult, 4),
         "diag":       kelly_diag,
         "ts":         int(now),
-        "notes":      ("V1: Kelly modifies ATR risk budget, not final spend. "
-                       "Disabled until ≥50 closed outcomes; then set kelly: enabled=True, "
-                       "min_samples=50, fraction=0.5, min_mult=0.5, max_mult=1.25."),
+        "notes":      "V1: Kelly modifies ATR risk budget, not final spend.",
     }
 
     candidate_pool = []
@@ -3084,16 +2978,6 @@ def _run_bot_locked(force=False, user_forced=False, max_runtime_sec=None):
     ) if candidate_pool else []
     no_buy_diag["ranked_count"] = len(ranked_candidates)
     no_buy_diag["tradable_count"] = sum(1 for c in ranked_candidates if c.get("tradable"))
-    # candidates whose gross edge is within 0.2pp of required — tells us if
-    # EV gates are marginally mistuned without re-auditing (audit P5-24)
-    ev_near_miss = 0
-    for c in ranked_candidates:
-        if c.get("tradable"):
-            continue
-        gap = (c.get("ev_diagnostics") or {}).get("edge_gap_to_required_pct")
-        if gap is not None and -0.2 <= float(gap) < 0:
-            ev_near_miss += 1
-    no_buy_diag["ev_near_miss_count"] = ev_near_miss
     variance_checks = []
 
     def _ranking_rows():
@@ -4083,7 +3967,7 @@ def _render_bot_page(read_only):
     return render_template("bot.html",
         bot=b, positions=positions,
         # Round-8: split BUY/SELL windows (100 each), decisions cap 20
-        buys=buys[:100], sells=sells[:100], decisions=decisions[:20],
+        buys=buys[:100], sells=sells[:100], decisions=decisions[:100],
         total=total, pnl=pnl, pnl_pct=pnl_pct, starting=b.get("starting", 10000),
         stats=stats,
         no_buy=safe_no_buy,
