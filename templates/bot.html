@@ -296,6 +296,9 @@
           <td colspan="5">
             <div><strong>{{ tx.display_signal or tx.signal }}</strong><span class="note"> at {{ tx.confidence }}% confidence</span></div>
             <div class="note" style="margin-top:6px"><span class="note">Decision reasoning:</span> {{ tx.reason }}</div>
+            {% if tx.reason_detail and tx.reason_detail != tx.reason %}
+            <div class="note" style="font-size:11px;margin-top:4px;opacity:.8"><span class="note">Technical detail:</span> {{ tx.reason_detail }}</div>
+            {% endif %}
             <div class="note" style="font-size:11px;margin-top:6px">
               Executed @ ${{ '{:,.2f}'.format(tx.price) }} · Total spent: ${{ '{:,.2f}'.format(tx.total) }}
             </div>
@@ -348,6 +351,9 @@
           <td colspan="5">
             <div><strong>{{ tx.display_signal or tx.signal }}</strong><span class="note"> at {{ tx.confidence }}% confidence</span></div>
             <div class="note" style="margin-top:6px"><span class="note">Decision reasoning:</span> {{ tx.reason }}</div>
+            {% if tx.reason_detail and tx.reason_detail != tx.reason %}
+            <div class="note" style="font-size:11px;margin-top:4px;opacity:.8"><span class="note">Technical detail:</span> {{ tx.reason_detail }}</div>
+            {% endif %}
             <div class="note" style="font-size:11px;margin-top:6px">
               Executed @ ${{ '{:,.2f}'.format(tx.price) }} · Total received: ${{ '{:,.2f}'.format(tx.total) }}
             </div>
@@ -395,6 +401,9 @@
           <td colspan="5">
             <div><strong>{{ tx.display_signal or tx.signal }}</strong>{% if not is_hold %}<span class="note"> at {{ tx.confidence }}% confidence</span>{% endif %}</div>
             <div class="note" style="margin-top:6px"><span class="note">Decision reasoning:</span> {{ tx.reason }}</div>
+            {% if tx.reason_detail and tx.reason_detail != tx.reason %}
+            <div class="note" style="font-size:11px;margin-top:4px;opacity:.8"><span class="note">Technical detail:</span> {{ tx.reason_detail }}</div>
+            {% endif %}
             {% if is_hold and tx.signals %}
             <div class="note" style="font-size:11px;margin-top:6px">Signals across watchlist: {{ tx.signals }}</div>
             {% elif not is_hold %}
@@ -726,6 +735,13 @@ function pcRenderDetail(day) {
     weekday: 'long', month: 'short', day: 'numeric'
   });
   detail.appendChild(title);
+  if (day.session_sgt) {
+    const sess = document.createElement('div');
+    sess.className = 'pc-note';
+    sess.style.marginTop = '0';
+    sess.textContent = 'Session: ' + day.session_sgt;
+    detail.appendChild(sess);
+  }
   detail.append(
     pcDetailRow('status', day.status),
     pcDetailRow('P/L', pcSignedMoney(day.pnl_usd), day.pnl_usd > 0 ? 'green' : day.pnl_usd < 0 ? 'red' : ''),
@@ -814,8 +830,9 @@ function pcRenderCalendar(payload) {
       : (day.holdings && day.holdings.length ? day.holdings.join(', ') : 'no data');
     meta.textContent = tradeText;
     btn.append(num, pl, meta);
+    // click-only: hovering used to hijack the detail panel and made dates
+    // hard to inspect — the detail now changes only on click.
     btn.addEventListener('click', () => pcSelectDay(day, btn));
-    btn.addEventListener('mouseenter', () => pcRenderDetail(day));
     grid.appendChild(btn);
     if (!firstActive && day.has_activity) {
       firstActive = day;

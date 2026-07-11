@@ -229,7 +229,8 @@ def _cap_bot_state(b):
     except Exception:
         PYTHONANYWHERE_MODE = False
     caps = {
-        "history": 220,
+        # 350 so the UI's 100 buys + 100 sells + 100 hold/skip rows coexist
+        "history": 350,
         "equity_history": 400 if PYTHONANYWHERE_MODE else 2000,
         "trade_outcomes": 200,
         "candidate_observations": 300 if PYTHONANYWHERE_MODE else 600,

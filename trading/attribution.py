@@ -12,9 +12,17 @@ from trading.exit_ladders import normalize_cluster
 ALPHA_PRIOR = 3
 BETA_PRIOR = 4
 EMA_ALPHA = 0.08
-ENTRY_LIVE_N = 60
-EXIT_LIVE_N = 60
-FULL_TRUST_N = 120
+# Learning v3: activation lowered from 60/120 — at ~1-2 trades/day the old
+# thresholds never fired (largest live bucket had n=2 after weeks). Safe with
+# time-decay + the hierarchical blend leaning on the global bucket.
+ENTRY_LIVE_N = 15
+EXIT_LIVE_N = 15
+FULL_TRUST_N = 40
+# Learning v3: exponential forgetting so old outcomes stop steering decisions
+# ("remove old data to prevent persistent hesitation"). Counts decay with a
+# 14-day half-life; raw events older than 60 days are pruned from state.
+DECAY_HALF_LIFE_SEC = 14 * 86400
+EVENT_MAX_AGE_SEC = 60 * 86400
 SUCCESS_THRESHOLD_PCT = 0.5
 FAILURE_THRESHOLD_PCT = -1.0
 STRONG_SUCCESS_PCT = 2.0
@@ -262,9 +270,27 @@ def bucket_keys(regime, cluster, category):
     }
 
 
+def _decay_entry_bucket(b, ts):
+    """Decay accumulated evidence toward the Beta prior (half-life 14d)."""
+    last = b.get("last_updated")
+    if not last or ts <= int(last):
+        return b
+    f = 0.5 ** ((int(ts) - int(last)) / DECAY_HALF_LIFE_SEC)
+    if f >= 0.999:
+        return b
+    b["alpha"] = round(ALPHA_PRIOR + (float(b["alpha"]) - ALPHA_PRIOR) * f, 4)
+    b["beta"] = round(BETA_PRIOR + (float(b["beta"]) - BETA_PRIOR) * f, 4)
+    for k in ("n", "successes", "failures", "neutral", "strong_successes",
+              "wins", "losses", "executed_n", "skipped_n"):
+        b[k] = round(float(b.get(k, 0) or 0) * f, 4)
+    for k in ("sum_net_ret_pct", "sum_raw_ret_pct", "sum_win_pct", "sum_loss_pct"):
+        b[k] = round(float(b.get(k, 0.0) or 0.0) * f, 4)
+    return b
+
+
 def _update_bucket(bucket, net_ret_pct, raw_ret_pct, mfe_pct, mae_pct, signal_strength, ts,
                    decision=None):
-    b = init_entry_bucket(bucket)
+    b = _decay_entry_bucket(init_entry_bucket(bucket), ts)
     net = float(net_ret_pct or 0.0)
     raw = float(raw_ret_pct or 0.0)
     mfe = float(mfe_pct or 0.0)
@@ -372,8 +398,8 @@ def update_entry_buckets(state, event, horizon=MAIN_HORIZON):
 
 def record_entry_event(state, candidate, decision, reason, ts=None, regime=None):
     ensure_attribution_state(state)
-    # "skipped" events fill forward-return edge buckets without trading
-    # (audit P0-2); caller caps them at TRACK_TOP_SKIPS_PER_CYCLE per tick.
+    # Learning v3: skipped candidates are recorded too, so the bot can learn
+    # from mistakes of omission (skipped winners) as well as bad executions.
     if decision not in ("executed", "skipped"):
         return None
     rec = candidate.get("rec") or {}
@@ -450,6 +476,8 @@ def update_forward_outcomes(state, price_lookup, ts=None, benchmark_lookup=None)
         fwd = event.setdefault("forward_returns", {})
         done = all(f"{d}d" in fwd for d in FORWARD_HORIZONS_DAYS)
         age_sec = ts - event.get("ts", 0)
+        if age_sec > EVENT_MAX_AGE_SEC:
+            continue  # Learning v3: prune old raw events (decay already faded them)
         if done and age_sec > 35 * 86400:
             keep.append(event)
             continue
@@ -521,7 +549,16 @@ def blended_bucket(state, regime, cluster, category):
         out["live"] = False
         out["gross_edge_pct"] = None
         return out
-    out["live"] = out["n_effective"] >= ENTRY_LIVE_N
+    # Learning v3: a blend is live once the RAW evidence behind it reaches
+    # ENTRY_LIVE_N (e.g. a live global bucket alone) — the old weighted
+    # n_effective criterion kept the learner dark even with a live parent.
+    # max (not sum): every level sees the same events, so summing would
+    # quadruple-count them.
+    n_total = max(
+        (float(p.get("n", 0) or 0) for p in out["parts"]), default=0.0
+    )
+    out["n_total"] = round(n_total, 2)
+    out["live"] = (out["n_effective"] >= ENTRY_LIVE_N) or (n_total >= ENTRY_LIVE_N)
     out["gross_edge_pct"] = round(out["gross_edge_sum"] / out["weight_sum"], 4)
     out["score"] = round(out["score_sum"] / out["weight_sum"], 4)
     out["n_effective"] = round(out["n_effective"], 2)
@@ -655,6 +692,20 @@ def record_exit_event(state, ticker, holding, exit_reason, realized_pnl_pct, pri
     return event
 
 
+def _decay_exit_bucket(b, ts):
+    """Half-life decay for exit-bucket counters (mirrors entry decay)."""
+    last = b.get("last_updated")
+    if not last or not ts or int(ts) <= int(last):
+        return b
+    f = 0.5 ** ((int(ts) - int(last)) / DECAY_HALF_LIFE_SEC)
+    if f >= 0.999:
+        return b
+    for k in ("n", "capture_n", "too_late_n", "too_early_n", "post_3d_n",
+              "sum_capture_ratio", "sum_realized_pnl_pct", "sum_mfe_pct", "sum_mae_pct"):
+        b[k] = round(float(b.get(k, 0) or 0) * f, 4)
+    return b
+
+
 def update_exit_bucket(state, event):
     buckets = state.setdefault("exit_attribution_buckets", {})
     keys = [
@@ -662,7 +713,7 @@ def update_exit_bucket(state, event):
         exit_bucket_key(event.get("regime"), event.get("cluster"), event.get("exit_reason")),
     ]
     for key in keys:
-        b = init_exit_bucket(buckets.setdefault(key, {}))
+        b = _decay_exit_bucket(init_exit_bucket(buckets.setdefault(key, {})), event.get("ts"))
         b["n"] += 1
         cap = event.get("capture_ratio")
         if cap is not None:
@@ -711,6 +762,10 @@ def update_exit_post_outcomes(state, price_lookup, ts=None):
     ensure_attribution_state(state)
     ts = int(ts or now_ts())
     updated = 0
+    state["exit_attribution_events"] = [
+        e for e in state.get("exit_attribution_events", [])
+        if ts - int(e.get("ts") or ts) <= EVENT_MAX_AGE_SEC
+    ]
     for event in state.get("exit_attribution_events", []):
         if "3d" in event.setdefault("post_exit_returns", {}):
             continue
@@ -777,6 +832,103 @@ def exit_profile(state, regime, cluster):
     return {"live": True, "key": key, "n": b.get("n", 0),
             "stop_mult": stop_mult, "trail_mult": trail_mult,
             "aging_mult": aging_mult, "notes": ", ".join(notes) or "neutral"}
+
+
+def _decayed_forward_samples(state, horizon="3d", ts=None):
+    """(event, forward_return_pct, decay_weight) for events with the horizon filled."""
+    ts = int(ts or now_ts())
+    out = []
+    for e in state.get("attribution_events", []) or []:
+        r = (e.get("forward_returns") or {}).get(horizon)
+        if r is None:
+            continue
+        age = max(0, ts - int(e.get("ts") or ts))
+        out.append((e, float(r), 0.5 ** (age / DECAY_HALF_LIFE_SEC)))
+    return out
+
+
+def adaptive_edge_floor(state, base_floor=0.40, ts=None):
+    """Learn the min-expected-edge gate from both mistake types.
+
+    Executed entries losing on a 3d horizon -> raise the bar (stop repeating
+    bad buys). Skipped candidates beating executed ones -> lower it (stop the
+    persistent hesitation the EDGE_TOO_LOW gate was causing). Decay-weighted,
+    so old lessons fade with the same 14d half-life as the buckets.
+    """
+    ensure_attribution_state(state)
+    ex_w = ex_sum = sk_w = sk_sum = 0.0
+    for e, r, w in _decayed_forward_samples(state, "3d", ts):
+        if e.get("decision") == "executed":
+            ex_w += w
+            ex_sum += r * w
+        else:
+            sk_w += w
+            sk_sum += r * w
+    ex_avg = (ex_sum / ex_w) if ex_w >= 5.0 else None
+    sk_avg = (sk_sum / sk_w) if sk_w >= 5.0 else None
+    floor = float(base_floor)
+    notes = []
+    if ex_avg is not None and ex_avg < 0:
+        floor = floor + min(0.60, -ex_avg * 0.5)
+        notes.append(f"executed 3d avg {ex_avg:+.2f}% -> raise bar")
+    if sk_avg is not None and sk_avg > max(ex_avg or 0.0, 0.0) + 0.30:
+        floor = floor - 0.15
+        notes.append(f"skipped 3d avg {sk_avg:+.2f}% beats executed -> lower bar")
+    return {
+        "floor": round(clamp(floor, 0.20, 1.00), 4),
+        "base_floor": round(float(base_floor), 4),
+        "executed_avg_3d_pct": None if ex_avg is None else round(ex_avg, 4),
+        "skipped_avg_3d_pct": None if sk_avg is None else round(sk_avg, 4),
+        "n_executed_eff": round(ex_w, 2),
+        "n_skipped_eff": round(sk_w, 2),
+        "notes": "; ".join(notes) or "base",
+    }
+
+
+CALIBRATION_BINS = ((0, 45), (45, 55), (55, 65), (65, 75), (75, 101))
+
+
+def _calibration_bin(conf):
+    for lo, hi in CALIBRATION_BINS:
+        if lo <= conf < hi:
+            return (lo, hi)
+    return None
+
+
+def calibrated_prior_edge(state, confidence, ts=None, min_total_eff=20.0):
+    """Empirical decayed 3d edge for this confidence bin, or None if too thin.
+
+    Replaces the hand-wavy (conf-50)*0.08 prior once real outcomes exist —
+    the live data showed every 52-69 confidence bucket losing, so the formula
+    was feeding noise into the EV gate.
+    """
+    ensure_attribution_state(state)
+    try:
+        conf = float(confidence or 0)
+    except Exception:
+        return None
+    target = _calibration_bin(conf)
+    if target is None:
+        return None
+    samples = _decayed_forward_samples(state, "3d", ts)
+    total = sum(w for _, _, w in samples)
+    if total < float(min_total_eff):
+        return None
+    bw = bsum = 0.0
+    for e, r, w in samples:
+        c = e.get("confidence")
+        if c is None:
+            continue
+        try:
+            if _calibration_bin(float(c)) == target:
+                bw += w
+                bsum += r * w
+        except Exception:
+            continue
+    if bw <= 3.0:
+        return None
+    shrunk = (bsum / bw) * (bw / (bw + 3.0))  # Laplace-style pull toward 0
+    return round(clamp(max(0.0, shrunk), 0.0, 4.0), 4)
 
 
 def summarize_attribution(state):

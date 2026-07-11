@@ -111,6 +111,26 @@ def in_new_buy_window():
     return start <= cur <= end
 
 
+def session_bounds(d):
+    """(start_ts, end_ts) epoch seconds for the NYSE regular session on ET date d.
+
+    09:30-16:00 ET (13:00 close on half-days); None for weekends/holidays.
+    In SGT this is the 9:30pm -> 4am (next day) window the profit calendar
+    anchors to. DST handled by zoneinfo.
+    """
+    if not is_trading_day(d):
+        return None
+    try:
+        from zoneinfo import ZoneInfo
+        tz = ZoneInfo("America/New_York")
+    except Exception:
+        return None
+    close_hm = (13, 0) if d.strftime("%Y-%m-%d") in NYSE_HOLIDAYS_HALF else (16, 0)
+    start = datetime(d.year, d.month, d.day, 9, 30, tzinfo=tz)
+    end = datetime(d.year, d.month, d.day, close_hm[0], close_hm[1], tzinfo=tz)
+    return int(start.timestamp()), int(end.timestamp())
+
+
 def _fmt_times(ts=None):
     """Return (ET_string, SGT_string) for a Unix timestamp."""
     import time

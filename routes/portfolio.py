@@ -29,7 +29,7 @@ from utils.storage import (
     acquire_bot_file_lock, load_tickers, save_tickers, save_bot, load_bot,
     SUGGESTION_DB_FILE,
 )
-from utils.threading_utils import trigger_bot_if_due, _bot_run_lock
+from utils.threading_utils import trigger_bot_if_due, _bot_run_lock, BOT_INTERVAL
 from utils.time_utils import is_market_open
 
 
@@ -257,6 +257,9 @@ def bot_run():
     return redirect(url_for("bot_dashboard"))
 
 
+_LAST_MACHINE_TICK = {"ts": 0.0}
+
+
 @app.route("/bot/tick", methods=["GET", "POST"])
 def bot_tick():
     auth = require_machine_token()
@@ -264,6 +267,22 @@ def bot_tick():
         return auth
     if _bot_run_lock.locked():
         return jsonify({"status": "already_running"}), 409
+    # The 1-min uptime ping used to force a FULL decision pass every minute
+    # (double the intended 2-min cadence), burning provider rate limits and
+    # causing INVALID_PRICE/MISSING_HISTORY failures. Machine pings now honor
+    # BOT_INTERVAL; the ping still keeps the site awake. `?manual=1` bypasses.
+    try:
+        manual = bool(request.args.get("manual"))
+    except RuntimeError:
+        manual = True  # direct invocation (tests/scripts) — no request context
+    if not manual:
+        since = time.time() - _LAST_MACHINE_TICK["ts"]
+        if since < BOT_INTERVAL:
+            return jsonify({
+                "status": "interval_wait",
+                "seconds_until_next_run": int(BOT_INTERVAL - since),
+            }), 200
+        _LAST_MACHINE_TICK["ts"] = time.time()
     scan_warm_started = False
     scan_warm_error = None
     if not PYTHONANYWHERE_MODE:
@@ -273,15 +292,9 @@ def bot_tick():
             scan_warm_started = False
             scan_warm_error = f"{type(e).__name__}: {e}"
     start = time.time()
-    # Audit P0-4: the UptimeRobot ping is a machine, not a human — user_forced
-    # only for real manual runs (&manual=1), which relax the human-only gates.
-    try:
-        manual = str(request.args.get("manual", "")).lower() in ("1", "true", "yes")
-    except Exception:  # direct calls outside a request context (tests)
-        manual = False
     b, traded, last_action = run_bot(
         force=True,
-        user_forced=manual,
+        user_forced=True,
         max_runtime_sec=BOT_TICK_MAX_RUNTIME_SEC,
     )
     diag = b.get("last_no_buy_diagnostics") or {}

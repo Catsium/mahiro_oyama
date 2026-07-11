@@ -435,6 +435,34 @@ def _calendar_date_from_ts(ts):
         return None
 
 
+# Snapshots may lag the 09:30 open / 16:00 close by a tick; accept a margin.
+SESSION_EDGE_TOLERANCE_SEC = 300
+
+
+def _session_bounds_for(d, cache):
+    if d not in cache:
+        try:
+            from utils.time_utils import session_bounds
+            cache[d] = session_bounds(d)
+        except Exception:
+            cache[d] = None
+    return cache[d]
+
+
+def _session_sgt_label(bounds):
+    """'21:30 Jul 07 → 04:00 Jul 08 SGT' — the user's local view of the session."""
+    if not bounds:
+        return None
+    try:
+        from zoneinfo import ZoneInfo
+        sg = ZoneInfo("Asia/Singapore")
+        s = datetime.fromtimestamp(bounds[0], sg)
+        e = datetime.fromtimestamp(bounds[1], sg)
+        return f"{s.strftime('%H:%M %b %d')} → {e.strftime('%H:%M %b %d')} SGT"
+    except Exception:
+        return None
+
+
 def _money(value):
     try:
         return round(float(value), 2)
@@ -487,6 +515,7 @@ def build_profit_calendar_payload(bot, year, month):
     days_in_month = monthrange(year, month)[1]
     month_key = f"{year:04d}-{month:02d}"
     today = datetime.now(BOT_CALENDAR_TZ).date()
+    session_cache = {}
     days = {}
     for day in range(1, days_in_month + 1):
         d = date(year, month, day)
@@ -505,10 +534,13 @@ def build_profit_calendar_payload(bot, year, month):
             "has_data": False,
             "has_activity": False,
             "note": "No trading data for this day.",
+            # user-local framing of the 09:30-16:00 ET session (9:30pm-4am SGT)
+            "session_sgt": _session_sgt_label(_session_bounds_for(d, session_cache)),
         }
 
     snapshots_by_day = {}
     snapshot_count = 0
+    session_excluded_count = 0
     for point in bot.get("equity_history") or []:
         if not isinstance(point, (list, tuple)) or len(point) < 2:
             continue
@@ -518,6 +550,16 @@ def build_profit_calendar_payload(bot, year, month):
         equity = _money(point[1])
         if equity is None:
             continue
+        # Session anchoring: a calendar day is the NYSE session, not the ET
+        # calendar date. Snapshots outside 09:30-16:00 ET (± tolerance) are
+        # excluded so daily P/L = session end - session start (user spec).
+        bounds = _session_bounds_for(d, session_cache)
+        if bounds:
+            ts = int(point[0])
+            if not (bounds[0] - SESSION_EDGE_TOLERANCE_SEC
+                    <= ts <= bounds[1] + SESSION_EDGE_TOLERANCE_SEC):
+                session_excluded_count += 1
+                continue
         snapshots_by_day.setdefault(d, []).append(point)
         snapshot_count += 1
 
@@ -604,6 +646,7 @@ def build_profit_calendar_payload(bot, year, month):
             "trade_count": trade_count,
             "legacy_trade_rows_without_ts": legacy_trade_rows_without_ts,
             "holding_snapshot_days": holding_snapshot_days,
+            "session_excluded_snapshots": session_excluded_count,
         },
     }
 

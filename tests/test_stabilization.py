@@ -73,8 +73,15 @@ class CacheAndQuoteTests(unittest.TestCase):
 
     def test_stooq_negative_cache_avoids_repeat_fetch(self):
         from market import quotes
+        from utils import cache
 
         symbol = "NEGZUNIT"
+        # Hermetic guard: earlier suite runs persist this endpoint's failures
+        # to provider_health.json; a still-warm circuit would skip the fetch
+        # entirely (0 calls) and fail the assertion below for the wrong reason.
+        with cache._cache_lock:
+            for key in [k for k in list(cache._api_failures) if symbol in k]:
+                cache._api_failures.pop(key, None)
         with patch("urllib.request.urlopen", side_effect=RuntimeError("boom")) as fetch:
             self.assertIsNone(quotes._stooq_daily(symbol))
             self.assertIsNone(quotes._stooq_daily(symbol))
