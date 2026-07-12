@@ -26,37 +26,6 @@ def _norm_symbol(tk):
     return str(tk or "").upper().strip()
 
 
-def _recorded_last_date_str(ctx):
-    """ET calendar date ('YYYY-MM-DD') of the newest recorded snapshot, or None."""
-    ts = ctx.get("recorded_last_ts")
-    if not ts:
-        return None
-    from datetime import datetime
-    try:
-        from zoneinfo import ZoneInfo
-        return datetime.fromtimestamp(int(ts), ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
-    except Exception:
-        return datetime.utcfromtimestamp(int(ts)).strftime("%Y-%m-%d")
-
-
-def _recorded_ctx_trusted(ctx):
-    """Audit P1-7 trust rule: ≥25 recorded closes AND newest point < 2
-    completed trading days old → usable as synthetic daily history."""
-    min_points = int(DEFAULT_CONFIG.get("history", {}).get("min_history_rows_for_buy", 25))
-    if int(ctx.get("recorded_points_n") or 0) < min_points:
-        return False
-    date_str = _recorded_last_date_str(ctx)
-    if not date_str:
-        return False
-    from datetime import datetime
-    from utils.time_utils import completed_trading_days_since
-    try:
-        last_date = datetime.strptime(date_str, "%Y-%m-%d").date()
-        return completed_trading_days_since(last_date) < 2
-    except Exception:
-        return False
-
-
 def _history_meta_from_df(df):
     attrs = getattr(df, "attrs", {}) or {}
     chain = list(attrs.get("provider_chain_debug") or [])
@@ -151,16 +120,7 @@ def get_history(tk):
     # Locally recorded snapshots (last resort; no weekly possible).
     if not r:
         r = _ctx_from_recorded(tk)
-        if r and _recorded_ctx_trusted(r):
-            # Audit P1-7: ≥25 recorded closes with a fresh newest point make a
-            # decidable ctx — history_rows unlocks buys via the normal
-            # _history_execution_status chokepoint; label keeps provenance.
-            r["history_source"] = "synthetic_recorded"
-            r["history_status"] = "synthetic_recorded"
-            r["history_rows"] = int(r.get("recorded_points_n") or 0)
-            r["history_last_date"] = _recorded_last_date_str(r)
-            r.setdefault("history_warnings", []).append("SYNTHETIC_RECORDED_HISTORY")
-        elif r:
+        if r:
             r.setdefault("history_source", "recorded")
             r.setdefault("history_status", "recorded_fallback")
             r.setdefault("history_rows", 0)
