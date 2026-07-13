@@ -97,9 +97,9 @@ SIGNAL_CONFIG = {
 }
 
 KELLY_CONFIG = {
-    "enabled": False,
+    "enabled": True,
     "min_samples": 100,
-    "fraction": 0.50,
+    "fraction": 0.25,
     "min_mult": 1.0,
     "max_mult": 1.0,
 }
@@ -269,7 +269,7 @@ SCAN_CONFIG = {
     "scan_requires_min_history_rows": 25,
     "scan_requires_min_trade_size": True,
     "scan_allow_bullish_lean": True,
-    "scan_allow_high_confidence_hold": False,
+    "scan_allow_high_confidence_hold": True,
 }
 
 HISTORY_CONFIG = {
